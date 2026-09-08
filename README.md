@@ -21,9 +21,6 @@ unsupported. EDF6 modules are disabled scaffolds.
 
 ## Repository layout
 
-Publish this `_dev` directory as the repository root, not the game directory.
-The historical `EDF5TrafficSniffer` folder name is retained for compatibility.
-
 ```text
 EDF5TrafficSniffer/
   src/               Core, shared code and per-game modules
@@ -34,9 +31,6 @@ EDF5TrafficSniffer/
   build.ps1          Windows x64 build
   config.ini         Development INI copied beside the built DLL
 ```
-
-Downloaded dependencies, game files, binaries, captures, caches and local build
-metadata are excluded by `.gitignore`.
 
 ## Requirements and dependency setup
 
