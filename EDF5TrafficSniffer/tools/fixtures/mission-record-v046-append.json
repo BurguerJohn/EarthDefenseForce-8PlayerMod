@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "source": "sanitized host v0.4.6 minidump and matching host/client reports",
+  "exception_code": 3221225477,
+  "exception_rva": 1172188,
+  "fault_write_address": 18,
+  "native_record_count": 4,
+  "record_size": 24,
+  "object_record_base": 312,
+  "fifth_object_offset": 408,
+  "existing_records": 1,
+  "append_records": 4,
+  "append_local_index": 3,
+  "destination_control_value": 6
+}

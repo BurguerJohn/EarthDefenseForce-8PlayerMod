@@ -1,0 +1,12 @@
+{"layer":"more_players","event":"mission_player_control_assignment","context":"mission_entry","participant_index":0,"local_controller_index":0}
+{"layer":"more_players","event":"mission_player_control_assignment","context":"mission_entry","participant_index":1,"local_controller_index":-1}
+{"layer":"more_players","event":"mission_player_control_assignment","context":"mission_entry","participant_index":2,"local_controller_index":-1}
+{"layer":"more_players","event":"mission_player_control_assignment","context":"mission_entry","participant_index":3,"local_controller_index":-1}
+{"layer":"more_players","event":"mission_player_control_assignment","context":"mission_entry","participant_index":4,"local_controller_index":-1}
+{"layer":"more_players","event":"mission_player_create_result","context":"mission_entry","participant_index":0,"output_player_present":true}
+{"layer":"more_players","event":"mission_player_create_result","context":"mission_entry","participant_index":1,"output_player_present":true}
+{"layer":"more_players","event":"mission_player_create_result","context":"mission_entry","participant_index":2,"output_player_present":true}
+{"layer":"more_players","event":"mission_player_create_result","context":"mission_entry","participant_index":3,"output_player_present":true}
+{"layer":"more_players","event":"mission_player_create_result","context":"mission_entry","participant_index":4,"output_player_present":true}
+{"layer":"more_players","event":"enemy_spawn_observed","call":1,"caller_rva":1901692,"confirmed_enemy_caller":true,"requested_count":10,"effective_requested_count":20,"multiplier":2,"experimental_multiplier_enabled":false,"multiplier_applied":true,"participant_count":5,"scale_fields_readable":true,"scale_numerator":1,"scale_denominator":1,"spawn_source_present":true,"zero_scale_repair_eligible":false,"scale_field_writable":false,"scale_repaired":false,"native_enemy_capacity":400,"mission_generation":2,"actor_pointer_logged":false,"spawn_payload_logged":false}
+{"layer":"more_players","event":"enemy_spawn_summary","phase":"mission_result_apply","calls":1,"confirmed_enemy_calls":1,"requested_total":10,"effective_requested_total":20,"zero_scale_calls":0,"missing_spawn_source_calls":0,"zero_scale_repairs":0,"scale_restore_failures":0,"configured_multiplier":2,"experimental_multiplier_enabled":false,"effective_multiplier":2,"native_enemy_capacity":400,"participant_count":5,"mission_generation":2,"actor_pointer_logged":false,"spawn_payload_logged":false}

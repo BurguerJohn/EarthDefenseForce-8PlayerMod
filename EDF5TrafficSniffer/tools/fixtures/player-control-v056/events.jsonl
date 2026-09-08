@@ -1,0 +1,6 @@
+{"layer":"more_players","event":"mission_source_collection_audit","collection":"session_all_users","source_count":2}
+{"layer":"more_players","event":"mission_source_collection_audit","collection":"session_local_controls","source_count":1}
+{"layer":"more_players","event":"mission_player_control_assignment","context":"mission_entry_primary","participant_index":0,"local_controller_index":0,"original_local_controller_index":0,"effective_local_controller_index":0,"control_assignment_corrected":false,"locally_controlled":true}
+{"layer":"more_players","event":"mission_player_create_result","context":"mission_entry_primary","participant_index":0,"local_controller_index":0,"output_player_present":true}
+{"layer":"more_players","event":"mission_player_control_assignment","context":"mission_entry_primary","participant_index":1,"local_controller_index":-1,"original_local_controller_index":0,"effective_local_controller_index":-1,"control_assignment_corrected":true,"locally_controlled":false}
+{"layer":"more_players","event":"mission_player_create_result","context":"mission_entry_primary","participant_index":1,"local_controller_index":-1,"output_player_present":true}

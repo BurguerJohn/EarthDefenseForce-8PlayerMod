@@ -1,0 +1,236 @@
+EDF5_MultiSlotMod v0.6.52 - PACOTE DE TESTE LOCAL/COORDENADO
+
+Pre-requisito:
+- EDFModLoader 1.0.10 instalado em cada computador.
+
+Instalacao:
+1. Feche o jogo.
+2. Extraia este ZIP na pasta raiz de EARTH DEFENSE FORCE 5.
+3. Confirme a mesclagem da pasta Mods.
+4. Todos os computadores devem usar estes mesmos arquivos e config.ini.
+
+DLL esperada:
+Mods\Plugins\EDF5_MultiSlotMod.dll
+SHA-256: 2FDE70233461AFD07861417329E29B8C146AEA61B5B99C51DBE070BB68BF51B6
+
+Nota da v0.6.52:
+- O MorePlayers agora exige o conjunto completo de hooks Steam usado por
+  callbacks e lifecycle. Winsock nao mascara mais a falta de um hook Steam.
+- Se uma etapa obrigatoria falhar, a quarentena restaura somente assinaturas
+  exatas deste mod no EDF5.exe, incluindo roster, paineis, resultado, relays
+  de participante/spawn/escala e reservas experimentais.
+- O build Release trata os avisos estritos do C++ proprio como erro. Smoke,
+  diagnosticos completos e integracao Steam positiva/negativa devem passar.
+- A base de recepcao e pipeline final introduzida na v0.6.51 permanece ativa:
+- A recepcao de gameplay agora associa cada parser ao UserImpl pela cadeia
+  real `parser -> route -> control -> UserImpl`. O report mostra rotas
+  ausentes, duplicadas ou atribuidas ao participante errado sem guardar
+  ponteiros, SteamIDs, endpoints ou payloads.
+- Register/unregister compara, somente como booleano, o owner que atribuiu
+  UserImpl+0xC8 com o manager de recepcao. Esse dado decide se o loop nativo
+  de 8 bytes e o vetor de 16 bytes pertencem ao mesmo objeto; nenhum stride
+  foi alterado antes dessa prova.
+- O encerramento da fase agora mede tambem ResultSync_Update e
+  ResultSync_Finally, preservando exatamente retorno e ABI nativos.
+- O aviso local usa agora o estilo classico do IRC, com caracteres ASCII:
+  `*** EDF5_MultiSlotMod v0.6.52 ***`.
+- `Reports\no_msg_2.zip` confirmou que a tentativa anterior com lobby+jogador
+  local tambem era rejeitada. O banner agora usa a funcao nativa de mensagem
+  de sistema do `Chat_Room`, que recebe apenas sala+texto e insere a linha
+  diretamente na lista local. Ela nao depende de jogador, SteamID ou de uma
+  primeira mensagem real e nao passa pela rotina de envio Steam.
+- Ao criar/entrar, confirme a linha antes de escrever qualquer coisa. No report,
+  `chat_mod_banner_publish` deve mostrar `success=true` e
+  `publish_path=room_update_system_message` e
+  `identity_context=not_required` em uma unica tentativa.
+- `chat_identity_context` registra somente comparacoes booleanas; SteamID,
+  lobby ID, nickname e texto da mensagem nao sao gravados nem fingerprintados.
+- A base de telemetria e correcoes da v0.6.46 permanece ativa:
+- A nova telemetria observa o gate nativo entre o update e o metodo de spawn.
+  `generator_poll_gate_path` separa cooldown, quota interna, retorno falso e
+  spawn aceito. O hook e passivo: nao altera timer, quota, escala, quantidade,
+  descritor ou fluxo do jogo, nem guarda ponteiros/payloads.
+- As telemetrias de update e metodo continuam registrando a cadeia completa.
+  Juntas, as tres camadas separam update ausente, motivo exato do gate,
+  manager ausente e rejeicao no boundary.
+- O report agora identifica se `Exec_Begin` veio do despacho de missao, do
+  wrapper nativo `ResultSync_Begin` ou da recuperacao do mod. O executavel tem
+  exatamente dois callers diretos validados; esta mudanca acrescenta
+  observabilidade e nao altera o fluxo normal.
+- O autoteste offline agora executa os 56 relays de escalonamento com
+  contagens 3, 5 e 8 e confere registradores, flags, mascara e preservacao da
+  contagem real. Isso nao roda no carregamento normal do EDF5 e nao altera o
+  comportamento runtime da v0.6.41.
+- O multiplicador artificial continua experimental e desativado. Nao altere
+  ExperimentalEnemySpawnMultiplier=false nem EnemySpawnMultiplier=1 neste
+  teste coordenado.
+
+Teste do Local Mission Harness (somente host):
+1. Crie uma sala e aguarde a lista de jogadores aparecer.
+2. Sem nenhum cliente real, pressione F3 uma vez. Devem aparecer tres
+   `Harness Dummy`; eles copiam o loadout do host e entram Ready.
+3. Inicie a fase. Esse e o baseline host+3 dentro dos quatro slots nativos.
+   A v0.6.52 mantem a correcao que deixa o EDF5 inicializar MissionStart 0->1 e libera temporariamente
+   o gate anterior ao Update e conclui 4->5 somente depois de Ready, l1/l2 e
+   contato dos tres dummies estarem completos. Nenhum pacote e fabricado.
+4. Volte para a sala, pressione F3 outra vez e inicie com host+4. Esse teste
+   exercita P4, o quinto participante que interessa ao desenvolvimento.
+5. Um terceiro F3 desliga o harness e remove os dummies.
+6. Os dummies sao remotos e inertes: eles nao tem IA nem conexao Steam real.
+   Este teste cobre entrada/crash, personagens, loadout, HUD, spawn e saida
+   local; nao cobre P2P, movimento remoto, chat/nicks entre computadores ou
+   dessincronizacao.
+7. Se outra pessoa entrar, o harness se desliga e libera todas as vagas.
+   F3 tambem e recusado fora da tela da sala ou se fillers F8 estiverem ativos.
+
+Teste de cinco jogadores:
+0. Antes de reunir os clientes, crie uma sala sozinho e confirme que o lobby
+   abre normalmente e que o chat mostra exatamente uma vez
+   `*** EDF5_MultiSlotMod v0.6.52 ***`. Em um cliente, confirme a mesma linha uma vez
+   depois de entrar. A identificacao e apenas local: nao e enviada pelo chat da
+   Steam e cada computador com o mod cria a sua propria linha. A correcao do
+   retorno RAX do conversor PlayerInfo da v0.6.20 continua ativa.
+1. Durante 10-15 segundos, confirmar que todos veem o host se movimentar,
+   atirar e executar acoes. Depois, confirmar o mesmo para cada cliente.
+2. Conferir os cinco nicks no lobby, chat e durante a fase.
+   Se possivel, cada jogador deve enviar uma mensagem curta no chat para que
+   a associacao remetente/nick seja auditada sem guardar o texto.
+3. Fazer o quinto jogador escolher uma classe diferente do host e conferir
+   classe, armas e armadura depois do carregamento.
+   Este teste tambem valida as duas correcoes do painel de status: P4 conserva
+   seu indice logico 4, reutiliza o descritor visual nativo 0 e a classe
+   entregue a tabela de texto permanece entre 0 e 3.
+   O evento sanitizado `mission_participant_visual_slot_remapped` deve mostrar
+   `logical_participant_index=4`, `native_visual_slot=0` e
+   `logical_user_index_preserved=true` em cada computador que renderizou P4.
+4. Vencer a fase naturalmente e conferir recompensas para todos e retorno ao
+   lobby sem ficar eternamente em Connecting.
+5. Nao use F5 neste primeiro teste de vitoria; precisamos observar o caminho
+   natural completo. A v0.6.52 preserva a identidade de P4, captura em sidecar
+   classe/loadout antes de restaurar as escritas P4-P7 que invadiam
+   reward/result, resolve a classe extra pelo PlayerInfo ou sidecar e inclui o
+   Item de resultado de P4-P7 nos quatro
+   acumuladores nativos sem ultrapassar a faixa que termina antes de rewards.
+   O report separa: rollback do parser; classe; replicacao 0x3300/0x3400;
+   agregacao dos Items extras; fechamento da UI 2; Exec_Begin/Sync;
+   ResolveResult/ApplyResult. Ela tambem
+   confirma se os cinco UserImpl sao unicos, se cada cliente recebeu
+   replicacao do host e dos outros participantes e se a tabela dinamica real
+   de recepcao contem exatamente uma rota para P0-P4. A origem de cada nick
+   agora e cruzada como participante -> UserImpl -> PlayerInfo -> chat, e o
+   checkpoint de rewards confirma se o Item de P4 ja estava agregado antes de
+   ResolveResult. Ela tambem cruza o indice interno `UserImpl+0xC8` com o slot
+   real da tabela dinamica de recepcao, permitindo localizar rota ausente,
+   duplicada ou fora de posicao. Nada disso registra nomes, mensagens,
+   SteamIDs, endpoints, payloads ou conteudo de recompensas.
+   A primeira mensagem 0x3300/0x3400 de cada participante local tambem audita
+   o fan-out do serializador por descritores de rota de 8 bytes: numa sala de
+   cinco jogadores deve aparecer exatamente a mascara dos quatro remotos, sem
+   registrar descritores, indices/chaves de rota ou quem sao os usuarios.
+   O decoder de resultado tambem registra uma mascara sanitizada P0-P4, sem
+   valores de armas/rewards, mesmo se o fluxo parar antes de ResolveResult.
+   Como defesa adicional, se o quinto bloco ainda zerar o contador nativo de
+   perfis locais, a versao 0.6.52 o restaura a partir da colecao local real
+   antes de ApplyResult. O report registra somente 0->1/2 e o sucesso, nunca
+   armas, rewards ou dados do perfil.
+   Esta versao tambem preserva a contagem 5 mesmo quando o parser retorna
+   booleano false e seu out-parameter de falha permanece limpo. Se o registro
+   de classe 1 de P4 sobrepor uma arma com essa contagem, somente aquele campo
+   usa o valor seguro do bloco nativo; as outras cinco armas continuam vindo
+   do sidecar.
+6. A v0.6.52 limita 56 leituras de escalonamento nativo ao perfil existente de
+   quatro jogadores sem alterar a contagem real 5..8. Isso corrige timers e
+   parametros que antes indexavam alem das tabelas antes mesmo de chegar a
+   rotina comum de spawn. O evento
+   `native_participant_scaling_clamp_observed` deve ter `hits_total>0`,
+   `site_mask>0`, capacidade 4 e `participant_count_storage_preserved=true`.
+   A rotina comum de spawn continua auditada. O multiplicador e uma base
+   experimental opcional para desenvolvimento futuro; mantenha
+   `ExperimentalEnemySpawnMultiplier=false` e `EnemySpawnMultiplier=1` neste
+   teste. O primeiro gate mantem o aumento artificial fora do MultiSlot mesmo
+   se o valor numerico for alterado acidentalmente.
+   Se o boundary comum receber escala zero com pedido positivo numa missao de
+   cinco jogadores, o mod usa temporariamente escala 1:1 somente quando caller,
+   fonte, denominador e contagem sao validos. O report preserva o par original;
+   a tabela participant_count-1 do GeneratorPoll afeta um timer separado e nao
+   e tratada como prova da origem dessa escala.
+7. Se o resultado entrar em Sync_MissionResult 0/0 sem Exec_Begin, o mod espera
+   1000 ms pelo caminho nativo. Persistindo o stall, aplica uma unica chamada
+   Exec_Begin com o argumento comprovado -20000 em host e clientes reais. Se
+   o caminho nativo chegar durante a espera, ele cancela a fila e impede uma
+   segunda chamada.
+8. Ao reaparecer a tela da sala, a v0.6.52 registra
+   `mission_result_transition_completed` com
+   `completion_signal=room_ui_update` e `room_ui_returned=true`. Esse evento
+   apenas observa o update nativo da sala; nao forca a transicao. O gate usa o
+   tick armado por MissionResultApply e funciona mesmo se um cliente ainda
+   reportar a fase textual `mission`. Ele tambem
+   resume as contagens de Exec_Begin, sync, ResolveResult, ApplyResult e a
+   mascara de Items sem registrar rewards ou payloads.
+
+Depois do teste:
+- Em cada computador, execute Mods\TrafficSniffer\CreateDebugReport.bat.
+- Identifique o ZIP como host ou client antes de reuni-los.
+- Confirme no summary.json de cada ZIP que plugin_version e 0.6.52.
+- No teste F3, confirme primeiro
+  `local_mission_harness_controller_gate_observed` com native_gate_value=0,
+  effective_gate_value=1, bypass_applied=true,
+  temporary_value_restored=true e native_mission_state_forced=false. Confirme
+  tambem o evento
+  `local_mission_harness_matching_gate_completed` com estado 4->5, todas as
+  tres ou quatro mascaras completas, zero peers reais e
+  `gameplay_packet_fabricated=false`.
+- Ao analisar os ZIPs, use `--require-visual-slot-remap` para exigir a prova
+  de que P4 passou pela nova rota visual antes da fase ser renderizada.
+- Confirme que `mission_loadout_parser_extra_blocks_restored` tem
+  `captured_sidecar_mask=1`, que `mission_loadout_block_synthesized` informa
+  `loadout_source=parser_sidecar` quando PlayerInfo estiver ausente, e que
+  `mission_participant_class_resolved` mostra `safe_class_in_range=true`.
+- No mesmo evento do parser, confirme `participant_count_preserved=5`,
+  `participant_count_output_valid=true` e `participant_count_source=parser_output`.
+  Um sidecar parcial e esperado para P4/classe 1: `partial_sidecar_weapon_mask=1`;
+  o evento sintetizado deve mostrar `weapon_valid_mask=47` e
+  `fallback_weapon_mask=16`.
+- Procure `enemy_spawn_summary`: ele deve ter `confirmed_enemy_calls>0`,
+  `scale_restore_failures=0`, `actor_pointer_logged=false` e
+  `spawn_payload_logged=false`. Se houve escala zero valida, deve aparecer
+  `enemy_spawn_scale_repaired`.
+  Se mostrar `calls=0` e `common_spawn_reached=false`, a telemetria funcionou,
+  mas nenhum caminho de inimigo chegou a rotina comum; isso nao conta como
+  spawn bem-sucedido.
+- Procure primeiro `generator_poll_update_path`. `original_returned=true` e
+  `base_update_and_gate_reached=true` provam que o objeto foi atualizado e o
+  gate nativo executou. Se `spawn_method_reached=false`, o bloqueio ocorreu no
+  gate antes do metodo +0x108. O `enemy_spawn_summary` agrega os contadores de
+  update. Em caso de crash, o escopo
+  `generator_poll_update/before_original` prova que o original foi iniciado.
+- Procure `generator_poll_gate_path`. O campo `outcome` identifica
+  `cooldown_blocked`, `quota_blocked_inside_time_window`,
+  `spawn_returned_false` ou `spawn_accepted`. Exija tambem
+  `method_call_count_valid=true`, `cooldown_threshold=460` e todos os campos
+  `*_pointer_logged`/`spawn_payload_logged` falsos. O summary agrega as quatro
+  classes; `generator_poll_native_gate_unknown` deve permanecer zero.
+- Procure tambem `generator_poll_spawn_path`. Se o metodo foi chamado, ele
+  mostra `manager_present`, `common_spawn_reached` e
+  `gate_return_low_byte_nonzero`. O mesmo `enemy_spawn_summary` agrega essas
+  contagens. Se o evento nao existir, procure no contexto de crash o escopo
+  `generator_poll_spawn/before_original`: ele distingue um crash dentro do
+  metodo de um computador no qual o GeneratorPoll nao foi chamado.
+- No mesmo summary, exija `native_participant_scaling_clamp_hits>0`, mascara
+  diferente de zero, capacidade 4 e preservacao da contagem real. O getter
+  nativo continua reportando `participant_count=5`; ele nao e substituido por 4.
+- Se o resultado precisou da nova recuperacao, devem aparecer
+  `mission_result_exec_recovery_queued`, `mission_result_exec_begin` aceito e
+  `mission_result_exec_recovery_applied`. Uma chamada nativa durante a janela
+  deve produzir apenas `mission_result_exec_recovery_cancelled`.
+- Em `mission_result_exec_begin`, confira `caller_path`: o caminho normal pode
+  ser `mission_script_dispatch` ou `result_sync_begin_wrapper`; quando a fila
+  da recuperacao for aplicada, deve ser `mod_recovery` com `caller_rva=0`.
+- Se outra fase iniciou com uma fila antiga ainda pendente, deve aparecer
+  `mission_result_exec_recovery_generation_reset` com
+  `stale_pending_discarded=true` e `queue_cleared=true`.
+- Exija `--require-result-room-return` junto de
+  `--require-result-reward-chain`; sucesso requer o sinal `room_ui_update`,
+  nao apenas `leave_lobby`.
+- Nao envie a pasta logs bruta; o gerador remove payloads, dumps e dados
+  sensiveis do relatorio compartilhavel.

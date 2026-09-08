@@ -1,0 +1,15 @@
+{"layer":"more_players","event":"mission_source_collection_audit","collection":"session_all_users","source_count":5}
+{"layer":"more_players","event":"mission_source_collection_audit","collection":"session_local_controls","source_count":1}
+{"layer":"more_players","event":"mission_player_control_assignment","context":"mission_entry_primary","participant_index":0,"local_controller_index":0,"output_player_present":true}
+{"layer":"more_players","event":"mission_player_create_result","context":"mission_entry_primary","participant_index":0,"local_controller_index":0,"output_player_present":true}
+{"layer":"more_players","event":"mission_player_control_assignment","context":"mission_entry_primary","participant_index":1,"local_controller_index":-1}
+{"layer":"more_players","event":"mission_player_create_result","context":"mission_entry_primary","participant_index":1,"local_controller_index":-1,"output_player_present":true}
+{"layer":"more_players","event":"mission_player_control_assignment","context":"mission_entry_primary","participant_index":2,"local_controller_index":-1}
+{"layer":"more_players","event":"mission_player_create_result","context":"mission_entry_primary","participant_index":2,"local_controller_index":-1,"output_player_present":true}
+{"layer":"more_players","event":"mission_player_control_assignment","context":"mission_entry_primary","participant_index":3,"local_controller_index":-1}
+{"layer":"more_players","event":"mission_player_create_result","context":"mission_entry_primary","participant_index":3,"local_controller_index":-1,"output_player_present":true}
+{"layer":"more_players","event":"mission_player_control_assignment","context":"mission_entry_primary","participant_index":4,"local_controller_index":-1}
+{"layer":"more_players","event":"mission_player_create_result","context":"mission_entry_primary","participant_index":4,"local_controller_index":-1,"output_player_present":true}
+{"layer":"more_players","event":"mission_result_apply","call":1,"result":1,"after_ui_state":3,"after_ui_result":1}
+{"layer":"more_players","event":"mission_result_setter","call":1,"result":1,"natural_clear_caller":true,"caller_rva":4030808,"after_ui_state":3,"after_ui_result":1}
+{"layer":"more_players","event":"mission_result_progress","age_ms":5100,"checkpoint_ms":5000,"diagnostic_phase":"result","result":1,"last_ui_state":3,"setter_calls":1,"apply_calls":1,"transition_pending":true}

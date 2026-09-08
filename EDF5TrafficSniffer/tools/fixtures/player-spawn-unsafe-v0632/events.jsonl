@@ -1,0 +1,11 @@
+{"layer":"more_players","event":"mission_player_control_assignment","context":"mission_entry","participant_index":0,"local_controller_index":0}
+{"layer":"more_players","event":"mission_player_control_assignment","context":"mission_entry","participant_index":1,"local_controller_index":-1}
+{"layer":"more_players","event":"mission_player_control_assignment","context":"mission_entry","participant_index":2,"local_controller_index":-1}
+{"layer":"more_players","event":"mission_player_control_assignment","context":"mission_entry","participant_index":3,"local_controller_index":-1}
+{"layer":"more_players","event":"mission_player_control_assignment","context":"mission_entry","participant_index":4,"local_controller_index":-1}
+{"layer":"more_players","event":"mission_player_create_result","context":"mission_entry","participant_index":0,"output_player_present":true}
+{"layer":"more_players","event":"mission_player_create_result","context":"mission_entry","participant_index":1,"output_player_present":true}
+{"layer":"more_players","event":"mission_player_create_result","context":"mission_entry","participant_index":2,"output_player_present":true}
+{"layer":"more_players","event":"mission_player_create_result","context":"mission_entry","participant_index":3,"output_player_present":true}
+{"layer":"more_players","event":"mission_player_create_result","context":"mission_entry","participant_index":4,"output_player_present":true}
+{"layer":"more_players","event":"enemy_spawn_scale_repaired","call":1,"caller_rva":1901692,"confirmed_enemy_caller":true,"requested_count":10,"effective_requested_count":10,"multiplier":1,"participant_count":5,"scale_fields_readable":true,"scale_numerator":1,"scale_denominator":0,"spawn_source_present":false,"zero_scale_repair_eligible":false,"scale_field_writable":false,"scale_repaired":true,"native_enemy_capacity":400,"mission_generation":2,"actor_pointer_logged":false,"spawn_payload_logged":false}

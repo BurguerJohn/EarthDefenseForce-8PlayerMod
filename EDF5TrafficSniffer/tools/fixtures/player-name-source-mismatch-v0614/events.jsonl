@@ -1,0 +1,6 @@
+{"layer":"more_players","event":"mission_source_collection_audit","collection":"session_all_users","source_count":2}
+{"layer":"more_players","event":"mission_source_collection_audit","collection":"session_local_controls","source_count":1}
+{"layer":"more_players","event":"mission_player_control_assignment","context":"mission_entry_primary","participant_index":0,"local_controller_index":0}
+{"layer":"more_players","event":"mission_player_create_result","context":"mission_entry_primary","participant_index":0,"local_controller_index":0,"source_registered_order":0,"source_mission_loadout_index":0,"source_identity_index_matches_participant":true,"player_info_display_name_valid":true,"player_info_display_name_token":101,"player_info_display_name_length":4,"output_player_present":true}
+{"layer":"more_players","event":"mission_player_control_assignment","context":"mission_entry_primary","participant_index":1,"local_controller_index":-1}
+{"layer":"more_players","event":"mission_player_create_result","context":"mission_entry_primary","participant_index":1,"local_controller_index":-1,"source_registered_order":1,"source_mission_loadout_index":0,"source_identity_index_matches_participant":false,"player_info_display_name_valid":true,"player_info_display_name_token":202,"player_info_display_name_length":6,"output_player_present":true}

@@ -1,0 +1,80 @@
+{
+  "schema": 1,
+  "edf5_exe_sha256": "3512D2A2E61D532C5D12DC0C5FD1AC61F6743E13349AE21301BB8449DD4BAE5F",
+  "scan": {
+    "text_rva": "0x1000",
+    "text_size": "0xc95400",
+    "decoded_instructions": 3552870,
+    "immediate_four_instructions": 24971,
+    "capacity_compare_anchors": 49,
+    "proven_capacity_anchors": 8,
+    "unclassified_or_rejected_anchors": 41,
+    "contextual_immediates": 109
+  },
+  "proven_roster_anchor_rvas": [
+    "0x419789",
+    "0x4197a4",
+    "0x41bb36",
+    "0x432af9",
+    "0x432b14",
+    "0x436996",
+    "0x5a59fc",
+    "0x5a7261"
+  ],
+    "proven_capacity_operand_count": 22,
+  "reviewed_non_roster_anchor_rvas": {
+    "graphics_fixed_groups": [
+      "0x4b8bc0",
+      "0x4b8fe6",
+      "0x4bcdc8",
+      "0x4bd536",
+      "0x4bd7c1"
+    ],
+    "exact_state_check_not_capacity": [
+      "0x4594cc"
+    ]
+  },
+    "remaining_unclassified_anchor_rvas": [
+        "0x5b6c1",
+        "0xd2238",
+        "0xd25b6",
+        "0x14958d",
+        "0x1cdcf2",
+        "0x1ce773",
+        "0x1d8176",
+        "0x1d95ad",
+        "0x1f7d70",
+        "0x1fbf2a",
+        "0x1fc508",
+        "0x25d408",
+        "0x263925",
+        "0x2769a2",
+        "0x282612",
+        "0x29cba2",
+        "0x2a27a5",
+        "0x2a6f6f",
+        "0x2b0242",
+        "0x2b837d",
+        "0x2bb10d",
+        "0x2bd3cf",
+        "0x2c4b67",
+        "0x2d17f3",
+        "0x34eaa0",
+        "0x35037a",
+        "0x47a4cf",
+        "0x4aecfe",
+        "0x971940",
+        "0x9722c7",
+    "0xc3b97c",
+    "0xc3b9fa",
+    "0xc3ba2d",
+    "0xc3bc1a",
+    "0xc3bc76"
+  ],
+  "applied_policy": {
+        "logical_max_players": 5,
+        "preallocated_roster_slots": 8,
+        "bulk_replace_immediate_four": false,
+    "mission_buffers_generalized_to_eight": false
+  }
+}

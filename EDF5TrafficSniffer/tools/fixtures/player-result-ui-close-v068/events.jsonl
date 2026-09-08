@@ -1,0 +1,8 @@
+{"layer":"more_players","event":"mission_source_collection_audit","collection":"session_all_users","source_count":2}
+{"layer":"more_players","event":"mission_source_collection_audit","collection":"session_local_controls","source_count":1}
+{"layer":"more_players","event":"mission_player_control_assignment","context":"mission_entry_primary","participant_index":0,"local_controller_index":0}
+{"layer":"more_players","event":"mission_player_create_result","context":"mission_entry_primary","participant_index":0,"local_controller_index":0,"output_player_present":true}
+{"layer":"more_players","event":"mission_player_control_assignment","context":"mission_entry_primary","participant_index":1,"local_controller_index":-1}
+{"layer":"more_players","event":"mission_player_create_result","context":"mission_entry_primary","participant_index":1,"local_controller_index":-1,"output_player_present":true}
+{"layer":"more_players","event":"mission_result_event_publish","call":1,"event_type":1,"payload_value":2,"payload_readable":true,"publisher_present":true,"setter_scope":true,"expected_ui_close_event":true,"mission_generation":1,"payload_contents_logged":false}
+{"layer":"more_players","event":"mission_result_ui_close_dispatch","call":1,"event_type":1,"payload_value":2,"payload_readable":true,"listener_id":2,"listener_fields_readable":true,"target_match":true,"close_flag_before":false,"close_flag_after":true,"accepted":true,"mission_generation":1,"payload_contents_logged":false}

@@ -1,0 +1,97 @@
+# Only reviewed project files belong at the repository root.
+/*
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/THIRD_PARTY.md
+!/EDF5TrafficSniffer/
+
+# First-party source, documentation, configuration and test tools.
+/EDF5TrafficSniffer/*
+!/EDF5TrafficSniffer/*.md
+!/EDF5TrafficSniffer/TESTING.txt
+!/EDF5TrafficSniffer/build.ps1
+!/EDF5TrafficSniffer/config.ini
+!/EDF5TrafficSniffer/src/
+!/EDF5TrafficSniffer/docs/
+!/EDF5TrafficSniffer/tools/
+!/EDF5TrafficSniffer/release-assets/
+
+# EDF5TrafficSniffer build outputs and runtime data
+/EDF5TrafficSniffer/build/
+/EDF5TrafficSniffer/Mods/
+/EDF5TrafficSniffer/release/
+/EDF5TrafficSniffer/t/
+/EDF5TrafficSniffer/test-output/
+/EDF5TrafficSniffer/Reports/
+/EDF5TrafficSniffer/reports/
+
+# Local development environments and caches
+/EDF5TrafficSniffer/.venv/
+/EDF5TrafficSniffer/.zig-cache/
+/EDF5TrafficSniffer/.zig-global-cache/
+/EDF5TrafficSniffer/third_party/pycapstone/
+/EDF5TrafficSniffer/tools/zig/
+/EDF5TrafficSniffer/tools/zig-*.zip
+**/__pycache__/
+*.py[cod]
+
+# Compiled binaries, debug symbols and intermediate objects
+*.dll
+*.exe
+*.lib
+*.obj
+*.pdb
+
+# Diagnostics, captures and crash artifacts
+*.bin
+*.dmp
+*.log
+*.tmp
+
+# Local credentials and machine-specific secrets
+.env
+.env.*
+!.env.example
+!.env.sample
+*credentials*.json
+*secrets*.json
+
+# Generated release archives
+*.zip
+*.rar
+*.7z
+*.cpk
+*.a
+*.o
+*.ilk
+*.exp
+*.mdmp
+
+# Raw event streams are private; regression fixtures are intentional inputs.
+*.jsonl
+!/EDF5TrafficSniffer/tools/fixtures/**/events.jsonl
+**/logs/
+**/reports/
+**/Reports/
+**/.git/
+**/node_modules/
+**/.pytest_cache/
+*.pem
+*.key
+
+# IDE and operating-system metadata
+.vs/
+.idea/
+.vscode/
+*.suo
+*.user
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor backups
+*~
+*.bak
+*.swp
+*.swo
