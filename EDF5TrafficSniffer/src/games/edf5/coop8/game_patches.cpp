@@ -517,6 +517,40 @@ static_assert(kReplicationMessageReserveGrownCounterOffset +
 static_assert(kSpawnTransformLoopStubOffset + 0x40 <= kMissionRelayPageSize,
               "spawn transform relay exceeds relay page");
 
+// Two mission-script commands (0x127260 with this in r13, 0x121BE0 with this
+// in rsi) walk every participant's persistent record at this+0x138+i*0x18 and
+// lock its shared handle through 0x6D730. The object holds four records;
+// records 4..7 live in the relay sidecars. For i >= 4 the native address hits
+// unrelated object fields (control block 0xE / 0x1 in a live six-player dump)
+// and 0x6D730 faults. Point those lookups at the sidecars instead.
+constexpr uintptr_t kRecordLookupARva = 0x127390;
+constexpr uintptr_t kRecordLookupAReturnRva = 0x1273a6;
+constexpr std::array<uint8_t, 22> kRecordLookupAOriginal = {
+    0x48, 0x63, 0xc7,                                // movsxd rax,edi
+    0x48, 0x8d, 0x48, 0x14,                          // lea rcx,[rax+0x14]
+    0x48, 0x8d, 0x0c, 0x48,                          // lea rcx,[rax+rcx*2]
+    0x48, 0x8d, 0x0c, 0xcd, 0x00, 0x00, 0x00, 0x00,  // lea rcx,[rcx*8]
+    0x49, 0x03, 0xcd,                                // add rcx,r13
+};
+constexpr uintptr_t kRecordLookupBRva = 0x121c40;
+constexpr uintptr_t kRecordLookupBReturnRva = 0x121c4f;
+constexpr std::array<uint8_t, 15> kRecordLookupBOriginal = {
+    0x48, 0x63, 0xc7,                                // movsxd rax,edi
+    0x48, 0x8d, 0x48, 0x14,                          // lea rcx,[rax+0x14]
+    0x48, 0x8d, 0x0c, 0x48,                          // lea rcx,[rax+rcx*2]
+    0x48, 0x8d, 0x0c, 0xce,                          // lea rcx,[rsi+rcx*8]
+};
+constexpr size_t kRecordLookupAStubOffset = 0x1580;
+constexpr size_t kRecordLookupBStubOffset = 0x1600;
+constexpr size_t kRecordLookupRedirectCounterOffset = 0x1328;
+static_assert(kSpawnTransformCappedCounterOffset + sizeof(uint64_t) <=
+                  kRecordLookupRedirectCounterOffset,
+              "record lookup telemetry overlaps spawn telemetry");
+static_assert(kSpawnTransformLoopStubOffset + 0x40 <= kRecordLookupAStubOffset &&
+                  kRecordLookupAStubOffset + 0x80 <= kRecordLookupBStubOffset &&
+                  kRecordLookupBStubOffset + 0x80 <= kMissionRelayPageSize,
+              "record lookup relays overlap or exceed relay page");
+
 uint8_t* g_mission_relay_page = nullptr;
 // Allocated once and never released: the parser hook may still be reading it
 // while a quarantine restores the original instruction.
@@ -527,6 +561,7 @@ std::atomic<uint64_t> g_reported_loadout_parser_invalid_redirects{0};
 std::atomic<uint64_t> g_reported_reliable_message_reserves_grown{0};
 std::atomic<uint64_t> g_reported_replication_message_reserves_grown{0};
 std::atomic<uint64_t> g_reported_spawn_transform_caps{0};
+std::atomic<uint64_t> g_reported_record_lookup_redirects{0};
 unsigned g_mission_relay_capacity = 0;
 unsigned g_roster_patch_max_players = 0;
 unsigned g_roster_patch_preallocated_slots = 0;
@@ -1075,6 +1110,51 @@ bool BuildSpawnTransformRelay(uint8_t* page, uint8_t* image) {
            stub <= page + kSpawnTransformLoopStubOffset + 0x40;
 }
 
+// rcx = &record[i].handle: the native address for i < 4, otherwise the same
+// field of sidecar[(i - 4) & 3]. rax is dead after the stub (a call follows).
+bool BuildRecordLookupRelay(uint8_t* page, uint8_t* image, size_t stub_offset,
+                            std::initializer_list<uint8_t> native_address,
+                            uintptr_t return_rva) {
+    uint8_t* stub = page + stub_offset;
+    EmitBytes(stub, {0x48, 0x63, 0xc7,
+                     0x83, 0xf8,
+                     static_cast<uint8_t>(kMissionSpawnPointCount),
+                     0x73, 0x00});
+    uint8_t* extra_branch = stub - 1;
+    EmitBytes(stub, native_address);
+    if (!EmitRelative32(stub, 0xe9, image + return_rva)) return false;
+    uint8_t* extra = stub;
+    EmitBytes(stub, {0x83, 0xe8,
+                     static_cast<uint8_t>(kMissionSpawnPointCount),
+                     0x83, 0xe0, 0x03,
+                     0x48, 0x8d, 0x0c, 0x40,
+                     0x48, 0xb8});
+    EmitU64(stub, reinterpret_cast<uint64_t>(page + kMissionSidecarOffset +
+                                             sizeof(uint64_t)));
+    EmitBytes(stub, {0x48, 0x8d, 0x0c, 0xc8});
+    return EmitLockIncrement(stub, page + kRecordLookupRedirectCounterOffset) &&
+           EmitRelative32(stub, 0xe9, image + return_rva) &&
+           PatchRelative8(extra_branch, extra) &&
+           stub <= page + stub_offset + 0x80;
+}
+
+bool BuildRecordLookupRelays(uint8_t* page, uint8_t* image) {
+    return page && image &&
+        BuildRecordLookupRelay(
+            page, image, kRecordLookupAStubOffset,
+            {0x48, 0x8d, 0x48, 0x14,
+             0x48, 0x8d, 0x0c, 0x48,
+             0x48, 0x8d, 0x0c, 0xcd, 0x00, 0x00, 0x00, 0x00,
+             0x49, 0x03, 0xcd},
+            kRecordLookupAReturnRva) &&
+        BuildRecordLookupRelay(
+            page, image, kRecordLookupBStubOffset,
+            {0x48, 0x8d, 0x48, 0x14,
+             0x48, 0x8d, 0x0c, 0x48,
+             0x48, 0x8d, 0x0c, 0xce},
+            kRecordLookupBReturnRva);
+}
+
 bool BuildMissionRelayPage(uint8_t* image, unsigned max_players) {
     if (g_mission_relay_page) {
         return g_mission_relay_capacity == max_players;
@@ -1240,10 +1320,13 @@ bool BuildMissionRelayPage(uint8_t* image, unsigned max_players) {
     if (!BuildParticipantScalingRelays(page) ||
         !BuildLoadoutParserRelay(page, image) ||
         !BuildMessageReserveRelays(page, image) ||
-        !BuildSpawnTransformRelay(page, image)) {
+        !BuildSpawnTransformRelay(page, image) ||
+        !BuildRecordLookupRelays(page, image)) {
         return fail();
     }
 
+    std::memset(page + kRecordLookupRedirectCounterOffset, 0,
+                sizeof(uint64_t));
     std::memset(page + kSpawnTransformCappedCounterOffset, 0,
                 sizeof(uint64_t));
     std::memset(page + kReliableMessageReserveGrownCounterOffset, 0,
@@ -1684,6 +1767,24 @@ bool WriteSpawnTransformSite(uint8_t* image) {
                               kSpawnTransformLoopStubOffset);
 }
 
+bool RecordLookupSitesMatch(const uint8_t* image, bool replacement) {
+    return RelayJumpSiteMatches(image, kRecordLookupARva,
+                                kRecordLookupAOriginal,
+                                kRecordLookupAStubOffset, replacement) &&
+           RelayJumpSiteMatches(image, kRecordLookupBRva,
+                                kRecordLookupBOriginal,
+                                kRecordLookupBStubOffset, replacement);
+}
+
+bool WriteRecordLookupSites(uint8_t* image) {
+    return WriteRelayJumpSite(image, kRecordLookupARva,
+                              kRecordLookupAOriginal,
+                              kRecordLookupAStubOffset) &&
+           WriteRelayJumpSite(image, kRecordLookupBRva,
+                              kRecordLookupBOriginal,
+                              kRecordLookupBStubOffset);
+}
+
 bool RosterReplacementSitesMatch(const uint8_t* image, unsigned max_players,
                                  unsigned preallocated_roster_slots) {
     return image &&
@@ -1700,6 +1801,7 @@ bool RosterReplacementSitesMatch(const uint8_t* image, unsigned max_players,
         LoadoutParserSiteMatches(image, true) &&
         MessageReserveSitesMatch(image, true) &&
         SpawnTransformSiteMatches(image, true) &&
+        RecordLookupSitesMatch(image, true) &&
         MemberButtonKeysMatch(image);
 }
 
@@ -1717,6 +1819,7 @@ bool RosterOriginalSitesMatch(const uint8_t* image) {
         LoadoutParserSiteMatches(image, false) &&
         MessageReserveSitesMatch(image, false) &&
         SpawnTransformSiteMatches(image, false) &&
+        RecordLookupSitesMatch(image, false) &&
         MemberButtonKeysMatch(image);
 }
 
@@ -1734,6 +1837,10 @@ void WriteRosterOriginalSites(uint8_t* image) {
     std::memcpy(image + kSpawnTransformLoopRva,
                 kSpawnTransformLoopOriginal.data(),
                 kSpawnTransformLoopOriginal.size());
+    std::memcpy(image + kRecordLookupARva, kRecordLookupAOriginal.data(),
+                kRecordLookupAOriginal.size());
+    std::memcpy(image + kRecordLookupBRva, kRecordLookupBOriginal.data(),
+                kRecordLookupBOriginal.size());
     WriteCapacity(image + kCapacityRegionRva, kOriginalCapacity);
     WriteSecondarySites(image, kOriginalCapacity);
     WriteTertiarySites(image, kOriginalCapacity);
@@ -2515,6 +2622,118 @@ bool SelfTestSpawnTransformRelayExecution(std::string& report) {
                   "spawn transform loop capped at four native records for 1-8 participants");
 }
 
+using RecordLookupExecutionThunk =
+    uint64_t(__fastcall*)(int32_t index, void* target, uint64_t self);
+
+RecordLookupExecutionThunk BuildRecordLookupExecutionThunk(
+    uint8_t*& allocation) {
+    // edi = index, rsi = r13 = self (each site uses one of them), enter the
+    // patched site and return the record address it leaves in rcx.
+    constexpr uint8_t code[] = {
+        0x57,
+        0x56,
+        0x41, 0x55,
+        0x48, 0x83, 0xec, 0x20,
+        0x89, 0xcf,
+        0x4c, 0x89, 0xc6,
+        0x4d, 0x89, 0xc5,
+        0xff, 0xd2,
+        0x48, 0x89, 0xc8,
+        0x48, 0x83, 0xc4, 0x20,
+        0x41, 0x5d,
+        0x5e,
+        0x5f,
+        0xc3,
+    };
+    allocation = static_cast<uint8_t*>(VirtualAlloc(
+        nullptr, sizeof(code), MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE));
+    if (!allocation) return nullptr;
+    std::memcpy(allocation, code, sizeof(code));
+    FlushInstructionCache(GetCurrentProcess(), allocation, sizeof(code));
+    return reinterpret_cast<RecordLookupExecutionThunk>(allocation);
+}
+
+bool SelfTestRecordLookupRelayExecution(std::string& report) {
+    if (g_mission_relay_page) {
+        report = "record lookup microtest refused: relay page already live";
+        return false;
+    }
+    // WriteRosterOriginalSites below restores every site, the highest being
+    // the room panels near 0x5A72E0.
+    constexpr size_t kFakeImageSize = kLoadoutParserStateSlotRva + 0x1000;
+    auto* image = static_cast<uint8_t*>(VirtualAlloc(
+        nullptr, kFakeImageSize, MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE));
+    uint8_t* thunk_allocation = nullptr;
+    const RecordLookupExecutionThunk thunk =
+        image ? BuildRecordLookupExecutionThunk(thunk_allocation) : nullptr;
+    auto finish = [&](bool result, const std::string& message) {
+        if (g_mission_relay_page) {
+            VirtualFree(g_mission_relay_page, 0, MEM_RELEASE);
+            g_mission_relay_page = nullptr;
+            g_mission_relay_capacity = 0;
+        }
+        g_loadout_parser_redirect_active.store(false,
+                                               std::memory_order_release);
+        if (thunk_allocation) VirtualFree(thunk_allocation, 0, MEM_RELEASE);
+        if (image) VirtualFree(image, 0, MEM_RELEASE);
+        report = message;
+        return result;
+    };
+    if (!image || !thunk) {
+        return finish(false, "could not allocate the record lookup microtest");
+    }
+    std::memcpy(image + kRecordLookupARva, kRecordLookupAOriginal.data(),
+                kRecordLookupAOriginal.size());
+    std::memcpy(image + kRecordLookupBRva, kRecordLookupBOriginal.data(),
+                kRecordLookupBOriginal.size());
+    image[kRecordLookupAReturnRva] = 0xc3;
+    image[kRecordLookupBReturnRva] = 0xc3;
+    if (!RecordLookupSitesMatch(image, false) ||
+        !BuildMissionRelayPage(image, 8) ||
+        !WriteRecordLookupSites(image) ||
+        !RecordLookupSitesMatch(image, true) ||
+        RecordLookupSitesMatch(image, false)) {
+        return finish(false, "record lookup relays were not installed");
+    }
+    FlushInstructionCache(GetCurrentProcess(), image, kFakeImageSize);
+
+    constexpr uint64_t kSelf = 0x0000123456780000ULL;
+    const uint64_t sidecars = reinterpret_cast<uint64_t>(
+        g_mission_relay_page + kMissionSidecarOffset);
+    uint64_t expected_redirects = 0;
+    for (const uintptr_t site : {kRecordLookupARva, kRecordLookupBRva}) {
+        for (int32_t index = 0; index < 10; ++index) {
+            const uint64_t unsigned_index = static_cast<uint64_t>(index);
+            const uint64_t expected = index < 4
+                ? kSelf + kMissionRecordObjectBaseOffset + sizeof(uint64_t) +
+                      unsigned_index * kMissionRecordSize
+                : sidecars + sizeof(uint64_t) +
+                      ((unsigned_index - 4) & 3) * kMissionRecordSize;
+            expected_redirects += index < 4 ? 0 : 1;
+            const uint64_t actual = thunk(index, image + site, kSelf);
+            if (actual != expected) {
+                return finish(false, "record lookup relay at " +
+                                         std::to_string(site) +
+                                         " misaddressed index " +
+                                         std::to_string(index));
+            }
+        }
+    }
+    if (ReadMissionRelayCounter(kRecordLookupRedirectCounterOffset) !=
+        expected_redirects) {
+        return finish(false, "record lookup telemetry count mismatch");
+    }
+
+    WriteRosterOriginalSites(image);
+    if (!RecordLookupSitesMatch(image, false)) {
+        return finish(false, "record lookup restore left a relay jump");
+    }
+    return finish(true,
+                  "both script record lookups keep records 0-3 native and read 4-7 from sidecars");
+}
+
 struct MissionHarnessRecord {
     uint32_t value = 0;
     uint32_t padding = 0;
@@ -2610,12 +2829,13 @@ bool InstallRosterCapacity(unsigned max_players,
     const bool loadout_parser_ready = LoadoutParserSiteMatches(image, true);
     const bool message_reserve_ready = MessageReserveSitesMatch(image, true);
     const bool spawn_transform_ready = SpawnTransformSiteMatches(image, true);
+    const bool record_lookup_ready = RecordLookupSitesMatch(image, true);
     if (primary_ready && secondary_ready && tertiary_ready && room_panels_ready &&
         mission_result_participants_ready &&
         member_buttons_ready && mission_participants_ready && mission_spawns_ready &&
         participant_scaling_ready && loadout_parser_ready &&
         message_reserve_ready && spawn_transform_ready &&
-        MemberButtonKeysMatch(image)) {
+        record_lookup_ready && MemberButtonKeysMatch(image)) {
         g_roster_patch_max_players = max_players;
         g_roster_patch_preallocated_slots = preallocated_roster_slots;
         g_loadout_parser_redirect_active.store(true,
@@ -2702,6 +2922,7 @@ bool InstallRosterCapacity(unsigned max_players,
         MessageReserveSitesMatch(image, false);
     const bool spawn_transform_original =
         SpawnTransformSiteMatches(image, false);
+    const bool record_lookup_original = RecordLookupSitesMatch(image, false);
     if ((!primary_ready && !primary_original) ||
         (!secondary_ready && !secondary_original) ||
         (!tertiary_ready && !tertiary_original) ||
@@ -2715,6 +2936,7 @@ bool InstallRosterCapacity(unsigned max_players,
         (!loadout_parser_ready && !loadout_parser_original) ||
         (!message_reserve_ready && !message_reserve_original) ||
         (!spawn_transform_ready && !spawn_transform_original) ||
+        (!record_lookup_ready && !record_lookup_original) ||
         !MemberButtonKeysMatch(image)) {
         EDF5_CAPTURE_EVENT("more_players", "roster_capacity_patch_failed",
                        capture::Fields().String("reason", "EDF5 byte signature mismatch")
@@ -2726,6 +2948,8 @@ bool InstallRosterCapacity(unsigned max_players,
                                  message_reserve_original)
                            .Bool("spawn_transform_original",
                                  spawn_transform_original)
+                           .Bool("record_lookup_original",
+                                 record_lookup_original)
                            .UInt("constructor_rva", kRosterConstructorRva)
                            .UInt("secondary_constructor_rva", kSecondaryConstructorRva)
                            .UInt("secondary_grow_helper_rva", kSecondaryGrowHelperRva)
@@ -2788,6 +3012,10 @@ bool InstallRosterCapacity(unsigned max_players,
                               kSpawnTransformLoopOriginal.size() <=
                           capacity_patch_end,
                   "spawn transform site must stay inside the capacity range");
+    static_assert(kRecordLookupBRva >= capacity_patch_begin &&
+                      kRecordLookupARva + kRecordLookupAOriginal.size() <=
+                          capacity_patch_end,
+                  "record lookup sites must stay inside the capacity range");
     constexpr uintptr_t button_patch_begin = kMemberButtonLoopSites.front().rva;
     constexpr uintptr_t button_patch_end = 0x565acb;
     constexpr uintptr_t room_panel_patch_begin =
@@ -2917,11 +3145,12 @@ bool InstallRosterCapacity(unsigned max_players,
     const bool mission_spawn_written = WriteMissionSpawnSites(image);
     const bool participant_scaling_written =
         WriteParticipantScalingSites(image);
-    // 0x11DB21, 0x42F7C9, 0x432D65 and 0x43309E lie inside the capacity range
-    // made writable and flushed above.
+    // 0x11DB21, 0x121C40, 0x127390, 0x42F7C9, 0x432D65 and 0x43309E lie
+    // inside the capacity range made writable and flushed above.
     const bool loadout_parser_written = WriteLoadoutParserSite(image);
     const bool message_reserve_written = WriteMessageReserveSites(image);
     const bool spawn_transform_written = WriteSpawnTransformSite(image);
+    const bool record_lookup_written = WriteRecordLookupSites(image);
     EDF5_DIAGNOSTIC_PHASE(diagnostics_scope, "flush_instruction_cache",
                             capacity_patch_begin, capacity_patch_end);
     FlushInstructionCache(GetCurrentProcess(), image + capacity_patch_begin,
@@ -2941,6 +3170,7 @@ bool InstallRosterCapacity(unsigned max_players,
                           loadout_parser_written &&
                           message_reserve_written &&
                           spawn_transform_written &&
+                          record_lookup_written &&
                           RosterReplacementSitesMatch(
                               image, max_players,
                               preallocated_roster_slots);
@@ -3403,6 +3633,7 @@ bool ReleaseMissionRelayPage() {
     g_reported_replication_message_reserves_grown.store(
         0, std::memory_order_release);
     g_reported_spawn_transform_caps.store(0, std::memory_order_release);
+    g_reported_record_lookup_redirects.store(0, std::memory_order_release);
     g_reported_primary_redirects.store(0, std::memory_order_release);
     g_reported_existing_redirects.store(0, std::memory_order_release);
     g_reported_append_redirects.store(0, std::memory_order_release);
@@ -3802,6 +4033,24 @@ void PollMissionRelayTelemetry() {
                 .UInt("loop_rva", kSpawnTransformLoopRva)
                 .UInt("native_spawn_records", kMissionSpawnPointCount)
                 .Bool("stack_cookie_overwrite_prevented", true));
+    }
+
+    const uint64_t record_redirects =
+        ReadMissionRelayCounter(kRecordLookupRedirectCounterOffset);
+    const uint64_t previous_record_redirects =
+        g_reported_record_lookup_redirects.exchange(
+            record_redirects, std::memory_order_acq_rel);
+    if (record_redirects > previous_record_redirects) {
+        EDF5_CAPTURE_EVENT(
+            "more_players", "mission_record_lookup_redirect_hit",
+            capture::Fields()
+                .UInt("hits_delta", record_redirects - previous_record_redirects)
+                .UInt("hits_total", record_redirects)
+                .UInt("script_command_a_rva", 0x127260)
+                .UInt("script_command_b_rva", 0x121be0)
+                .UInt("native_record_count", kMissionSpawnPointCount)
+                .Bool("sidecar_selected", true)
+                .Bool("pointer_logged", false));
     }
 }
 
@@ -4303,6 +4552,11 @@ bool SelfTest(std::string& report) {
         report = spawn_transform_report;
         return false;
     }
+    std::string record_lookup_report;
+    if (!SelfTestRecordLookupRelayExecution(record_lookup_report)) {
+        report = record_lookup_report;
+        return false;
+    }
     std::array<uint8_t, 0x30> member_button_loop{};
     const uintptr_t member_button_base = kMemberButtonLoopSites.front().rva;
     for (const auto& site : kMemberButtonLoopSites) {
@@ -4471,7 +4725,7 @@ bool SelfTest(std::string& report) {
         report = "fail-closed restoration did not restore/reject the expected bytes";
         return false;
     }
-    report = "validated: three tables and room boxes preallocated 4->8, 24 experimental reserves/48 operands 4->8, dynamic Master/Member, MissionSync_Res filter following MaxPlayers 5..8, external eight-participant vector, modulo-four spawn, four sidecars across three persistent paths and 56 native relays executed for 3/5/8 with profile clamped to 4 without changing the real count, loadout parser stride relay executed for indices 0-8/63 keeping P4-P7 inside private blocks, both message builders sized to header+payload beyond 0x2E8, spawn transform loop capped at four records, plus fail-closed signature restoration";
+    report = "validated: three tables and room boxes preallocated 4->8, 24 experimental reserves/48 operands 4->8, dynamic Master/Member, MissionSync_Res filter following MaxPlayers 5..8, external eight-participant vector, modulo-four spawn, four sidecars across three persistent paths and 56 native relays executed for 3/5/8 with profile clamped to 4 without changing the real count, loadout parser stride relay executed for indices 0-8/63 keeping P4-P7 inside private blocks, both message builders sized to header+payload beyond 0x2E8, spawn transform loop capped at four records, script record lookups 4-7 read from sidecars, plus fail-closed signature restoration";
     return true;
 }
 
