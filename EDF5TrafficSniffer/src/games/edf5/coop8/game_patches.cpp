@@ -465,6 +465,36 @@ static_assert(kLoadoutParserInvalidCounterOffset + sizeof(uint64_t) <=
                   kMissionRelayPageSize,
               "loadout parser telemetry exceeds relay page");
 
+// EDF5's two variable-length message builders size their buffer to a fixed
+// 0x2E8 bytes and copy the caller's payload into it before (0x433000, 12-byte
+// header, rejects totals above 0x578 only afterwards) or without (0x432D20,
+// 4-byte header) any size check. Mission start with six participants sent an
+// 857-byte 0x1100 message and corrupted the host heap (live 2026-10-02).
+// Relay each initial reserve so it is max(0x2E8, header + payload size).
+constexpr uint32_t kNativeMessageReserve = 0x2e8;
+constexpr uintptr_t kReliableMessageReserveRva = 0x43309e;
+constexpr uintptr_t kReliableMessageReserveReturnRva = 0x4330a6;
+constexpr std::array<uint8_t, 8> kReliableMessageReserveOriginal = {
+    0xba, 0xe8, 0x02, 0x00, 0x00,  // mov edx,0x2e8
+    0x48, 0x8b, 0xcb,              // mov rcx,rbx
+};
+constexpr uintptr_t kReplicationMessageReserveRva = 0x432d65;
+constexpr uintptr_t kReplicationMessageReserveReturnRva = 0x432d6e;
+constexpr std::array<uint8_t, 9> kReplicationMessageReserveOriginal = {
+    0xba, 0xe8, 0x02, 0x00, 0x00,  // mov edx,0x2e8
+    0x48, 0x8d, 0x4d, 0x07,        // lea rcx,[rbp+7]
+};
+constexpr size_t kReliableMessageReserveStubOffset = 0x1400;
+constexpr size_t kReplicationMessageReserveStubOffset = 0x1480;
+constexpr size_t kReliableMessageReserveGrownCounterOffset = 0x1310;
+constexpr size_t kReplicationMessageReserveGrownCounterOffset = 0x1318;
+static_assert(kLoadoutParserInvalidCounterOffset + sizeof(uint64_t) <=
+                  kReliableMessageReserveGrownCounterOffset,
+              "message reserve telemetry overlaps loadout telemetry");
+static_assert(kReplicationMessageReserveStubOffset + 0x80 <=
+                  kMissionRelayPageSize,
+              "message reserve relays exceed relay page");
+
 uint8_t* g_mission_relay_page = nullptr;
 // Allocated once and never released: the parser hook may still be reading it
 // while a quarantine restores the original instruction.
@@ -472,6 +502,8 @@ uint8_t* g_loadout_parser_scratch = nullptr;
 std::atomic<bool> g_loadout_parser_redirect_active{false};
 std::atomic<uint64_t> g_reported_loadout_parser_extra_redirects{0};
 std::atomic<uint64_t> g_reported_loadout_parser_invalid_redirects{0};
+std::atomic<uint64_t> g_reported_reliable_message_reserves_grown{0};
+std::atomic<uint64_t> g_reported_replication_message_reserves_grown{0};
 unsigned g_mission_relay_capacity = 0;
 unsigned g_roster_patch_max_players = 0;
 unsigned g_roster_patch_preallocated_slots = 0;
@@ -951,6 +983,49 @@ bool BuildLoadoutParserRelay(uint8_t* page, uint8_t* image) {
     return stub <= page + kLoadoutParserExtraCounterOffset;
 }
 
+// rdx = max(0x2E8, [rbp+size_disp] + header_bytes), then replay the displaced
+// rcx setup and return to the native reserve call. The payload size is the
+// builder's stack argument that later becomes the memcpy length.
+bool BuildMessageReserveRelay(uint8_t* page, uint8_t* image,
+                              size_t stub_offset, uint8_t size_disp,
+                              uint8_t header_bytes,
+                              std::initializer_list<uint8_t> rcx_setup,
+                              uintptr_t return_rva, size_t counter_offset) {
+    uint8_t* stub = page + stub_offset;
+    EmitBytes(stub, {0x48, 0x8b, 0x55, size_disp,
+                     0x48, 0x83, 0xc2, header_bytes,
+                     0x48, 0x81, 0xfa});
+    std::memcpy(stub, &kNativeMessageReserve, sizeof(kNativeMessageReserve));
+    stub += sizeof(kNativeMessageReserve);
+    EmitBytes(stub, {0x77, 0x00});
+    uint8_t* grown_branch = stub - 1;
+    EmitBytes(stub, {0xba});
+    std::memcpy(stub, &kNativeMessageReserve, sizeof(kNativeMessageReserve));
+    stub += sizeof(kNativeMessageReserve);
+    EmitBytes(stub, {0xeb, 0x00});
+    uint8_t* native_branch = stub - 1;
+    uint8_t* grown = stub;
+    if (!EmitLockIncrement(stub, page + counter_offset)) return false;
+    uint8_t* done = stub;
+    EmitBytes(stub, rcx_setup);
+    return EmitRelative32(stub, 0xe9, image + return_rva) &&
+           PatchRelative8(grown_branch, grown) &&
+           PatchRelative8(native_branch, done) &&
+           stub <= page + stub_offset + 0x80;
+}
+
+bool BuildMessageReserveRelays(uint8_t* page, uint8_t* image) {
+    return page && image &&
+        BuildMessageReserveRelay(
+            page, image, kReliableMessageReserveStubOffset, 0x77, 0x0c,
+            {0x48, 0x8b, 0xcb}, kReliableMessageReserveReturnRva,
+            kReliableMessageReserveGrownCounterOffset) &&
+        BuildMessageReserveRelay(
+            page, image, kReplicationMessageReserveStubOffset, 0x7f, 0x04,
+            {0x48, 0x8d, 0x4d, 0x07}, kReplicationMessageReserveReturnRva,
+            kReplicationMessageReserveGrownCounterOffset);
+}
+
 bool BuildMissionRelayPage(uint8_t* image, unsigned max_players) {
     if (g_mission_relay_page) {
         return g_mission_relay_capacity == max_players;
@@ -1114,10 +1189,15 @@ bool BuildMissionRelayPage(uint8_t* image, unsigned max_players) {
     }
 
     if (!BuildParticipantScalingRelays(page) ||
-        !BuildLoadoutParserRelay(page, image)) {
+        !BuildLoadoutParserRelay(page, image) ||
+        !BuildMessageReserveRelays(page, image)) {
         return fail();
     }
 
+    std::memset(page + kReliableMessageReserveGrownCounterOffset, 0,
+                sizeof(uint64_t));
+    std::memset(page + kReplicationMessageReserveGrownCounterOffset, 0,
+                sizeof(uint64_t));
     std::memset(page + kLoadoutParserExtraCounterOffset, 0,
                 sizeof(uint64_t));
     std::memset(page + kLoadoutParserInvalidCounterOffset, 0,
@@ -1489,6 +1569,57 @@ bool WriteLoadoutParserSite(uint8_t* image) {
     return true;
 }
 
+template <size_t N>
+bool RelayJumpSiteMatches(const uint8_t* image, uintptr_t rva,
+                          const std::array<uint8_t, N>& original,
+                          size_t stub_offset, bool replacement) {
+    const uint8_t* site = image + rva;
+    if (!replacement) {
+        return std::memcmp(site, original.data(), original.size()) == 0;
+    }
+    if (!g_mission_relay_page ||
+        Relative32Target(site, 0xe9) != g_mission_relay_page + stub_offset) {
+        return false;
+    }
+    for (size_t index = 5; index < original.size(); ++index) {
+        if (site[index] != 0x90) return false;
+    }
+    return true;
+}
+
+template <size_t N>
+bool WriteRelayJumpSite(uint8_t* image, uintptr_t rva,
+                        const std::array<uint8_t, N>& original,
+                        size_t stub_offset) {
+    if (!g_mission_relay_page ||
+        !WriteRelative32(image + rva, 0xe9,
+                         g_mission_relay_page + stub_offset)) {
+        return false;
+    }
+    std::memset(image + rva + 5, 0x90, original.size() - 5);
+    return true;
+}
+
+bool MessageReserveSitesMatch(const uint8_t* image, bool replacement) {
+    return RelayJumpSiteMatches(image, kReliableMessageReserveRva,
+                                kReliableMessageReserveOriginal,
+                                kReliableMessageReserveStubOffset,
+                                replacement) &&
+           RelayJumpSiteMatches(image, kReplicationMessageReserveRva,
+                                kReplicationMessageReserveOriginal,
+                                kReplicationMessageReserveStubOffset,
+                                replacement);
+}
+
+bool WriteMessageReserveSites(uint8_t* image) {
+    return WriteRelayJumpSite(image, kReliableMessageReserveRva,
+                              kReliableMessageReserveOriginal,
+                              kReliableMessageReserveStubOffset) &&
+           WriteRelayJumpSite(image, kReplicationMessageReserveRva,
+                              kReplicationMessageReserveOriginal,
+                              kReplicationMessageReserveStubOffset);
+}
+
 bool RosterReplacementSitesMatch(const uint8_t* image, unsigned max_players,
                                  unsigned preallocated_roster_slots) {
     return image &&
@@ -1503,6 +1634,7 @@ bool RosterReplacementSitesMatch(const uint8_t* image, unsigned max_players,
         MissionSpawnSitesMatch(image, true) &&
         ParticipantScalingSitesMatch(image, true) &&
         LoadoutParserSiteMatches(image, true) &&
+        MessageReserveSitesMatch(image, true) &&
         MemberButtonKeysMatch(image);
 }
 
@@ -1518,6 +1650,7 @@ bool RosterOriginalSitesMatch(const uint8_t* image) {
         MissionSpawnSitesMatch(image, false) &&
         ParticipantScalingSitesMatch(image, false) &&
         LoadoutParserSiteMatches(image, false) &&
+        MessageReserveSitesMatch(image, false) &&
         MemberButtonKeysMatch(image);
 }
 
@@ -1526,6 +1659,12 @@ void WriteRosterOriginalSites(uint8_t* image) {
     std::memcpy(image + kLoadoutParserStrideRva,
                 kLoadoutParserStrideOriginal.data(),
                 kLoadoutParserStrideOriginal.size());
+    std::memcpy(image + kReliableMessageReserveRva,
+                kReliableMessageReserveOriginal.data(),
+                kReliableMessageReserveOriginal.size());
+    std::memcpy(image + kReplicationMessageReserveRva,
+                kReplicationMessageReserveOriginal.data(),
+                kReplicationMessageReserveOriginal.size());
     WriteCapacity(image + kCapacityRegionRva, kOriginalCapacity);
     WriteSecondarySites(image, kOriginalCapacity);
     WriteTertiarySites(image, kOriginalCapacity);
@@ -2045,13 +2184,161 @@ bool SelfTestLoadoutParserRelayExecution(std::string& report) {
     }
 
     g_loadout_parser_redirect_active.store(true, std::memory_order_release);
+    if (!LoadoutParserStrideRelayInstalled(image)) {
+        return finish(false, "installed loadout relay was not reported");
+    }
     WriteRosterOriginalSites(image);
     if (!LoadoutParserSiteMatches(image, false) ||
-        g_loadout_parser_redirect_active.load(std::memory_order_acquire)) {
+        g_loadout_parser_redirect_active.load(std::memory_order_acquire) ||
+        LoadoutParserStrideRelayInstalled(image)) {
         return finish(false, "loadout relay restore left the redirect active");
     }
     return finish(true,
                   "parser stride relay keeps P0-P3 native, sends P4-P7 to private blocks and guards index>=8");
+}
+
+struct MessageReserveExecutionContext {
+    uint64_t rbp = 0;
+    uint64_t rbx = 0;
+    uint64_t rdx_out = 0;
+    uint64_t rcx_out = 0;
+};
+static_assert(sizeof(MessageReserveExecutionContext) == 0x20,
+              "message reserve test context layout changed");
+
+using MessageReserveExecutionThunk =
+    void(__fastcall*)(MessageReserveExecutionContext*, void*);
+
+MessageReserveExecutionThunk BuildMessageReserveExecutionThunk(
+    uint8_t*& allocation) {
+    // Load the builder's rbp/rbx, enter the patched site (which returns
+    // through a ret placed at the native call), then capture rdx/rcx.
+    constexpr uint8_t code[] = {
+        0x53,
+        0x55,
+        0x41, 0x54,
+        0x48, 0x83, 0xec, 0x20,
+        0x49, 0x89, 0xcc,
+        0x49, 0x8b, 0x2c, 0x24,
+        0x49, 0x8b, 0x5c, 0x24, 0x08,
+        0xff, 0xd2,
+        0x49, 0x89, 0x54, 0x24, 0x10,
+        0x49, 0x89, 0x4c, 0x24, 0x18,
+        0x48, 0x83, 0xc4, 0x20,
+        0x41, 0x5c,
+        0x5d,
+        0x5b,
+        0xc3,
+    };
+    allocation = static_cast<uint8_t*>(VirtualAlloc(
+        nullptr, sizeof(code), MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE));
+    if (!allocation) return nullptr;
+    std::memcpy(allocation, code, sizeof(code));
+    FlushInstructionCache(GetCurrentProcess(), allocation, sizeof(code));
+    return reinterpret_cast<MessageReserveExecutionThunk>(allocation);
+}
+
+bool SelfTestMessageReserveRelayExecution(std::string& report) {
+    if (g_mission_relay_page) {
+        report = "message reserve microtest refused: relay page already live";
+        return false;
+    }
+    // WriteRosterOriginalSites below also restores every other site, the
+    // highest being the room panels near 0x5A72E0.
+    constexpr size_t kFakeImageSize = kLoadoutParserStateSlotRva + 0x1000;
+    auto* image = static_cast<uint8_t*>(VirtualAlloc(
+        nullptr, kFakeImageSize, MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE));
+    uint8_t* thunk_allocation = nullptr;
+    const MessageReserveExecutionThunk thunk =
+        image ? BuildMessageReserveExecutionThunk(thunk_allocation) : nullptr;
+    auto finish = [&](bool result, const std::string& message) {
+        if (g_mission_relay_page) {
+            VirtualFree(g_mission_relay_page, 0, MEM_RELEASE);
+            g_mission_relay_page = nullptr;
+            g_mission_relay_capacity = 0;
+        }
+        g_loadout_parser_redirect_active.store(false,
+                                               std::memory_order_release);
+        if (thunk_allocation) VirtualFree(thunk_allocation, 0, MEM_RELEASE);
+        if (image) VirtualFree(image, 0, MEM_RELEASE);
+        report = message;
+        return result;
+    };
+    if (!image || !thunk) {
+        return finish(false, "could not allocate the message reserve microtest");
+    }
+    std::memcpy(image + kReliableMessageReserveRva,
+                kReliableMessageReserveOriginal.data(),
+                kReliableMessageReserveOriginal.size());
+    std::memcpy(image + kReplicationMessageReserveRva,
+                kReplicationMessageReserveOriginal.data(),
+                kReplicationMessageReserveOriginal.size());
+    image[kReliableMessageReserveReturnRva] = 0xc3;
+    image[kReplicationMessageReserveReturnRva] = 0xc3;
+    if (!MessageReserveSitesMatch(image, false) ||
+        !BuildMissionRelayPage(image, 8) ||
+        !WriteMessageReserveSites(image) ||
+        !MessageReserveSitesMatch(image, true) ||
+        MessageReserveSitesMatch(image, false)) {
+        return finish(false, "message reserve relays were not installed");
+    }
+    FlushInstructionCache(GetCurrentProcess(), image, kFakeImageSize);
+
+    struct Builder {
+        uintptr_t site_rva;
+        uint8_t size_disp;
+        uint64_t header_bytes;
+        size_t counter_offset;
+        bool rcx_is_rbx;
+    };
+    constexpr std::array<Builder, 2> kBuilders = {{
+        {kReliableMessageReserveRva, 0x77, 12,
+         kReliableMessageReserveGrownCounterOffset, true},
+        {kReplicationMessageReserveRva, 0x7f, 4,
+         kReplicationMessageReserveGrownCounterOffset, false},
+    }};
+    // 845 is the payload of the 857-byte 0x1100 message from the live crash.
+    constexpr std::array<uint64_t, 7> kPayloads = {
+        0, 100, 0x2dc, 0x2dd, 0x2e4, 845, 4000,
+    };
+    alignas(16) std::array<uint8_t, 0x100> frame{};
+    for (const Builder& builder : kBuilders) {
+        uint64_t expected_grown = 0;
+        for (const uint64_t payload : kPayloads) {
+            std::memcpy(frame.data() + builder.size_disp, &payload,
+                        sizeof(payload));
+            MessageReserveExecutionContext context{};
+            context.rbp = reinterpret_cast<uint64_t>(frame.data());
+            context.rbx = 0x1122334455667788ULL;
+            thunk(&context, image + builder.site_rva);
+            const uint64_t needed = payload + builder.header_bytes;
+            const uint64_t expected_rdx =
+                needed > kNativeMessageReserve ? needed : kNativeMessageReserve;
+            expected_grown += needed > kNativeMessageReserve ? 1 : 0;
+            const uint64_t expected_rcx = builder.rcx_is_rbx
+                ? context.rbx : context.rbp + 7;
+            if (context.rdx_out != expected_rdx ||
+                context.rcx_out != expected_rcx) {
+                return finish(false, "message reserve relay at " +
+                                         std::to_string(builder.site_rva) +
+                                         " mis-sized payload " +
+                                         std::to_string(payload));
+            }
+        }
+        if (ReadMissionRelayCounter(builder.counter_offset) !=
+            expected_grown) {
+            return finish(false, "message reserve telemetry count mismatch");
+        }
+    }
+
+    WriteRosterOriginalSites(image);
+    if (!MessageReserveSitesMatch(image, false)) {
+        return finish(false, "message reserve restore left a relay jump");
+    }
+    return finish(true,
+                  "both message builders reserve max(0x2E8, header+payload) for payloads 0..4000 and restore cleanly");
 }
 
 struct MissionHarnessRecord {
@@ -2147,11 +2434,12 @@ bool InstallRosterCapacity(unsigned max_players,
     const bool participant_scaling_ready =
         ParticipantScalingSitesMatch(image, true);
     const bool loadout_parser_ready = LoadoutParserSiteMatches(image, true);
+    const bool message_reserve_ready = MessageReserveSitesMatch(image, true);
     if (primary_ready && secondary_ready && tertiary_ready && room_panels_ready &&
         mission_result_participants_ready &&
         member_buttons_ready && mission_participants_ready && mission_spawns_ready &&
         participant_scaling_ready && loadout_parser_ready &&
-        MemberButtonKeysMatch(image)) {
+        message_reserve_ready && MemberButtonKeysMatch(image)) {
         g_roster_patch_max_players = max_players;
         g_roster_patch_preallocated_slots = preallocated_roster_slots;
         g_loadout_parser_redirect_active.store(true,
@@ -2234,6 +2522,8 @@ bool InstallRosterCapacity(unsigned max_players,
         ParticipantScalingSitesMatch(image, false);
     const bool loadout_parser_original =
         LoadoutParserSiteMatches(image, false);
+    const bool message_reserve_original =
+        MessageReserveSitesMatch(image, false);
     if ((!primary_ready && !primary_original) ||
         (!secondary_ready && !secondary_original) ||
         (!tertiary_ready && !tertiary_original) ||
@@ -2245,6 +2535,7 @@ bool InstallRosterCapacity(unsigned max_players,
         (!mission_spawns_ready && !mission_spawns_original) ||
         (!participant_scaling_ready && !participant_scaling_original) ||
         (!loadout_parser_ready && !loadout_parser_original) ||
+        (!message_reserve_ready && !message_reserve_original) ||
         !MemberButtonKeysMatch(image)) {
         EDF5_CAPTURE_EVENT("more_players", "roster_capacity_patch_failed",
                        capture::Fields().String("reason", "EDF5 byte signature mismatch")
@@ -2252,6 +2543,8 @@ bool InstallRosterCapacity(unsigned max_players,
                                  kLoadoutParserStrideRva)
                            .Bool("loadout_parser_original",
                                  loadout_parser_original)
+                           .Bool("message_reserve_original",
+                                 message_reserve_original)
                            .UInt("constructor_rva", kRosterConstructorRva)
                            .UInt("secondary_constructor_rva", kSecondaryConstructorRva)
                            .UInt("secondary_grow_helper_rva", kSecondaryGrowHelperRva)
@@ -2304,6 +2597,11 @@ bool InstallRosterCapacity(unsigned max_players,
                               kLoadoutParserStrideOriginal.size() <=
                           capacity_patch_end,
                   "loadout parser site must stay inside the capacity range");
+    static_assert(kReplicationMessageReserveRva >= capacity_patch_begin &&
+                      kReliableMessageReserveRva +
+                              kReliableMessageReserveOriginal.size() <=
+                          capacity_patch_end,
+                  "message reserve sites must stay inside the capacity range");
     constexpr uintptr_t button_patch_begin = kMemberButtonLoopSites.front().rva;
     constexpr uintptr_t button_patch_end = 0x565acb;
     constexpr uintptr_t room_panel_patch_begin =
@@ -2433,8 +2731,10 @@ bool InstallRosterCapacity(unsigned max_players,
     const bool mission_spawn_written = WriteMissionSpawnSites(image);
     const bool participant_scaling_written =
         WriteParticipantScalingSites(image);
-    // 0x42F7C9 lies inside the capacity range made writable and flushed above.
+    // 0x42F7C9, 0x432D65 and 0x43309E lie inside the capacity range made
+    // writable and flushed above.
     const bool loadout_parser_written = WriteLoadoutParserSite(image);
+    const bool message_reserve_written = WriteMessageReserveSites(image);
     EDF5_DIAGNOSTIC_PHASE(diagnostics_scope, "flush_instruction_cache",
                             capacity_patch_begin, capacity_patch_end);
     FlushInstructionCache(GetCurrentProcess(), image + capacity_patch_begin,
@@ -2452,6 +2752,7 @@ bool InstallRosterCapacity(unsigned max_players,
                           mission_spawn_written &&
                           participant_scaling_written &&
                           loadout_parser_written &&
+                          message_reserve_written &&
                           RosterReplacementSitesMatch(
                               image, max_players,
                               preallocated_roster_slots);
@@ -2909,6 +3210,10 @@ bool ReleaseMissionRelayPage() {
         0, std::memory_order_release);
     g_reported_loadout_parser_invalid_redirects.store(
         0, std::memory_order_release);
+    g_reported_reliable_message_reserves_grown.store(
+        0, std::memory_order_release);
+    g_reported_replication_message_reserves_grown.store(
+        0, std::memory_order_release);
     g_reported_primary_redirects.store(0, std::memory_order_release);
     g_reported_existing_redirects.store(0, std::memory_order_release);
     g_reported_append_redirects.store(0, std::memory_order_release);
@@ -3264,6 +3569,34 @@ void PollMissionRelayTelemetry() {
                 .UInt("native_block_count", 4)
                 .Bool("mission_state_overflow_prevented", true)
                 .Bool("pointer_logged", false));
+    }
+
+    const uint64_t reliable_grown =
+        ReadMissionRelayCounter(kReliableMessageReserveGrownCounterOffset);
+    const uint64_t replication_grown =
+        ReadMissionRelayCounter(kReplicationMessageReserveGrownCounterOffset);
+    const uint64_t previous_reliable_grown =
+        g_reported_reliable_message_reserves_grown.exchange(
+            reliable_grown, std::memory_order_acq_rel);
+    const uint64_t previous_replication_grown =
+        g_reported_replication_message_reserves_grown.exchange(
+            replication_grown, std::memory_order_acq_rel);
+    if (reliable_grown > previous_reliable_grown ||
+        replication_grown > previous_replication_grown) {
+        EDF5_CAPTURE_EVENT(
+            "more_players", "outgoing_message_reserve_grown",
+            capture::Fields()
+                .UInt("reliable_builder_rva", 0x433000)
+                .UInt("reliable_grown_delta",
+                      reliable_grown - previous_reliable_grown)
+                .UInt("reliable_grown_total", reliable_grown)
+                .UInt("replication_builder_rva", 0x432d20)
+                .UInt("replication_grown_delta",
+                      replication_grown - previous_replication_grown)
+                .UInt("replication_grown_total", replication_grown)
+                .UInt("native_reserve_bytes", kNativeMessageReserve)
+                .Bool("heap_overflow_prevented", true)
+                .Bool("payload_logged", false));
     }
 }
 
@@ -3755,6 +4088,11 @@ bool SelfTest(std::string& report) {
         report = loadout_relay_report;
         return false;
     }
+    std::string message_reserve_report;
+    if (!SelfTestMessageReserveRelayExecution(message_reserve_report)) {
+        report = message_reserve_report;
+        return false;
+    }
     std::array<uint8_t, 0x30> member_button_loop{};
     const uintptr_t member_button_base = kMemberButtonLoopSites.front().rva;
     for (const auto& site : kMemberButtonLoopSites) {
@@ -3923,7 +4261,7 @@ bool SelfTest(std::string& report) {
         report = "fail-closed restoration did not restore/reject the expected bytes";
         return false;
     }
-    report = "validated: three tables and room boxes preallocated 4->8, 24 experimental reserves/48 operands 4->8, dynamic Master/Member, MissionSync_Res filter following MaxPlayers 5..8, external eight-participant vector, modulo-four spawn, four sidecars across three persistent paths and 56 native relays executed for 3/5/8 with profile clamped to 4 without changing the real count, loadout parser stride relay executed for indices 0-8/63 keeping P4-P7 inside private blocks, plus fail-closed signature restoration";
+    report = "validated: three tables and room boxes preallocated 4->8, 24 experimental reserves/48 operands 4->8, dynamic Master/Member, MissionSync_Res filter following MaxPlayers 5..8, external eight-participant vector, modulo-four spawn, four sidecars across three persistent paths and 56 native relays executed for 3/5/8 with profile clamped to 4 without changing the real count, loadout parser stride relay executed for indices 0-8/63 keeping P4-P7 inside private blocks, both message builders sized to header+payload beyond 0x2E8, plus fail-closed signature restoration";
     return true;
 }
 
