@@ -133,6 +133,26 @@ Hook changes must preserve ABI, native return values and transactional rollback.
 Record the executable signatures and evidence behind each patch. Keep game
 addresses isolated and distinguish offline validation from in-game observations.
 
+## Credits
+
+Thanks to **[mi9202](https://github.com/mi9202)** for
+[pull request #1](https://github.com/BurguerJohn/EarthDefenseForce-8PlayerMod/pull/1),
+researched and tested in six-player sessions:
+
+- **Vehicle rear seats:** players 5-8 can ride in a rear seat of the Caliban
+  and of cars with more than four seats. Previously they could only drive, and
+  the native seat pickers wrote past the end of their seat list. Ported in
+  0.6.78 together with the PR's execution self-tests.
+- **Enemy HP with 5-8 players:** enemy health keeps scaling past the
+  four-player value. On Inferno that is 1.25/1.30/1.35/1.40 for 5/6/7/8
+  players. It can be configured with `ExtendedEnemyHealthScaling` and
+  `EnemyHealth5Players`..`EnemyHealth8Players`. Ported in 0.6.78.
+- **Six-player crash fixes:** the PR independently fixed the player 5-8 loadout
+  blocks, the mission-start message reserve, the spawn transform loop and
+  script records 4-7. It reached the same diagnosis as this mod's 0.6.66 and
+  0.6.77 fixes, and gave them independent confirmation. Those existing
+  implementations were kept.
+
 ## Publishing and licensing
 
 Initialize Git in this directory. Before committing, inspect `git status --short`
