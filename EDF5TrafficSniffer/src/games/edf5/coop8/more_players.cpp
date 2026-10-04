@@ -2103,6 +2103,8 @@ thread_local MissionPlayerCreateTrace g_mission_player_create_trace{};
 thread_local MissionLoadoutBlockPatch g_mission_loadout_block_patch{};
 thread_local MissionLoadoutParserProtection
     g_mission_loadout_parser_protection{};
+// Self-test stand-in for game_patches::LoadoutParserExtraScratch().
+std::atomic<uint8_t*> g_loadout_parser_redirect_test_scratch{nullptr};
 thread_local void* g_replication_incoming_user = nullptr;
 
 void PublishDiagnosticState(const char* phase = nullptr,
@@ -2821,6 +2823,27 @@ bool SignatureMatches(const uint8_t* base, size_t image_size, uintptr_t rva,
     return matches;
 }
 
+// game_patches installs before these checks and may already have replaced
+// the leading seven-byte imul with a jump to its parser stride relay. The
+// instructions after it must still be native.
+bool LoadoutParserStrideSignatureMatches(const uint8_t* base,
+                                         size_t image_size) {
+    constexpr size_t kRelayedBytes = 7;
+    static_assert(sizeof(kMissionLoadoutParserStrideSignature) >
+                      kRelayedBytes,
+                  "stride signature must extend past the relayed imul");
+    if (!game_patches::LoadoutParserStrideRelayInstalled(base)) {
+        return SignatureMatches(base, image_size,
+                                kMissionLoadoutParserStrideRva,
+                                kMissionLoadoutParserStrideSignature,
+                                sizeof(kMissionLoadoutParserStrideSignature));
+    }
+    return SignatureMatches(
+        base, image_size, kMissionLoadoutParserStrideRva + kRelayedBytes,
+        kMissionLoadoutParserStrideSignature + kRelayedBytes,
+        sizeof(kMissionLoadoutParserStrideSignature) - kRelayedBytes);
+}
+
 bool RelativeCallTargets(const uint8_t* base, size_t image_size,
                          uintptr_t call_rva, uintptr_t target_rva) {
     if (!base || call_rva > image_size || 5 > image_size - call_rva ||
@@ -3070,10 +3093,7 @@ bool ValidateUserReadyLayout(uint8_t* base, size_t image_size) {
                           kMissionLoadoutConsumerRecordRva,
                           kMissionLoadoutConsumerRecordSignature,
                           sizeof(kMissionLoadoutConsumerRecordSignature)) ||
-        !SignatureMatches(base, image_size,
-                          kMissionLoadoutParserStrideRva,
-                          kMissionLoadoutParserStrideSignature,
-                          sizeof(kMissionLoadoutParserStrideSignature)) ||
+        !LoadoutParserStrideSignatureMatches(base, image_size) ||
         !SignatureMatches(base, image_size,
                           kMissionLoadoutParserRecordRva,
                           kMissionLoadoutParserRecordSignature,
@@ -7348,9 +7368,19 @@ uint32_t MissionLoadoutWeaponValidMask(int32_t logical_index,
     return mask;
 }
 
+// With the parser stride relay installed, extra blocks live in private
+// scratch and no weapon overlaps the result participant count.
+uint8_t* ActiveLoadoutParserRedirectScratch() {
+    uint8_t* test_scratch = g_loadout_parser_redirect_test_scratch.load(
+        std::memory_order_acquire);
+    return test_scratch ? test_scratch
+                        : game_patches::LoadoutParserExtraScratch();
+}
+
 bool CaptureMissionExtraLoadoutSidecar(const uint8_t* block,
                                        int32_t logical_index,
-                                       unsigned parser_call) {
+                                       unsigned parser_call,
+                                       bool overlaps_result_state) {
     if (!block ||
         logical_index < static_cast<int32_t>(kNativeMissionSourceCount) ||
         logical_index >= static_cast<int32_t>(
@@ -7376,8 +7406,10 @@ bool CaptureMissionExtraLoadoutSidecar(const uint8_t* block,
             kMissionLoadoutRecordStride;
     std::memcpy(incoming.weapons.data(), active_record,
                 sizeof(incoming.weapons));
-    incoming.weapon_valid_mask = MissionLoadoutWeaponValidMask(
-        logical_index, incoming.selected_class);
+    incoming.weapon_valid_mask = overlaps_result_state
+        ? MissionLoadoutWeaponValidMask(logical_index,
+                                        incoming.selected_class)
+        : kMissionLoadoutWeaponMask;
     std::memcpy(&incoming.armor, block + kMissionLoadoutArmorOffset,
                 sizeof(incoming.armor));
     incoming.valid = true;
@@ -7687,13 +7719,17 @@ bool __fastcall FakeMissionLoadoutParser(int32_t, bool* failed) {
     const size_t extra_blocks = participant_capacity >
             kNativeMissionSourceCount
         ? participant_capacity - kNativeMissionSourceCount : 0;
+    // Write where the real parser would: private scratch while the stride
+    // relay is installed, otherwise past the four native blocks.
+    uint8_t* const redirect_scratch = ActiveLoadoutParserRedirectScratch();
+    uint8_t* const extra = redirect_scratch
+        ? redirect_scratch : state + kMissionExtraLoadoutBeginOffset;
     if (extra_blocks) {
-        std::memset(state + kMissionExtraLoadoutBeginOffset, 0xa5,
-                    extra_blocks * kMissionClassLoadoutStride);
-        // Class 1 deliberately places weapon 4 over participant_count.  The
-        // native parser writes all weapons first and then stores count 5, so
-        // the sidecar must mark only that overwritten weapon as unavailable.
-        auto* fifth = state + kMissionExtraLoadoutBeginOffset;
+        std::memset(extra, 0xa5, extra_blocks * kMissionClassLoadoutStride);
+        // In the native layout class 1 places weapon 4 over participant_count.
+        // The parser writes all weapons first and then stores count 5, so the
+        // sidecar must mark only that overwritten weapon as unavailable.
+        auto* fifth = extra;
         const int32_t selected_class = 1;
         const std::array<int32_t, kMissionLoadoutWeaponCount> weapons = {
             1040, 1041, 1042, 1043, 1044, 1045,
@@ -7741,13 +7777,29 @@ bool __fastcall MissionLoadoutParserHook(int32_t argument, bool* failed) {
                               sizeof(void*))) {
         std::memcpy(&state, g_mission_loadout_state_slot, sizeof(state));
     }
-    uint8_t* extra_begin = state
-        ? state + kMissionExtraLoadoutBeginOffset : nullptr;
-    const bool protected_call = bytes &&
-        IsReadableMemoryRange(extra_begin, bytes);
+    // With the stride relay installed the parser writes P4-P7 into private
+    // scratch, so nothing outside the native mission state is snapshotted or
+    // restored. Without it, fall back to rolling back the native overflow.
+    uint8_t* const redirect_scratch = ActiveLoadoutParserRedirectScratch();
+    const bool native_overlap = redirect_scratch == nullptr;
+    uint8_t* extra_begin = nullptr;
+    if (state) {
+        extra_begin = native_overlap
+            ? state + kMissionExtraLoadoutBeginOffset : redirect_scratch;
+    }
+    const bool protected_call = bytes && extra_begin &&
+        IsReadableMemoryRange(extra_begin, bytes) &&
+        IsReadableMemoryRange(state + kMissionRewardLocalProfileCountOffset,
+                              kMissionResultParticipantCountOffset +
+                                  sizeof(int32_t) -
+                                  kMissionRewardLocalProfileCountOffset);
     int32_t local_profiles_before = -1;
     int32_t participant_count_before = -1;
     if (protected_call) {
+        if (!native_overlap) {
+            // Every block the parser fills now differs from this pattern.
+            std::memset(redirect_scratch, 0xa5, bytes);
+        }
         protection.active = true;
         protection.state = state;
         protection.bytes = bytes;
@@ -7810,7 +7862,7 @@ bool __fastcall MissionLoadoutParserHook(int32_t argument, bool* failed) {
     size_t changed_bytes = 0;
     uint32_t changed_block_mask = 0;
     for (size_t index = 0; index < bytes; ++index) {
-        const bool participant_count_byte =
+        const bool participant_count_byte = native_overlap &&
             index >= participant_count_relative &&
             index < participant_count_relative + sizeof(int32_t);
         if (!participant_count_byte &&
@@ -7839,7 +7891,7 @@ bool __fastcall MissionLoadoutParserHook(int32_t argument, bool* failed) {
         if (CaptureMissionExtraLoadoutSidecar(
                 extra_begin +
                     extra_index * kMissionClassLoadoutStride,
-                logical_index, parser_call)) {
+                logical_index, parser_call, native_overlap)) {
             captured_sidecar_mask |= bit;
             const MissionExtraLoadoutSidecar sidecar =
                 FindMissionExtraLoadoutSidecar(logical_index);
@@ -7913,6 +7965,7 @@ bool __fastcall MissionLoadoutParserHook(int32_t argument, bool* failed) {
             .Bool("parser_result", result)
             .Bool("parser_failed", parser_failed)
             .Bool("parser_return_controls_participant_count", false)
+            .Bool("extra_blocks_redirected", !native_overlap)
             .Bool("restored", restored)
             .Bool("sidecar_captured_before_restore",
                   captured_sidecar_mask != 0)
@@ -13657,6 +13710,89 @@ void SyntheticAuthValidationDelivered(uint64_t user) {
     ReleaseSRWLockExclusive(&g_state_lock);
 }
 
+// The stride relay sends P4-P7 to private scratch. The hook must then leave
+// every mission-state byte past the four native blocks untouched (except the
+// native participant count), keep rewards intact and capture all six weapons.
+bool SelfTestRedirectedLoadoutParser(std::string& report) {
+    std::vector<uint8_t> state_bytes(
+        kMissionExtraLoadoutBeginOffset + kMissionExtraLoadoutSpan, 0x3c);
+    std::vector<uint8_t> scratch(kMissionExtraLoadoutSpan, 0);
+    const int32_t local_profiles_before = 1;
+    const int32_t participant_count_before = 4;
+    std::memcpy(state_bytes.data() + kMissionRewardLocalProfileCountOffset,
+                &local_profiles_before, sizeof(local_profiles_before));
+    std::memcpy(state_bytes.data() + kMissionResultParticipantCountOffset,
+                &participant_count_before, sizeof(participant_count_before));
+    const std::vector<uint8_t> state_before = state_bytes;
+    void* state_pointer = state_bytes.data();
+    void** const previous_state_slot = g_mission_loadout_state_slot;
+
+    auto reset = [&] {
+        g_loadout_parser_redirect_test_scratch.store(
+            nullptr, std::memory_order_release);
+        g_mission_loadout_parser = nullptr;
+        g_mission_loadout_state_slot = previous_state_slot;
+        g_mission_loadout_parser_protection = {};
+        ClearMissionExtraLoadoutSidecars();
+        g_mission_loadout_parser_calls.store(0, std::memory_order_release);
+        g_mission_loadout_parser_protected_calls.store(
+            0, std::memory_order_release);
+        g_mission_loadout_parser_oob_calls.store(0,
+                                                 std::memory_order_release);
+        g_fake_mission_loadout_parser_calls.store(0,
+                                                  std::memory_order_release);
+    };
+    auto fail = [&](const char* message) {
+        reset();
+        report = message;
+        return false;
+    };
+    reset();
+    g_mission_loadout_state_slot = &state_pointer;
+    g_loadout_parser_redirect_test_scratch.store(scratch.data(),
+                                                 std::memory_order_release);
+    g_mission_loadout_parser = &FakeMissionLoadoutParser;
+
+    bool failed = true;
+    const bool result = MissionLoadoutParserHook(123, &failed);
+    const size_t bytes =
+        (std::min(MaxPlayers(), kMaximumMissionParticipants) -
+         kNativeMissionSourceCount) * kMissionClassLoadoutStride;
+
+    std::vector<uint8_t> state_expected = state_before;
+    const int32_t participant_count_expected = 5;
+    std::memcpy(state_expected.data() + kMissionResultParticipantCountOffset,
+                &participant_count_expected,
+                sizeof(participant_count_expected));
+    if (result || failed || state_bytes != state_expected) {
+        return fail("redirected parser changed mission state beyond the "
+                    "native participant count");
+    }
+    for (size_t index = 0; index < bytes; ++index) {
+        if (scratch[index] != 0xa5) {
+            return fail("redirected parser scratch was not reset");
+        }
+    }
+    const MissionExtraLoadoutSidecar fifth = FindMissionExtraLoadoutSidecar(4);
+    const std::array<int32_t, kMissionLoadoutWeaponCount> weapons = {
+        1040, 1041, 1042, 1043, 1044, 1045,
+    };
+    if (!fifth.valid || fifth.logical_index != 4 ||
+        fifth.selected_class != 1 || fifth.weapons != weapons ||
+        fifth.weapon_valid_mask != kMissionLoadoutWeaponMask ||
+        fifth.armor != 456 ||
+        g_mission_loadout_parser_protected_calls.load(
+            std::memory_order_acquire) != 1 ||
+        g_mission_loadout_parser_oob_calls.load(
+            std::memory_order_acquire) != 1 ||
+        g_mission_loadout_parser_protection.active) {
+        return fail("redirected parser did not capture all six P4 weapons");
+    }
+    reset();
+    report = "redirected P4-P7 parser blocks leave mission state intact";
+    return true;
+}
+
 bool SelfTest(std::string& report) {
     constexpr uint64_t local_id = 76561198000000001ULL;
     constexpr uint64_t test_lobby = 109775241799999998ULL;
@@ -13671,6 +13807,7 @@ bool SelfTest(std::string& report) {
     }
     if (!mission_spawn::SelfTest(report)) return false;
     if (!mission_result_recovery::SelfTest(report)) return false;
+    if (!SelfTestRedirectedLoadoutParser(report)) return false;
 
     auto reset_state = [] {
         if (g_mission_loadout_block_patch.active) {
@@ -16033,7 +16170,7 @@ bool SelfTest(std::string& report) {
     g_ready_user_test_mode.store(false, std::memory_order_release);
     Stop();
     reset_state();
-    report = "ok: dynamic room up to 8/8; one native local EDF5_MultiSlotMod/version banner per create/join without identity or Steam send; PlayerInfo RAX preserved; P4-P7 parser safely captures sidecars, accepts valid count despite false return, masks overlapping weapon and restores out-of-range blocks without losing participants/rewards; extra class uses PlayerInfo/sidecar within 0..3; direct/fallback UserImpl source; fifth-player scratch synthesizes/restores class-weapons-armor and restores the unique index before map consumers; private distinct PlayerInfo name tokens/source indices; isolated per-participant sender/owner correlation without real chat text; registered order/local subset and participant-control assignment; replication detects duplicate UserImpl; dynamic receive table detects missing/duplicate P0 route and per-participant 0x3300/0x3400; runtime spawn multiplies 10->20, repairs 0/4 during call, restores zero and preserves concurrent mutation; GeneratorPoll preserves Update and RAX/AL, correlates update/base/gate/spawn/boundary and classifies cooldown/quota/false/accepted returns; native host-only recovery publishes UI event 1/2, closes object id 2 and returns effective result 1; independent Exec_Begin/Sync_MissionResult/ResolveResult/ApplyResult pipeline checks extra Items mask, defensively restores local count 0->1 before rewards, proves native Exec_Begin cancels the queue without requeue/duplication and new generations discard all previous mission state; Local Mission Harness F3 cycles host+3/host+4/off with distinct UserImpl, Ready, early l1/l2, preceding controller gate limited to states 1..5 and zero real peers, fail-closed global Matching 4->5 without fabricated packets and local result sync; loadout, PlayersGroup, callbacks, P2P, authentication and F8/F7/F6/F5/wheel validated";
+    report = "ok: dynamic room up to 8/8; one native local EDF5_MultiSlotMod/version banner per create/join without identity or Steam send; PlayerInfo RAX preserved; P4-P7 parser safely captures sidecars, accepts valid count despite false return, masks overlapping weapon and restores out-of-range blocks without losing participants/rewards; redirected P4-P7 parser blocks leave mission state intact with all six weapons; extra class uses PlayerInfo/sidecar within 0..3; direct/fallback UserImpl source; fifth-player scratch synthesizes/restores class-weapons-armor and restores the unique index before map consumers; private distinct PlayerInfo name tokens/source indices; isolated per-participant sender/owner correlation without real chat text; registered order/local subset and participant-control assignment; replication detects duplicate UserImpl; dynamic receive table detects missing/duplicate P0 route and per-participant 0x3300/0x3400; runtime spawn multiplies 10->20, repairs 0/4 during call, restores zero and preserves concurrent mutation; GeneratorPoll preserves Update and RAX/AL, correlates update/base/gate/spawn/boundary and classifies cooldown/quota/false/accepted returns; native host-only recovery publishes UI event 1/2, closes object id 2 and returns effective result 1; independent Exec_Begin/Sync_MissionResult/ResolveResult/ApplyResult pipeline checks extra Items mask, defensively restores local count 0->1 before rewards, proves native Exec_Begin cancels the queue without requeue/duplication and new generations discard all previous mission state; Local Mission Harness F3 cycles host+3/host+4/off with distinct UserImpl, Ready, early l1/l2, preceding controller gate limited to states 1..5 and zero real peers, fail-closed global Matching 4->5 without fabricated packets and local result sync; loadout, PlayersGroup, callbacks, P2P, authentication and F8/F7/F6/F5/wheel validated";
     return true;
 }
 

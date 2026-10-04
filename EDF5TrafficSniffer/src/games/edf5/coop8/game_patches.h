@@ -38,6 +38,16 @@ void PollMissionRelayTelemetry();
 uint64_t NativeParticipantScalingClampHits();
 uint64_t NativeParticipantScalingClampMask();
 
+// Private loadout blocks that the parser stride relay at 0x42F7C9 assigns to
+// logical participants 4..7, or nullptr while that relay is not installed.
+// Block (index - 4) keeps the native 0x3E90 stride and block-relative layout,
+// replacing the native block that would lie past the four-block mission state.
+uint8_t* LoadoutParserExtraScratch();
+
+// True while image holds the jump that replaced the native imul at 0x42F7C9.
+// Signature checks of that site must then skip its first seven bytes.
+bool LoadoutParserStrideRelayInstalled(const uint8_t* image);
+
 // Replays the exact v0.4.6 append-loop crash fixture in an isolated helper
 // process. When patched=false the caller intentionally reaches the native
 // access violation; patched=true must complete through the real relay bytes.

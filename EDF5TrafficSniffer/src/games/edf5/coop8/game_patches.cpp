@@ -427,7 +427,51 @@ static_assert(kParticipantScalingClampMaskOffset + sizeof(uint64_t) <=
                   kMissionRelayPageSize,
               "participant scaling telemetry exceeds relay page");
 
+// Loadout parser 0x42F480 addresses every participant block as
+// r14 + index*0x3E90 + offset, with r14 = state+0x14A40 (block 0 - 0xF0).
+// Mission state holds only four blocks: block 4 already overlaps the result
+// Items/counters at +0x24570, and its 0x30-byte tail at +0x283D0 lies past
+// the allocation (six-player host crash EDF5.exe+0x42F954 writing there).
+// Relay the stride multiply and select r14 per iteration so indices 4..7
+// address private blocks with the identical layout. r14 is dead after the
+// loop: 0x42FA94 zeroes it before its next use.
+constexpr uintptr_t kLoadoutParserStrideRva = 0x42f7c9;
+constexpr uintptr_t kLoadoutParserStrideReturnRva = 0x42f7d0;
+constexpr std::array<uint8_t, 7> kLoadoutParserStrideOriginal = {
+    0x4c, 0x69, 0xd1, 0x90, 0x3e, 0x00, 0x00,  // imul r10,rcx,0x3e90
+};
+constexpr uintptr_t kLoadoutParserStateSlotRva = 0x125ab30;
+constexpr uint32_t kLoadoutParserNativeBaseOffset = 0x14a40;
+constexpr size_t kLoadoutParserBlockStride = 0x3e90;
+constexpr size_t kLoadoutParserBlockBias = 0xf0;
+constexpr size_t kLoadoutParserLastWriteEnd = 0x3f80;
+constexpr unsigned kLoadoutParserExtraBlocks = 4;
+// One further block absorbs malformed indices >= 8 instead of letting them
+// address arbitrary memory.
+constexpr size_t kLoadoutParserScratchSize = 0x14000;
+constexpr size_t kLoadoutParserStubOffset = 0x1200;
+constexpr size_t kLoadoutParserExtraCounterOffset = 0x1300;
+constexpr size_t kLoadoutParserInvalidCounterOffset = 0x1308;
+static_assert(kLoadoutParserLastWriteEnd - kLoadoutParserBlockBias ==
+                  kLoadoutParserBlockStride,
+              "parser tail must end at its block boundary");
+static_assert((kLoadoutParserExtraBlocks + 1) * kLoadoutParserBlockStride <=
+                  kLoadoutParserScratchSize,
+              "loadout scratch cannot hold four blocks plus the guard block");
+static_assert(kParticipantScalingClampMaskOffset + sizeof(uint64_t) <=
+                  kLoadoutParserStubOffset,
+              "loadout parser relay overlaps scaling telemetry");
+static_assert(kLoadoutParserInvalidCounterOffset + sizeof(uint64_t) <=
+                  kMissionRelayPageSize,
+              "loadout parser telemetry exceeds relay page");
+
 uint8_t* g_mission_relay_page = nullptr;
+// Allocated once and never released: the parser hook may still be reading it
+// while a quarantine restores the original instruction.
+uint8_t* g_loadout_parser_scratch = nullptr;
+std::atomic<bool> g_loadout_parser_redirect_active{false};
+std::atomic<uint64_t> g_reported_loadout_parser_extra_redirects{0};
+std::atomic<uint64_t> g_reported_loadout_parser_invalid_redirects{0};
 unsigned g_mission_relay_capacity = 0;
 unsigned g_roster_patch_max_players = 0;
 unsigned g_roster_patch_preallocated_slots = 0;
@@ -842,6 +886,71 @@ bool BuildParticipantScalingRelays(uint8_t* page) {
     return true;
 }
 
+uint8_t* EnsureLoadoutParserScratch() {
+    if (!g_loadout_parser_scratch) {
+        g_loadout_parser_scratch = static_cast<uint8_t*>(VirtualAlloc(
+            nullptr, kLoadoutParserScratchSize, MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE));
+    }
+    return g_loadout_parser_scratch;
+}
+
+bool BuildLoadoutParserRelay(uint8_t* page, uint8_t* image) {
+    uint8_t* scratch = EnsureLoadoutParserScratch();
+    if (!page || !image || !scratch) return false;
+    // rcx holds the sign-extended record index; the native js at 0x42F7C0
+    // already skipped negative values. Every path keeps the original r10.
+    uint8_t* stub = page + kLoadoutParserStubOffset;
+    EmitBytes(stub, {0x4c, 0x69, 0xd1, 0x90, 0x3e, 0x00, 0x00,
+                     0x48, 0x83, 0xf9, 0x04,
+                     0x72, 0x00});
+    uint8_t* native_branch = stub - 1;
+    EmitBytes(stub, {0x48, 0x83, 0xf9, 0x08,
+                     0x73, 0x00});
+    uint8_t* invalid_branch = stub - 1;
+
+    // Indices 4..7: r14 + index*stride + bias == scratch + (index-4)*stride.
+    EmitBytes(stub, {0x49, 0xbe});
+    EmitU64(stub, reinterpret_cast<uint64_t>(scratch) -
+                      kLoadoutParserExtraBlocks * kLoadoutParserBlockStride -
+                      kLoadoutParserBlockBias);
+    if (!EmitLockIncrement(stub, page + kLoadoutParserExtraCounterOffset) ||
+        !EmitRelative32(stub, 0xe9, image + kLoadoutParserStrideReturnRva)) {
+        return false;
+    }
+
+    // Indices >= 8 cannot be real participants: r14 = guard - bias - r10.
+    uint8_t* invalid = stub;
+    EmitBytes(stub, {0x49, 0xbe});
+    EmitU64(stub, reinterpret_cast<uint64_t>(
+                      scratch + kLoadoutParserExtraBlocks *
+                                    kLoadoutParserBlockStride) -
+                      kLoadoutParserBlockBias);
+    EmitBytes(stub, {0x4d, 0x29, 0xd6});
+    if (!EmitLockIncrement(stub, page + kLoadoutParserInvalidCounterOffset) ||
+        !EmitRelative32(stub, 0xe9, image + kLoadoutParserStrideReturnRva)) {
+        return false;
+    }
+
+    // Indices 0..3: rebuild the native r14 from the global state slot, as
+    // 0x42F764/0x42F77F did before the loop.
+    uint8_t* native = stub;
+    EmitBytes(stub, {0x49, 0xbe});
+    EmitU64(stub, reinterpret_cast<uint64_t>(
+                      image + kLoadoutParserStateSlotRva));
+    EmitBytes(stub, {0x4d, 0x8b, 0x36,
+                     0x49, 0x81, 0xc6});
+    std::memcpy(stub, &kLoadoutParserNativeBaseOffset,
+                sizeof(kLoadoutParserNativeBaseOffset));
+    stub += sizeof(kLoadoutParserNativeBaseOffset);
+    if (!EmitRelative32(stub, 0xe9, image + kLoadoutParserStrideReturnRva) ||
+        !PatchRelative8(native_branch, native) ||
+        !PatchRelative8(invalid_branch, invalid)) {
+        return false;
+    }
+    return stub <= page + kLoadoutParserExtraCounterOffset;
+}
+
 bool BuildMissionRelayPage(uint8_t* image, unsigned max_players) {
     if (g_mission_relay_page) {
         return g_mission_relay_capacity == max_players;
@@ -1004,10 +1113,15 @@ bool BuildMissionRelayPage(uint8_t* image, unsigned max_players) {
         }
     }
 
-    if (!BuildParticipantScalingRelays(page)) {
+    if (!BuildParticipantScalingRelays(page) ||
+        !BuildLoadoutParserRelay(page, image)) {
         return fail();
     }
 
+    std::memset(page + kLoadoutParserExtraCounterOffset, 0,
+                sizeof(uint64_t));
+    std::memset(page + kLoadoutParserInvalidCounterOffset, 0,
+                sizeof(uint64_t));
     std::memset(page + kMissionSidecarOffset, 0,
                 kMissionRecordSidecarCount * kMissionRecordSize);
     std::memset(page + kMissionPrimaryRedirectCounterOffset, 0,
@@ -1346,6 +1460,35 @@ bool WriteMissionSpawnSites(uint8_t* image) {
     return true;
 }
 
+bool LoadoutParserSiteMatches(const uint8_t* image, bool replacement) {
+    const uint8_t* site = image + kLoadoutParserStrideRva;
+    if (!replacement) {
+        return std::memcmp(site, kLoadoutParserStrideOriginal.data(),
+                           kLoadoutParserStrideOriginal.size()) == 0;
+    }
+    if (!g_mission_relay_page ||
+        Relative32Target(site, 0xe9) !=
+            g_mission_relay_page + kLoadoutParserStubOffset) {
+        return false;
+    }
+    for (size_t index = 5; index < kLoadoutParserStrideOriginal.size();
+         ++index) {
+        if (site[index] != 0x90) return false;
+    }
+    return true;
+}
+
+bool WriteLoadoutParserSite(uint8_t* image) {
+    if (!g_mission_relay_page ||
+        !WriteRelative32(image + kLoadoutParserStrideRva, 0xe9,
+                         g_mission_relay_page + kLoadoutParserStubOffset)) {
+        return false;
+    }
+    std::memset(image + kLoadoutParserStrideRva + 5, 0x90,
+                kLoadoutParserStrideOriginal.size() - 5);
+    return true;
+}
+
 bool RosterReplacementSitesMatch(const uint8_t* image, unsigned max_players,
                                  unsigned preallocated_roster_slots) {
     return image &&
@@ -1359,6 +1502,7 @@ bool RosterReplacementSitesMatch(const uint8_t* image, unsigned max_players,
         MissionParticipantCallSitesMatch(image, true) &&
         MissionSpawnSitesMatch(image, true) &&
         ParticipantScalingSitesMatch(image, true) &&
+        LoadoutParserSiteMatches(image, true) &&
         MemberButtonKeysMatch(image);
 }
 
@@ -1373,10 +1517,15 @@ bool RosterOriginalSitesMatch(const uint8_t* image) {
         MissionParticipantCallSitesMatch(image, false) &&
         MissionSpawnSitesMatch(image, false) &&
         ParticipantScalingSitesMatch(image, false) &&
+        LoadoutParserSiteMatches(image, false) &&
         MemberButtonKeysMatch(image);
 }
 
 void WriteRosterOriginalSites(uint8_t* image) {
+    g_loadout_parser_redirect_active.store(false, std::memory_order_release);
+    std::memcpy(image + kLoadoutParserStrideRva,
+                kLoadoutParserStrideOriginal.data(),
+                kLoadoutParserStrideOriginal.size());
     WriteCapacity(image + kCapacityRegionRva, kOriginalCapacity);
     WriteSecondarySites(image, kOriginalCapacity);
     WriteTertiarySites(image, kOriginalCapacity);
@@ -1768,6 +1917,143 @@ bool SelfTestParticipantScalingRelayExecution(std::string& report) {
                   "56 relays executed for counts 3/5/8 with registers, flags and telemetry preserved");
 }
 
+struct LoadoutRelayExecutionContext {
+    uint64_t index = 0;
+    uint64_t r14_in = 0;
+    uint64_t r10_out = 0;
+    uint64_t r14_out = 0;
+};
+static_assert(sizeof(LoadoutRelayExecutionContext) == 0x20,
+              "loadout relay test context layout changed");
+
+using LoadoutRelayExecutionThunk =
+    void(__fastcall*)(LoadoutRelayExecutionContext*, void*);
+
+LoadoutRelayExecutionThunk BuildLoadoutRelayExecutionThunk(
+    uint8_t*& allocation) {
+    // Load rcx/r14 like the parser loop, enter the patched site (which jumps
+    // to the relay and back to a ret placed at the return RVA), then capture
+    // r10/r14. r12 keeps the context; r14 and r12 are restored for the caller.
+    constexpr uint8_t code[] = {
+        0x41, 0x56,
+        0x41, 0x54,
+        0x48, 0x83, 0xec, 0x28,
+        0x49, 0x89, 0xcc,
+        0x49, 0x8b, 0x0c, 0x24,
+        0x4d, 0x8b, 0x74, 0x24, 0x08,
+        0x45, 0x31, 0xd2,
+        0xff, 0xd2,
+        0x4d, 0x89, 0x54, 0x24, 0x10,
+        0x4d, 0x89, 0x74, 0x24, 0x18,
+        0x48, 0x83, 0xc4, 0x28,
+        0x41, 0x5c,
+        0x41, 0x5e,
+        0xc3,
+    };
+    allocation = static_cast<uint8_t*>(VirtualAlloc(
+        nullptr, sizeof(code), MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE));
+    if (!allocation) return nullptr;
+    std::memcpy(allocation, code, sizeof(code));
+    FlushInstructionCache(GetCurrentProcess(), allocation, sizeof(code));
+    return reinterpret_cast<LoadoutRelayExecutionThunk>(allocation);
+}
+
+bool SelfTestLoadoutParserRelayExecution(std::string& report) {
+    if (g_mission_relay_page) {
+        report = "loadout relay microtest refused: relay page already live";
+        return false;
+    }
+    constexpr size_t kFakeImageSize =
+        kLoadoutParserStateSlotRva + 0x1000;
+    auto* image = static_cast<uint8_t*>(VirtualAlloc(
+        nullptr, kFakeImageSize, MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE));
+    uint8_t* thunk_allocation = nullptr;
+    const LoadoutRelayExecutionThunk thunk =
+        image ? BuildLoadoutRelayExecutionThunk(thunk_allocation) : nullptr;
+    auto finish = [&](bool result, const std::string& message) {
+        if (g_mission_relay_page) {
+            VirtualFree(g_mission_relay_page, 0, MEM_RELEASE);
+            g_mission_relay_page = nullptr;
+            g_mission_relay_capacity = 0;
+        }
+        g_loadout_parser_redirect_active.store(false,
+                                               std::memory_order_release);
+        if (thunk_allocation) VirtualFree(thunk_allocation, 0, MEM_RELEASE);
+        if (image) VirtualFree(image, 0, MEM_RELEASE);
+        report = message;
+        return result;
+    };
+    if (!image || !thunk) {
+        return finish(false, "could not allocate the loadout relay microtest");
+    }
+
+    std::memcpy(image + kLoadoutParserStrideRva,
+                kLoadoutParserStrideOriginal.data(),
+                kLoadoutParserStrideOriginal.size());
+    image[kLoadoutParserStrideReturnRva] = 0xc3;
+    constexpr uint64_t kFakeState = 0x0000123456780000ULL;
+    std::memcpy(image + kLoadoutParserStateSlotRva, &kFakeState,
+                sizeof(kFakeState));
+    if (!LoadoutParserSiteMatches(image, false) ||
+        !BuildMissionRelayPage(image, 8) ||
+        !WriteLoadoutParserSite(image) ||
+        !LoadoutParserSiteMatches(image, true) ||
+        LoadoutParserSiteMatches(image, false)) {
+        return finish(false, "loadout relay was not installed on the fake image");
+    }
+    FlushInstructionCache(GetCurrentProcess(), image, kFakeImageSize);
+
+    const uint64_t scratch =
+        reinterpret_cast<uint64_t>(g_loadout_parser_scratch);
+    const uint64_t guard =
+        scratch + kLoadoutParserExtraBlocks * kLoadoutParserBlockStride;
+    constexpr std::array<uint64_t, 10> kIndices = {
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 63,
+    };
+    for (const uint64_t index : kIndices) {
+        LoadoutRelayExecutionContext context{};
+        context.index = index;
+        context.r14_in = 0x5a5a5a5a5a5a5a5aULL;
+        thunk(&context, image + kLoadoutParserStrideRva);
+        const uint64_t block = context.r14_out + context.r10_out +
+            kLoadoutParserBlockBias;
+        const uint64_t tail_end = context.r14_out + context.r10_out +
+            kLoadoutParserLastWriteEnd;
+        uint64_t expected_block = 0;
+        if (index < 4) {
+            expected_block = kFakeState + kLoadoutParserNativeBaseOffset +
+                kLoadoutParserBlockBias + index * kLoadoutParserBlockStride;
+        } else if (index < 8) {
+            expected_block = scratch + (index - 4) * kLoadoutParserBlockStride;
+        } else {
+            expected_block = guard;
+        }
+        if (context.r10_out != index * kLoadoutParserBlockStride ||
+            block != expected_block ||
+            (index >= 4 && tail_end > guard + kLoadoutParserBlockStride) ||
+            (index >= 4 && index < 8 && tail_end > guard)) {
+            return finish(false, "loadout relay addressed index " +
+                                     std::to_string(index) +
+                                     " outside its block");
+        }
+    }
+    if (ReadMissionRelayCounter(kLoadoutParserExtraCounterOffset) != 4 ||
+        ReadMissionRelayCounter(kLoadoutParserInvalidCounterOffset) != 2) {
+        return finish(false, "loadout relay telemetry count mismatch");
+    }
+
+    g_loadout_parser_redirect_active.store(true, std::memory_order_release);
+    WriteRosterOriginalSites(image);
+    if (!LoadoutParserSiteMatches(image, false) ||
+        g_loadout_parser_redirect_active.load(std::memory_order_acquire)) {
+        return finish(false, "loadout relay restore left the redirect active");
+    }
+    return finish(true,
+                  "parser stride relay keeps P0-P3 native, sends P4-P7 to private blocks and guards index>=8");
+}
+
 struct MissionHarnessRecord {
     uint32_t value = 0;
     uint32_t padding = 0;
@@ -1860,13 +2146,16 @@ bool InstallRosterCapacity(unsigned max_players,
     const bool mission_spawns_ready = MissionSpawnSitesMatch(image, true);
     const bool participant_scaling_ready =
         ParticipantScalingSitesMatch(image, true);
+    const bool loadout_parser_ready = LoadoutParserSiteMatches(image, true);
     if (primary_ready && secondary_ready && tertiary_ready && room_panels_ready &&
         mission_result_participants_ready &&
         member_buttons_ready && mission_participants_ready && mission_spawns_ready &&
-        participant_scaling_ready &&
+        participant_scaling_ready && loadout_parser_ready &&
         MemberButtonKeysMatch(image)) {
         g_roster_patch_max_players = max_players;
         g_roster_patch_preallocated_slots = preallocated_roster_slots;
+        g_loadout_parser_redirect_active.store(true,
+                                               std::memory_order_release);
         EDF5_CAPTURE_EVENT("more_players", "roster_capacity_patch_ready",
                        capture::Fields().UInt("constructor_rva", kRosterConstructorRva)
                            .UInt("secondary_constructor_rva", kSecondaryConstructorRva)
@@ -1943,6 +2232,8 @@ bool InstallRosterCapacity(unsigned max_players,
     const bool mission_spawns_original = MissionSpawnSitesMatch(image, false);
     const bool participant_scaling_original =
         ParticipantScalingSitesMatch(image, false);
+    const bool loadout_parser_original =
+        LoadoutParserSiteMatches(image, false);
     if ((!primary_ready && !primary_original) ||
         (!secondary_ready && !secondary_original) ||
         (!tertiary_ready && !tertiary_original) ||
@@ -1953,9 +2244,14 @@ bool InstallRosterCapacity(unsigned max_players,
         (!mission_participants_ready && !mission_participants_original) ||
         (!mission_spawns_ready && !mission_spawns_original) ||
         (!participant_scaling_ready && !participant_scaling_original) ||
+        (!loadout_parser_ready && !loadout_parser_original) ||
         !MemberButtonKeysMatch(image)) {
         EDF5_CAPTURE_EVENT("more_players", "roster_capacity_patch_failed",
                        capture::Fields().String("reason", "EDF5 byte signature mismatch")
+                           .UInt("loadout_parser_stride_rva",
+                                 kLoadoutParserStrideRva)
+                           .Bool("loadout_parser_original",
+                                 loadout_parser_original)
                            .UInt("constructor_rva", kRosterConstructorRva)
                            .UInt("secondary_constructor_rva", kSecondaryConstructorRva)
                            .UInt("secondary_grow_helper_rva", kSecondaryGrowHelperRva)
@@ -2003,6 +2299,11 @@ bool InstallRosterCapacity(unsigned max_players,
         kParticipantScalingSites.front().rva;
     constexpr uintptr_t capacity_patch_end =
         kCapacityRegionRva + kCapacityRegionSize;
+    static_assert(kLoadoutParserStrideRva >= capacity_patch_begin &&
+                      kLoadoutParserStrideRva +
+                              kLoadoutParserStrideOriginal.size() <=
+                          capacity_patch_end,
+                  "loadout parser site must stay inside the capacity range");
     constexpr uintptr_t button_patch_begin = kMemberButtonLoopSites.front().rva;
     constexpr uintptr_t button_patch_end = 0x565acb;
     constexpr uintptr_t room_panel_patch_begin =
@@ -2132,6 +2433,8 @@ bool InstallRosterCapacity(unsigned max_players,
     const bool mission_spawn_written = WriteMissionSpawnSites(image);
     const bool participant_scaling_written =
         WriteParticipantScalingSites(image);
+    // 0x42F7C9 lies inside the capacity range made writable and flushed above.
+    const bool loadout_parser_written = WriteLoadoutParserSite(image);
     EDF5_DIAGNOSTIC_PHASE(diagnostics_scope, "flush_instruction_cache",
                             capacity_patch_begin, capacity_patch_end);
     FlushInstructionCache(GetCurrentProcess(), image + capacity_patch_begin,
@@ -2148,6 +2451,7 @@ bool InstallRosterCapacity(unsigned max_players,
     const bool verified = mission_participants_written &&
                           mission_spawn_written &&
                           participant_scaling_written &&
+                          loadout_parser_written &&
                           RosterReplacementSitesMatch(
                               image, max_players,
                               preallocated_roster_slots);
@@ -2220,6 +2524,7 @@ bool InstallRosterCapacity(unsigned max_players,
                            .UInt("capacity_restore_error", capacity_restore_error));
         return false;
     }
+    g_loadout_parser_redirect_active.store(true, std::memory_order_release);
 
     EDF5_CAPTURE_EVENT("more_players", "roster_capacity_patch_ready",
                    capture::Fields().UInt("constructor_rva", kRosterConstructorRva)
@@ -2599,6 +2904,11 @@ bool ReleaseMissionRelayPage() {
     g_mission_relay_capacity = 0;
     g_roster_patch_max_players = 0;
     g_roster_patch_preallocated_slots = 0;
+    g_loadout_parser_redirect_active.store(false, std::memory_order_release);
+    g_reported_loadout_parser_extra_redirects.store(
+        0, std::memory_order_release);
+    g_reported_loadout_parser_invalid_redirects.store(
+        0, std::memory_order_release);
     g_reported_primary_redirects.store(0, std::memory_order_release);
     g_reported_existing_redirects.store(0, std::memory_order_release);
     g_reported_append_redirects.store(0, std::memory_order_release);
@@ -2928,6 +3238,33 @@ void PollMissionRelayTelemetry() {
                 .Bool("payload_logged", false)
                 .Bool("pointer_logged", false));
     }
+
+    const uint64_t loadout_extra =
+        ReadMissionRelayCounter(kLoadoutParserExtraCounterOffset);
+    const uint64_t loadout_invalid =
+        ReadMissionRelayCounter(kLoadoutParserInvalidCounterOffset);
+    const uint64_t previous_loadout_extra =
+        g_reported_loadout_parser_extra_redirects.exchange(
+            loadout_extra, std::memory_order_acq_rel);
+    const uint64_t previous_loadout_invalid =
+        g_reported_loadout_parser_invalid_redirects.exchange(
+            loadout_invalid, std::memory_order_acq_rel);
+    if (loadout_extra > previous_loadout_extra ||
+        loadout_invalid > previous_loadout_invalid) {
+        EDF5_CAPTURE_EVENT(
+            loadout_invalid > previous_loadout_invalid
+                ? capture::Level::Warning : capture::Level::Info,
+            "more_players", "loadout_parser_extra_block_redirect_hit",
+            capture::Fields()
+                .UInt("extra_hits_delta",
+                      loadout_extra - previous_loadout_extra)
+                .UInt("extra_hits_total", loadout_extra)
+                .UInt("invalid_index_hits_total", loadout_invalid)
+                .UInt("stride_rva", kLoadoutParserStrideRva)
+                .UInt("native_block_count", 4)
+                .Bool("mission_state_overflow_prevented", true)
+                .Bool("pointer_logged", false));
+    }
 }
 
 uint64_t NativeParticipantScalingClampHits() {
@@ -2936,6 +3273,17 @@ uint64_t NativeParticipantScalingClampHits() {
 
 uint64_t NativeParticipantScalingClampMask() {
     return ReadMissionRelayCounter(kParticipantScalingClampMaskOffset);
+}
+
+uint8_t* LoadoutParserExtraScratch() {
+    return g_loadout_parser_redirect_active.load(std::memory_order_acquire)
+        ? g_loadout_parser_scratch : nullptr;
+}
+
+bool LoadoutParserStrideRelayInstalled(const uint8_t* image) {
+    return image &&
+        g_loadout_parser_redirect_active.load(std::memory_order_acquire) &&
+        LoadoutParserSiteMatches(image, true);
 }
 
 bool RunMissionRecordMicroTest(const wchar_t* fixture_path, bool patched,
@@ -3402,6 +3750,11 @@ bool SelfTest(std::string& report) {
         report = relay_execution_report;
         return false;
     }
+    std::string loadout_relay_report;
+    if (!SelfTestLoadoutParserRelayExecution(loadout_relay_report)) {
+        report = loadout_relay_report;
+        return false;
+    }
     std::array<uint8_t, 0x30> member_button_loop{};
     const uintptr_t member_button_base = kMemberButtonLoopSites.front().rva;
     for (const auto& site : kMemberButtonLoopSites) {
@@ -3570,7 +3923,7 @@ bool SelfTest(std::string& report) {
         report = "fail-closed restoration did not restore/reject the expected bytes";
         return false;
     }
-    report = "validated: three tables and room boxes preallocated 4->8, 24 experimental reserves/48 operands 4->8, dynamic Master/Member, MissionSync_Res filter following MaxPlayers 5..8, external eight-participant vector, modulo-four spawn, four sidecars across three persistent paths and 56 native relays executed for 3/5/8 with profile clamped to 4 without changing the real count, plus fail-closed signature restoration";
+    report = "validated: three tables and room boxes preallocated 4->8, 24 experimental reserves/48 operands 4->8, dynamic Master/Member, MissionSync_Res filter following MaxPlayers 5..8, external eight-participant vector, modulo-four spawn, four sidecars across three persistent paths and 56 native relays executed for 3/5/8 with profile clamped to 4 without changing the real count, loadout parser stride relay executed for indices 0-8/63 keeping P4-P7 inside private blocks, plus fail-closed signature restoration";
     return true;
 }
 
