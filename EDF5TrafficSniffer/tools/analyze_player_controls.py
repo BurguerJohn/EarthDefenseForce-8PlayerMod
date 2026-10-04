@@ -2333,10 +2333,13 @@ def summarize(captures: list[Capture], expected_players: int,
             for event, phase, participants, participant_count_valid, \
                     expected_mask, observed_mask, complete, reward_logged, \
                     payload_logged in capture.reward_item_checkpoints:
-                if reward_logged or payload_logged:
+                # Since 0.6.69 resolve checkpoints carry the numeric Item
+                # fields and resolver counters (box pickup counts, no
+                # identity); only raw payloads remain forbidden.
+                if payload_logged:
                     problems.append(
                         f"{capture.label}: {event}/{phase} reward checkpoint "
-                        "retained reward or payload contents")
+                        "retained payload contents")
                 if (require_extra_result_items and
                         phase == "before_original" and
                         participants >= expected_players and
@@ -2366,10 +2369,10 @@ def summarize(captures: list[Capture], expected_players: int,
                 in capture.result_item_checkpoints))
             for event, phase, _, _, _, _, _, reward_logged, \
                     payload_logged in capture.result_item_checkpoints:
-                if reward_logged or payload_logged:
+                if payload_logged:
                     problems.append(
                         f"{capture.label}: {event}/{phase} full result Item "
-                        "checkpoint retained reward or payload contents")
+                        "checkpoint retained payload contents")
         if require_result_item_matrix:
             required_item_mask = (1 << expected_players) - 1
             matrix_observations = [

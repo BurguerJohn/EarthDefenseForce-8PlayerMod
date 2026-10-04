@@ -539,6 +539,15 @@ void WriteStatus(const char* state, const std::string& extra = {}) {
     ReleaseSRWLockExclusive(&g_status_lock);
 }
 
+// "auto" or the configured multiple of the four-player enemy health.
+std::string EnemyHealthSetting(float multiplier) {
+    if (!(multiplier > 0.0f)) return "auto";
+    char text[32]{};
+    std::snprintf(text, sizeof(text), "%.3g",
+                  static_cast<double>(multiplier));
+    return text;
+}
+
 DWORD WINAPI WriterMain(void*) {
     unsigned since_flush = 0;
     uint64_t reported_dropped = 0;
@@ -1136,6 +1145,21 @@ bool Initialize(HMODULE plugin_module) {
              << ",\r\n"
              << "  \"debug_stage_win_hotkey_vk\": "
              << g_config.debug_stage_win_hotkey_vk << ",\r\n"
+             << "  \"damage_meter_enabled\": "
+             << (g_config.damage_meter_enabled ? "true" : "false")
+             << ",\r\n"
+             << "  \"damage_meter_chat\": "
+             << (g_config.damage_meter_chat ? "true" : "false")
+             << ",\r\n"
+             << "  \"extended_enemy_health_scaling\": "
+             << (g_config.extended_enemy_health_scaling ? "true" : "false")
+             << ",\r\n"
+             << "  \"enemy_health_players_5_to_8\": \""
+             << EnemyHealthSetting(g_config.enemy_health_multipliers[0]) << "/"
+             << EnemyHealthSetting(g_config.enemy_health_multipliers[1]) << "/"
+             << EnemyHealthSetting(g_config.enemy_health_multipliers[2]) << "/"
+             << EnemyHealthSetting(g_config.enemy_health_multipliers[3])
+             << "\",\r\n"
              << "  \"bot_steam_id\": " << g_config.bot_steam_id << ",\r\n"
              << "  \"modules\": {\r\n"
              << ModuleMetadata("executable", exe_path) << ",\r\n"

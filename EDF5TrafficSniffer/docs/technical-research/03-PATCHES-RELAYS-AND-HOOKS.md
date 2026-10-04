@@ -80,6 +80,40 @@ than used as native storage.
 - Existing-record flow: `0x11E1A0`, native source `0x11E1AE`,
   extra return `0x11E1CC`.
 
+### Spawn transform loop (six-player crash, 0.6.65)
+
+Before creating participants, `0x11D860` runs a first loop at
+`0x11DAB1..0x11DB25` that normalizes (`0x7CDC0`) and rotates `spawn[edi]` in
+place at `rbp+0x1E0+edi*0x10` until `edi` equals the participant count at
+`[rsp+0x50]`. Only four records exist (`0x11D9E3` initializes four, `0x11DA46`
+copies four positions) and the function's /GS cookie is stored at
+`rbp+0x230` (`0x11D8A7`) and checked at `0x11E414`.
+
+| Participant | Write target | Effect |
+| --- | --- | --- |
+| P4 (5 players) | `rbp+0x220..0x22F` | unused padding; five players survive |
+| P5 (6 players) | `rbp+0x230..0x23F` | overwrites the cookie; `__report_gsfailure` fast-fails `0xC0000409` when `0x11D860` returns |
+| P6/P7 | `rbp+0x240..0x25F` | overwrite the caller's saved `xmm9`/`xmm8` |
+
+This is a deterministic crash on every machine at mission entry with six or
+more participants. It was invisible in the Users DLL because fast-fail
+bypasses normal exception filters. The relay replaces only the backedge
+`cmp edi,[rsp+0x50]; jne 0x11DAB1` at `0x11DB21` (six bytes, `jmp`+`nop`):
+it exits natively when `edi` reaches the count, loops only while `edi < 4`,
+and otherwise increments a clamp counter and exits. The creation loop already
+reads `spawn[index % 4]` through the primary redirect, so extras reuse the
+four transformed records. Signature, rollback and quarantine are shared with
+the other mission-spawn sites; the micro-harness replays the exact backedge
+bytes unpatched (six iterations) and patched (1/4/5/6/8 participants).
+
+The sibling script command `0x11E7A0` (called from `0x115C6C`) stores the
+participant producer's four control integers at `rbp+0x100` directly below
+its cookie at `rbp+0x110`. It was not observed in any five-player report
+(only `mission_entry_primary`), builds matrices per local profile and is left
+unpatched pending evidence. `mission_player_control_assignment` with
+`context=mission_entry_secondary` and `participant_index>=4` is the signal
+to watch.
+
 Result participant filters are `0x42DB4C` and `0x430F23`. They follow
 MaxPlayers while physical Item capacity remains four; extras are folded,
 never written past the array.
@@ -101,6 +135,65 @@ flags are preserved.
 
 Leaf sites `0x0008ADCF` and `0x002D0913` have no unwind entry. Getter
 `0x11E48E` stays unchanged. See the [full RVA list](08-RVA-REFERENCE.md).
+
+### Mission script record reads (0.6.77)
+
+`0x121C43` (12 bytes, mission in rsi) and `0x127393` (19 bytes, mission in
+r13) compute `mission+0x140+i*0x18` before locking the record weak_ptr with
+`0x6D730`. Stubs at relay page `0x1300/0x1380` keep `i < 4` native, map
+`i = 4..7` to sidecar `0x400 + (i-4)*0x18 + 8` and `i >= 8` to the empty
+record at `0x1408`, counting sidecar/empty reads at `0x1420/0x1428`. rax,
+rcx and flags are dead until the following `lea rdx` and call. Context bytes
+(`movsxd rax,edi` before, lock call after) are validated with the sites.
+
+### Vehicle rear seats and enemy HP (0.6.78, ported from PR #1)
+
+Ported from mi9202's pull request to BurguerJohn/EarthDefenseForce-8PlayerMod
+(fix/6-player-support), re-verified against this EDF5.exe and re-laid out on
+this relay page, which grew to 0x4000.
+
+- Rear seats: the Caliban (`0x34F9AD`) and Vehicle_Car (`0x374EED`) seat
+  pickers write `vec[0] = vec[index+1] = index` into an int vector sized by
+  the seat count; index 4+ writes past it and those players could only
+  drive. Stubs at `0x1480/0x1580` keep the native seat when it exists, give
+  P5-P8 rear seat `1 + index % rear_seats`, and open every rear seat when the
+  preferred one is occupied (seat array `[vehicle+0x418]`, stride `0x340`,
+  occupant control `+0x268`, uses `+8`, as in `0x355BE0`). Counters at
+  `0x1430/0x1438`.
+- Enemy HP: 24 enemy initializers multiply HP by a four-entry per-player
+  table (`mulss xmmN,[base+index*4+8]`, index `3*(count-1)`), which the
+  participant-scaling clamp leaves at the four-player entry for 5+. Stubs at
+  `0x2000 + i*0x100` apply, for a real count 5..8 and index 9 only,
+  `max(t3, t3 + (n-4)*(t3-t2))` or `EnemyHealth<n>Players * t3`, preserving
+  flags, xmm15 and every GPR. Data at `0x1440..0x1470` (applied counter,
+  site mask, enabled flag, last factor/count, four INI multipliers).
+
+## Damage meter (0.6.74)
+
+Two optional hooks, installed only when every signature (ApplyDamage, its
+health/amount reads, the single message-handler call, the flush and both
+projectile call sites, the two RTTI names) matches; a mismatch disables the
+meter without quarantine. `0x2DB370` measures health before/after the native
+call and credits the attacker only when its address equals a soldier created
+for P0-P7 by `0x11CE60` (the attacker is never dereferenced for that).
+`0x2D9720` records the projectile (`list - 0x80`) in a thread-local while the
+projectile system flushes, so ApplyDamage knows which projectile hit. The
+weapon is the first pointer inside the projectile whose RTTI derives from
+WeaponBase, discovered once per projectile class (8 attempts, readable-memory
+and image-RTTI validated). Result 3 keeps the measurement across a two-part
+mission; another result ends it; the host prints it to its own room chat with
+the native system-message publisher on room return.
+
+0.6.79: the chat print is off by default (`DamageMeterChat=false`). A live
+13-minute mission (0.6.77, 5 players) credited the Ranger 361 and the Fencer
+818 damage on the host, so the host's ApplyDamage view is incomplete for
+remote players. The summary now also records, per participant, the raw
+`GameDamageInfo +0x50` amount of the hits applied on this machine (including
+hits that lowered no health) and the source side: every `0x2D9720` flush on
+this machine sums the entries (`[list+8]` data, `[list+0x18]` count, 0xA0
+stride, target `+0`, attacker `+0x20`, amount `+0x60`) whose attacker is a
+registered soldier and whose target is not. Each machine's log therefore holds
+what its own player sent, for comparison with the host's received totals.
 
 ## Hook installation criteria
 

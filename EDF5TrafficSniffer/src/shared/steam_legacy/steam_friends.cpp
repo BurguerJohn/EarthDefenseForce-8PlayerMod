@@ -221,6 +221,23 @@ bool SelfTestPrivateIdentityAudit(std::string& report) {
     return passed;
 }
 
+bool CopyFriendPersonaName(uint64_t user, std::string& name) {
+    name.clear();
+    if (!user) return false;
+    void* interface_pointer = nullptr;
+    AcquireSRWLockShared(&g_friends_lock);
+    interface_pointer = g_friends_interface;
+    const GetFriendPersonaNameFn original = o_get_friend_persona_name;
+    ReleaseSRWLockShared(&g_friends_lock);
+    if (!interface_pointer || !original) return false;
+    const char* result = original(interface_pointer, user);
+    if (!result || !*result) return false;
+    size_t length = 0;
+    while (length < 128 && result[length]) ++length;
+    name.assign(result, length);
+    return !name.empty() && name != "[unknown]";
+}
+
 bool OpenLobbyInviteDialog(uint64_t lobby) {
     if (!lobby) return false;
     void* interface_pointer = nullptr;

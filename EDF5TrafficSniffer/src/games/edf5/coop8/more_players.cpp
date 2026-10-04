@@ -37,6 +37,26 @@ constexpr uint32_t kMemberEntered = 0x0001;
 constexpr uint32_t kMemberLeft = 0x0002;
 constexpr unsigned kLocalMissionHarnessBaselineDummies = 3;
 constexpr unsigned kLocalMissionHarnessProbeDummies = 4;
+// F3 continues past the P4 probe to host+5..host+7 so P5-P7 (six to eight
+// mission participants) can be reproduced on one PC before a real test.
+constexpr unsigned kLocalMissionHarnessMaximumDummies = 7;
+
+bool IsLocalMissionHarnessTarget(unsigned target) {
+    return target >= kLocalMissionHarnessBaselineDummies &&
+        target <= kLocalMissionHarnessMaximumDummies;
+}
+
+[[maybe_unused]] const char* LocalMissionHarnessModeName(unsigned target) {
+    switch (target) {
+    case 0: return "off";
+    case kLocalMissionHarnessBaselineDummies: return "native_baseline";
+    case 4: return "p4_capacity_probe";
+    case 5: return "p5_capacity_probe";
+    case 6: return "p6_capacity_probe";
+    case 7: return "p7_capacity_probe";
+    default: return "invalid";
+    }
+}
 // MissionStart::Update leaves the locally aggregated state at 4. In a real
 // room, an incoming peer snapshot is copied to the global controller and
 // supplies state 5; the controller immediately consumes the already-built
@@ -471,6 +491,12 @@ constexpr size_t kMissionExtraLoadoutSpan =
 constexpr size_t kUserLocalControllerIndexOffset = 0x190;
 constexpr size_t kMissionSourceAuditCapacity = 32;
 constexpr uintptr_t kUiLayoutVtableRva = 0xec8628;
+// Focus object at Layout+0x88; vt[1] (0x343E20) returns byte +0x20, the
+// "focus navigation active" gate of the focus-follow scroll 0x4AB180.
+constexpr uintptr_t kUiFocusVtableRva = 0xec8450;
+constexpr uintptr_t kUiFocusActiveGetterRva = 0x343e20;
+constexpr size_t kUiFocusActiveOffset = 0x20;
+constexpr size_t kUiLayoutFocusOffset = 0x88;
 constexpr size_t kUserStateLockOffset = 0x78;
 constexpr size_t kUserReadyFlagOffset = 0xc0;
 constexpr size_t kUserPropertyObjectOffset = 0xf0;
@@ -509,6 +535,8 @@ constexpr size_t kPlayerInfoNameLengthOffset = 0x18;
 constexpr size_t kPlayerInfoNameCapacityOffset = 0x20;
 constexpr size_t kPlayerInfoNameInlineCapacity = 7;
 constexpr size_t kPlayerInfoNameAuditMaximumLength = 64;
+// In-memory copy for the host damage summary; never logged.
+constexpr size_t kPlayerInfoDisplayNameCopyLength = 24;
 constexpr size_t kPlayerInfoSize = 0x60;
 constexpr size_t kPlayerInfoObservationCapacity = 32;
 constexpr size_t kMissionExtraLoadoutBeginOffset =
@@ -1640,6 +1668,7 @@ struct PlayerInfoObservation {
     uint32_t name_token = 0;
     uint32_t name_length = 0;
     bool name_valid = false;
+    std::array<wchar_t, kPlayerInfoDisplayNameCopyLength> display_name{};
     uint32_t shared_name_user_count = 0;
     int32_t source_mission_loadout_index = -1;
     uint32_t shared_loadout_index_user_count = 0;
@@ -1802,6 +1831,10 @@ std::atomic<unsigned> g_chat_banner_publish_successes{0};
 std::atomic<uint32_t> g_chat_banner_wait_logged_mask{0};
 std::atomic<unsigned> g_chat_room_capture_count{0};
 std::atomic<int> g_last_actual_member_count{-1};
+// Lobby whose room is shown (owned or joined) and the member count the game
+// last saw for it, synthetic members included. Drives roster scroll rows.
+std::atomic<uint64_t> g_room_lobby{0};
+std::atomic<int> g_room_member_count{-1};
 std::atomic<int> g_add_hotkey_test_override{-1};
 std::atomic<int> g_remove_hotkey_test_override{-1};
 std::atomic<int> g_ready_hotkey_test_override{-1};
@@ -2021,6 +2054,15 @@ std::array<PlayerInfoObservation, kPlayerInfoObservationCapacity>
     g_player_info_observations{};
 std::array<MissionExtraLoadoutSidecar, kMissionExtraLoadoutBlockCount>
     g_mission_extra_loadout_sidecars{};
+// Complete native-format loadout images (0x3E90 bytes) for P4-P7, captured
+// from the redirected parser blocks. Guarded by the sidecar lock. Without
+// them an extra character borrowed every field except class/weapons/armor
+// (per-weapon data, block+4) from the P0-P3 block it was created on.
+std::array<std::array<uint8_t, kMissionClassLoadoutStride>,
+           kMissionExtraLoadoutBlockCount>
+    g_mission_extra_loadout_images{};
+std::array<unsigned, kMissionExtraLoadoutBlockCount>
+    g_mission_extra_loadout_image_parser_call{};
 uint32_t g_next_player_info_name_token = 1;
 UserConstructorFn g_user_constructor = nullptr;
 UserDestructorFn g_user_destructor = nullptr;
@@ -2090,6 +2132,7 @@ thread_local bool g_replication_outgoing_local_control_fallback = false;
 void** g_runtime_user_vtable = nullptr;
 void** g_runtime_ui_layout_vtable = nullptr;
 void** g_runtime_chat_room_vtable = nullptr;
+void** g_runtime_ui_focus_vtable = nullptr;
 std::atomic<uintptr_t> g_chat_room_instance{0};
 std::atomic<uintptr_t> g_players_group_layout{0};
 std::atomic<uint64_t> g_players_group_capture_tick{0};
@@ -2233,6 +2276,7 @@ std::atomic<unsigned> g_fake_mission_reward_apply_calls{0};
 std::atomic<int32_t> g_fake_mission_source_consumer_loadout_index{-1};
 std::atomic<int32_t> g_fake_mission_update_override{-1};
 std::atomic<unsigned> g_fake_mission_loadout_parser_calls{0};
+std::atomic<unsigned> g_fake_mission_loadout_parser_extra_players{1};
 std::atomic<unsigned> g_fake_mission_class_resolver_calls{0};
 std::atomic<int32_t> g_fake_mission_class_resolver_index{4};
 std::atomic<int32_t> g_fake_mission_class_resolver_class{0};
@@ -2821,6 +2865,33 @@ bool SignatureMatches(const uint8_t* base, size_t image_size, uintptr_t rva,
     return matches;
 }
 
+// game_patches installs the parser index relays (0x42F7C9 and 0x42F898,
+// `jmp rel32; nop; nop` over `imul ...,0x3E90`) before these hooks are
+// validated. Accept that exact replacement at `relay_offset` only when
+// game_patches confirms both jumps reach its own relay stubs; every other
+// byte of the signature must still match the original.
+bool ParserSignatureMatches(const uint8_t* base, size_t image_size,
+                            uintptr_t rva, const uint8_t* expected,
+                            size_t expected_size, size_t relay_offset) {
+    constexpr size_t kRelaySize = 7;
+    if (base && expected && rva <= image_size &&
+        expected_size <= image_size - rva &&
+        relay_offset + kRelaySize <= expected_size &&
+        game_patches::MissionLoadoutParserExtraBlocks() != nullptr) {
+        const uint8_t* actual = base + rva;
+        const size_t tail = relay_offset + kRelaySize;
+        if (std::memcmp(actual, expected, relay_offset) == 0 &&
+            actual[relay_offset] == 0xe9 &&
+            actual[relay_offset + 5] == 0x90 &&
+            actual[relay_offset + 6] == 0x90 &&
+            std::memcmp(actual + tail, expected + tail,
+                        expected_size - tail) == 0) {
+            return true;
+        }
+    }
+    return SignatureMatches(base, image_size, rva, expected, expected_size);
+}
+
 bool RelativeCallTargets(const uint8_t* base, size_t image_size,
                          uintptr_t call_rva, uintptr_t target_rva) {
     if (!base || call_rva > image_size || 5 > image_size - call_rva ||
@@ -3070,14 +3141,16 @@ bool ValidateUserReadyLayout(uint8_t* base, size_t image_size) {
                           kMissionLoadoutConsumerRecordRva,
                           kMissionLoadoutConsumerRecordSignature,
                           sizeof(kMissionLoadoutConsumerRecordSignature)) ||
-        !SignatureMatches(base, image_size,
-                          kMissionLoadoutParserStrideRva,
-                          kMissionLoadoutParserStrideSignature,
-                          sizeof(kMissionLoadoutParserStrideSignature)) ||
-        !SignatureMatches(base, image_size,
-                          kMissionLoadoutParserRecordRva,
-                          kMissionLoadoutParserRecordSignature,
-                          sizeof(kMissionLoadoutParserRecordSignature)) ||
+        !ParserSignatureMatches(base, image_size,
+                                kMissionLoadoutParserStrideRva,
+                                kMissionLoadoutParserStrideSignature,
+                                sizeof(kMissionLoadoutParserStrideSignature),
+                                0) ||
+        !ParserSignatureMatches(base, image_size,
+                                kMissionLoadoutParserRecordRva,
+                                kMissionLoadoutParserRecordSignature,
+                                sizeof(kMissionLoadoutParserRecordSignature),
+                                0x42f898 - kMissionLoadoutParserRecordRva) ||
         !SignatureMatches(
             base, image_size,
             kMissionLoadoutParserParticipantCountWriteRva,
@@ -4090,8 +4163,7 @@ bool LocalMissionHarnessSessionReady() {
     const unsigned target = g_local_mission_harness_target.load(
         std::memory_order_acquire);
     return capture::GetConfig().local_mission_harness_enabled &&
-        (target == kLocalMissionHarnessBaselineDummies ||
-         target == kLocalMissionHarnessProbeDummies) &&
+        IsLocalMissionHarnessTarget(target) &&
         g_owned_lobby.load(std::memory_order_acquire) != 0 &&
         g_last_actual_member_count.load(std::memory_order_acquire) == 1 &&
         g_bot_count.load(std::memory_order_acquire) == target;
@@ -4340,6 +4412,326 @@ int32_t ReadMissionRewardLocalProfileCount() {
     int32_t count = -1;
     std::memcpy(&count, field, sizeof(count));
     return count;
+}
+
+// Each native result Item is {int32 field0, int32 field1}. Online,
+// ResolveResult (0x3E3150 -> 0x1991D0 with the object in slot 0x125ABD8)
+// sums field0/field1 over all four Items into object+0xA88/+0xA8C, adds its
+// own counters +0xA90/+0xA94 and clamps against +0xAD8/+0xADC (0x1992D9).
+// These are plain game counters (box pickups), safe to log; they show what
+// each machine actually credits when a player reports a missing reward.
+constexpr uintptr_t kMissionRewardResolverSlotRva = 0x125abd8;
+constexpr size_t kMissionRewardResolverCountersOffset = 0xa88;
+constexpr size_t kMissionRewardResolverCapsOffset = 0xad8;
+
+[[maybe_unused]] std::string MissionResultItemFieldsJson() {
+    if (!g_mission_loadout_state_slot ||
+        !IsReadableMemoryRange(g_mission_loadout_state_slot,
+                               sizeof(void*))) {
+        return "null";
+    }
+    void* state = nullptr;
+    std::memcpy(&state, g_mission_loadout_state_slot, sizeof(state));
+    const auto* items = state
+        ? static_cast<const uint8_t*>(state) + kMissionResultItemArrayOffset
+        : nullptr;
+    if (!items ||
+        !IsReadableMemoryRange(items, kMissionResultNativeItemCount *
+                                          kMissionResultItemSize)) {
+        return "null";
+    }
+    std::string json = "[";
+    for (unsigned index = 0; index < kMissionResultNativeItemCount; ++index) {
+        int32_t field0 = 0;
+        int32_t field1 = 0;
+        std::memcpy(&field0, items + index * kMissionResultItemSize,
+                    sizeof(field0));
+        std::memcpy(&field1, items + index * kMissionResultItemSize + 4,
+                    sizeof(field1));
+        json += (index ? ",[" : "[") + std::to_string(field0) + "," +
+            std::to_string(field1) + "]";
+    }
+    return json + "]";
+}
+
+[[maybe_unused]] std::string MissionRewardResolverCountersJson() {
+    if (!g_module_base) return "null";
+    const auto* slot = reinterpret_cast<const uint8_t*>(
+        g_module_base + kMissionRewardResolverSlotRva);
+    if (!IsReadableMemoryRange(slot, sizeof(void*))) return "null";
+    const uint8_t* resolver = nullptr;
+    std::memcpy(&resolver, slot, sizeof(resolver));
+    if (!resolver ||
+        !IsReadableMemoryRange(resolver + kMissionRewardResolverCountersOffset,
+                               4 * sizeof(int32_t)) ||
+        !IsReadableMemoryRange(resolver + kMissionRewardResolverCapsOffset,
+                               2 * sizeof(int32_t))) {
+        return "null";
+    }
+    std::array<uint32_t, 6> values{};
+    std::memcpy(values.data(), resolver + kMissionRewardResolverCountersOffset,
+                4 * sizeof(uint32_t));
+    std::memcpy(values.data() + 4,
+                resolver + kMissionRewardResolverCapsOffset,
+                2 * sizeof(uint32_t));
+    return "{\"item_sum\":[" + std::to_string(values[0]) + "," +
+        std::to_string(values[1]) + "],\"own_counters\":[" +
+        std::to_string(values[2]) + "," + std::to_string(values[3]) +
+        "],\"caps\":[" + std::to_string(values[4]) + "," +
+        std::to_string(values[5]) + "]}";
+}
+
+// Local soldier profile records consumed by ApplyResult (0x3E3160 loads
+// state+0x6D4C at 0x3E31A4, stride 0x3E60 at 0x3E32AE, count state+0x2459C).
+// A snapshot taken when the reward calculation starts, diffed after
+// crediting and again at room return, shows which numeric fields the game
+// actually changed (armor, unlock flags) for a "no armor" report. Only
+// dword offsets and integer values are logged, never names or pointers.
+constexpr size_t kMissionLocalProfileBaseOffset = 0x6d4c;
+constexpr size_t kMissionLocalProfileStride = 0x3e60;
+constexpr size_t kMissionLocalProfileDiffLimit = 48;
+// Armor split (ResolveResult): every armor box (Items field1) goes to one
+// class drawn with weight 250 for the class at profile+0 (0x1994AB) and 100
+// for the others; weapon boxes (field0) use 600/100. Each class total
+// becomes a resolver record {0, class, count} (list resolver+0xA98, 0x14
+// bytes each) that 0x199D7F credits as profile+0xF8+4*class, capped by the
+// save-header total state+0x6D24+4*class (raised by the same count first)
+// and skipped while byte state+0x6D00+10*profile+class is set. The save
+// block starts at state+0x6D24 (0x3D9B60 copies 0xDC80 bytes from there).
+constexpr size_t kMissionSaveHeaderOffset = 0x6d00;
+constexpr size_t kMissionSaveHeaderSize =
+    kMissionLocalProfileBaseOffset - kMissionSaveHeaderOffset;
+constexpr size_t kMissionClassCreditBlockedOffset = 0x6d00;
+constexpr size_t kMissionClassCreditBlockedProfileStride = 10;
+constexpr size_t kMissionClassArmorTotalOffset = 0x6d24;
+constexpr size_t kMissionProfileClassArmorOffset = 0xf8;
+constexpr size_t kMissionRewardRecordListOffset = 0xa98;
+constexpr size_t kMissionRewardRecordDataOffset = 0x08;
+constexpr size_t kMissionRewardRecordSizeOffset = 0x18;
+constexpr size_t kMissionRewardRecordStride = 0x14;
+constexpr size_t kMissionRewardRecordLogLimit = 64;
+struct MissionLocalProfileSnapshot {
+    bool valid = false;
+    int32_t count = 0;
+    std::array<uint8_t, kMissionSaveHeaderSize> header{};
+    std::array<std::array<uint8_t, kMissionLocalProfileStride>,
+               static_cast<size_t>(kMissionRewardLocalProfileCapacity)>
+        bytes{};
+};
+MissionLocalProfileSnapshot g_mission_local_profile_snapshot{};
+
+const uint8_t* MissionLocalProfiles(int32_t& count) {
+    count = ReadMissionRewardLocalProfileCount();
+    if (count < 1 || count > kMissionRewardLocalProfileCapacity ||
+        !g_mission_loadout_state_slot ||
+        !IsReadableMemoryRange(g_mission_loadout_state_slot,
+                               sizeof(void*))) {
+        return nullptr;
+    }
+    const uint8_t* state = nullptr;
+    std::memcpy(&state, g_mission_loadout_state_slot, sizeof(state));
+    const uint8_t* profiles = state
+        ? state + kMissionLocalProfileBaseOffset : nullptr;
+    if (!profiles ||
+        !IsReadableMemoryRange(profiles, static_cast<size_t>(count) *
+                                             kMissionLocalProfileStride)) {
+        return nullptr;
+    }
+    return profiles;
+}
+
+[[maybe_unused]] void SnapshotMissionLocalProfiles() {
+    auto& snapshot = g_mission_local_profile_snapshot;
+    snapshot.valid = false;
+    int32_t count = 0;
+    const uint8_t* profiles = MissionLocalProfiles(count);
+    if (!profiles) return;
+    // The header precedes the profiles inside the same 0x24600-byte state.
+    std::memcpy(snapshot.header.data(), profiles - kMissionSaveHeaderSize,
+                kMissionSaveHeaderSize);
+    for (int32_t index = 0; index < count; ++index) {
+        std::memcpy(snapshot.bytes[static_cast<size_t>(index)].data(),
+                    profiles + static_cast<size_t>(index) *
+                                   kMissionLocalProfileStride,
+                    kMissionLocalProfileStride);
+    }
+    snapshot.count = count;
+    snapshot.valid = true;
+}
+
+// {"profiles":N,"changed_dwords":K,"changes":[[profile,offset,before,after]]}
+[[maybe_unused]] std::string MissionLocalProfileDiffJson() {
+    const auto& snapshot = g_mission_local_profile_snapshot;
+    int32_t count = 0;
+    const uint8_t* profiles = MissionLocalProfiles(count);
+    if (!snapshot.valid || !profiles) return "null";
+    const int32_t compared = std::min(count, snapshot.count);
+    size_t changed = 0;
+    std::string changes;
+    for (int32_t index = 0; index < compared; ++index) {
+        const uint8_t* now = profiles +
+            static_cast<size_t>(index) * kMissionLocalProfileStride;
+        const uint8_t* before =
+            snapshot.bytes[static_cast<size_t>(index)].data();
+        for (size_t offset = 0; offset + 4 <= kMissionLocalProfileStride;
+             offset += 4) {
+            int32_t old_value = 0;
+            int32_t new_value = 0;
+            std::memcpy(&old_value, before + offset, sizeof(old_value));
+            std::memcpy(&new_value, now + offset, sizeof(new_value));
+            if (old_value == new_value) continue;
+            if (++changed > kMissionLocalProfileDiffLimit) continue;
+            changes += (changes.empty() ? "[" : ",[") +
+                std::to_string(index) + "," + std::to_string(offset) + "," +
+                std::to_string(old_value) + "," +
+                std::to_string(new_value) + "]";
+        }
+    }
+    return "{\"profiles\":" + std::to_string(compared) +
+        ",\"changed_dwords\":" + std::to_string(changed) +
+        ",\"truncated\":" +
+        (changed > kMissionLocalProfileDiffLimit ? "true" : "false") +
+        ",\"changes\":[" + changes + "]}";
+}
+
+[[maybe_unused]] std::string Int32ArrayJson(const int32_t* values,
+                                            size_t count) {
+    std::string json = "[";
+    for (size_t index = 0; index < count; ++index) {
+        json += (index ? "," : "") + std::to_string(values[index]);
+    }
+    return json + "]";
+}
+
+// Inputs of the native armor split for a "wrong class" report: the class
+// each local profile weights (profile+0), the class each native participant
+// block carries, the save totals that cap the credit, the per-class
+// blocking bytes and the resolver's {class, count} armor records.
+[[maybe_unused]] std::string MissionArmorContextJson() {
+    int32_t count = 0;
+    const uint8_t* profiles = MissionLocalProfiles(count);
+    if (!profiles) return "null";
+    const uint8_t* header = profiles - kMissionSaveHeaderSize;
+    const uint8_t* state = header - kMissionSaveHeaderOffset;
+    if (!IsReadableMemoryRange(header, kMissionSaveHeaderSize) ||
+        !IsReadableMemoryRange(state + kMissionSelectedLoadoutOffset,
+                               kNativeMissionSourceCount *
+                                   kMissionClassLoadoutStride)) {
+        return "null";
+    }
+    constexpr size_t kClasses =
+        static_cast<size_t>(kMissionCharacterClassLimit);
+    std::array<int32_t, static_cast<size_t>(
+                            kMissionRewardLocalProfileCapacity)> classes{};
+    for (int32_t index = 0; index < count; ++index) {
+        std::memcpy(&classes[static_cast<size_t>(index)],
+                    profiles + static_cast<size_t>(index) *
+                                   kMissionLocalProfileStride,
+                    sizeof(int32_t));
+    }
+    std::array<int32_t, kNativeMissionSourceCount> block_classes{};
+    for (size_t index = 0; index < kNativeMissionSourceCount; ++index) {
+        std::memcpy(&block_classes[index],
+                    state + kMissionSelectedLoadoutOffset +
+                        index * kMissionClassLoadoutStride,
+                    sizeof(int32_t));
+    }
+    auto totals_json = [&](const uint8_t* source) {
+        std::array<int32_t, kClasses> totals{};
+        std::memcpy(totals.data(),
+                    source + (kMissionClassArmorTotalOffset -
+                              kMissionSaveHeaderOffset),
+                    sizeof(totals));
+        return Int32ArrayJson(totals.data(), totals.size());
+    };
+    std::string blocked = "[";
+    for (int32_t index = 0; index < count; ++index) {
+        std::array<int32_t, kClasses> flags{};
+        for (size_t cls = 0; cls < kClasses; ++cls) {
+            flags[cls] = header[(kMissionClassCreditBlockedOffset -
+                                 kMissionSaveHeaderOffset) +
+                                static_cast<size_t>(index) *
+                                    kMissionClassCreditBlockedProfileStride +
+                                cls];
+        }
+        blocked += (index ? "," : "") +
+            Int32ArrayJson(flags.data(), flags.size());
+    }
+    blocked += "]";
+    std::string profile_armor = "[";
+    for (int32_t index = 0; index < count; ++index) {
+        std::array<int32_t, kClasses> armor{};
+        std::memcpy(armor.data(),
+                    profiles + static_cast<size_t>(index) *
+                                   kMissionLocalProfileStride +
+                        kMissionProfileClassArmorOffset,
+                    sizeof(armor));
+        profile_armor += (index ? "," : "") +
+            Int32ArrayJson(armor.data(), armor.size());
+    }
+    profile_armor += "]";
+    const auto& snapshot = g_mission_local_profile_snapshot;
+    std::string json =
+        "{\"profile_classes\":" +
+        Int32ArrayJson(classes.data(), static_cast<size_t>(count)) +
+        ",\"participant_block_classes\":" +
+        Int32ArrayJson(block_classes.data(), block_classes.size()) +
+        ",\"local_participant_mask\":" +
+        std::to_string(g_mission_local_participant_mask.load(
+            std::memory_order_acquire)) +
+        ",\"profile_class_armor\":" + profile_armor +
+        ",\"class_armor_totals_before\":" +
+        (snapshot.valid ? totals_json(snapshot.header.data())
+                        : std::string("null")) +
+        ",\"class_armor_totals\":" + totals_json(header) +
+        ",\"class_credit_blocked\":" + blocked;
+
+    // Resolver records: type 0 = armor {class, count}, type 1 = weapon.
+    std::string records = "null";
+    size_t weapon_records = 0;
+    const auto* slot = g_module_base
+        ? reinterpret_cast<const uint8_t*>(
+              g_module_base + kMissionRewardResolverSlotRva)
+        : nullptr;
+    const uint8_t* resolver = nullptr;
+    if (slot && IsReadableMemoryRange(slot, sizeof(void*))) {
+        std::memcpy(&resolver, slot, sizeof(resolver));
+    }
+    const uint8_t* list = resolver
+        ? resolver + kMissionRewardRecordListOffset : nullptr;
+    if (list && IsReadableMemoryRange(
+                    list, kMissionRewardRecordSizeOffset + sizeof(uint64_t))) {
+        const uint8_t* data = nullptr;
+        uint64_t size = 0;
+        std::memcpy(&data, list + kMissionRewardRecordDataOffset,
+                    sizeof(data));
+        std::memcpy(&size, list + kMissionRewardRecordSizeOffset,
+                    sizeof(size));
+        if (size <= 4096 &&
+            (!size || (data && IsReadableMemoryRange(
+                                   data, static_cast<size_t>(size) *
+                                             kMissionRewardRecordStride)))) {
+            records = "[";
+            size_t logged = 0;
+            for (uint64_t index = 0; index < size; ++index) {
+                std::array<int32_t, 3> record{};
+                std::memcpy(record.data(),
+                            data + static_cast<size_t>(index) *
+                                       kMissionRewardRecordStride,
+                            sizeof(record));
+                if (record[0] != 0) {
+                    ++weapon_records;
+                    continue;
+                }
+                if (logged++ >= kMissionRewardRecordLogLimit) continue;
+                records += (logged > 1 ? "," : "") +
+                    Int32ArrayJson(record.data() + 1, 2);
+            }
+            records += "]";
+        }
+    }
+    return json + ",\"armor_records\":" + records +
+        ",\"weapon_records\":" + std::to_string(weapon_records) + "}";
 }
 
 bool RepairMissionRewardLocalProfileCount(const char* phase,
@@ -5091,6 +5483,63 @@ uint32_t ExpectedMissionResultItemMask(int32_t participant_count) {
     return (uint32_t{1} << static_cast<unsigned>(participant_count)) - 1;
 }
 
+// Order- and duplicate-independent fold of P4-P7 result Items. The native
+// sink 0x132BB0 *assigns* Items[i] (mov [Items+i*8],value) while extras used
+// to be added on top: a native delivery arriving after an extra erased the
+// extra's pickups for everyone, and a re-sent extra was counted twice. Every
+// delivery is now stored and the slot rewritten as native + extra. Extra
+// logical index 4+k maps to slot k. Exec_Begin, which zeroes the native
+// Items, resets the table.
+struct MissionResultItemFoldState {
+    std::array<std::array<uint32_t, 2>, kMissionResultNativeItemCount>
+        native{};
+    std::array<std::array<uint32_t, 2>, kMissionResultNativeItemCount>
+        extra{};
+    std::array<bool, kMissionResultNativeItemCount> extra_present{};
+};
+static_assert(kMaximumMissionParticipants - kNativeMissionSourceCount ==
+                  kMissionResultNativeItemCount,
+              "each native result slot folds exactly one extra participant");
+MissionResultItemFoldState g_mission_result_item_fold{};
+SRWLOCK g_mission_result_item_fold_lock = SRWLOCK_INIT;
+
+void ResetMissionResultItemFold() {
+    AcquireSRWLockExclusive(&g_mission_result_item_fold_lock);
+    g_mission_result_item_fold = {};
+    ReleaseSRWLockExclusive(&g_mission_result_item_fold_lock);
+}
+
+// Caller holds the fold lock.
+bool WriteFoldedMissionResultItemLocked(uint8_t* state, unsigned slot) {
+    auto* destination = state
+        ? state + kMissionResultItemArrayOffset +
+              static_cast<size_t>(slot) * kMissionResultItemSize
+        : nullptr;
+    if (!destination || slot >= kMissionResultNativeItemCount ||
+        !IsWritableMemoryRange(destination, kMissionResultItemSize)) {
+        return false;
+    }
+    std::array<uint32_t, 2> total = g_mission_result_item_fold.native[slot];
+    if (g_mission_result_item_fold.extra_present[slot]) {
+        for (size_t field = 0; field < total.size(); ++field) {
+            total[field] += g_mission_result_item_fold.extra[slot][field];
+        }
+    }
+    std::memcpy(destination, total.data(), sizeof(total));
+    return true;
+}
+
+uint8_t* CurrentMissionResultState() {
+    if (!g_mission_loadout_state_slot ||
+        !IsReadableMemoryRange(g_mission_loadout_state_slot,
+                               sizeof(void*))) {
+        return nullptr;
+    }
+    uint8_t* state = nullptr;
+    std::memcpy(&state, g_mission_loadout_state_slot, sizeof(state));
+    return state;
+}
+
 void __fastcall MissionResultItemSinkHook(
     void* callback, const int32_t* participant_index,
     const uint64_t* item) {
@@ -5121,6 +5570,19 @@ void __fastcall MissionResultItemSinkHook(
         if (g_mission_result_item_sink) {
             g_mission_result_item_sink(callback, participant_index, item);
         }
+        if (decoded_item_readable) {
+            // The native write just replaced the slot; re-add any extra
+            // that was folded into it earlier in this result exchange.
+            const unsigned slot = static_cast<unsigned>(logical_index);
+            AcquireSRWLockExclusive(&g_mission_result_item_fold_lock);
+            std::memcpy(g_mission_result_item_fold.native[slot].data(),
+                        item, sizeof(*item));
+            if (g_mission_result_item_fold.extra_present[slot]) {
+                WriteFoldedMissionResultItemLocked(
+                    CurrentMissionResultState(), slot);
+            }
+            ReleaseSRWLockExclusive(&g_mission_result_item_fold_lock);
+        }
         return;
     }
 
@@ -5136,25 +5598,19 @@ void __fastcall MissionResultItemSinkHook(
         g_mission_loadout_state_slot &&
         IsReadableMemoryRange(g_mission_loadout_state_slot,
                               sizeof(void*))) {
-        uint8_t* state = nullptr;
-        std::memcpy(&state, g_mission_loadout_state_slot, sizeof(state));
         native_slot = logical_index %
             static_cast<int32_t>(kMissionResultNativeItemCount);
-        auto* destination = state
-            ? state + kMissionResultItemArrayOffset +
-                  static_cast<size_t>(native_slot) *
-                      kMissionResultItemSize
-            : nullptr;
-        if (destination &&
-            IsReadableMemoryRange(destination, kMissionResultItemSize)) {
-            std::array<uint32_t, 2> values{};
-            std::memcpy(values.data(), item, sizeof(values));
-            for (size_t field = 0; field < values.size(); ++field) {
-                InterlockedExchangeAdd(
-                    reinterpret_cast<volatile LONG*>(
-                        destination + field * sizeof(uint32_t)),
-                    static_cast<LONG>(values[field]));
-            }
+        const unsigned slot = static_cast<unsigned>(native_slot);
+        AcquireSRWLockExclusive(&g_mission_result_item_fold_lock);
+        // Store (not add) this participant's latest Item so a re-send is
+        // idempotent, then rewrite the slot as native + extra.
+        std::memcpy(g_mission_result_item_fold.extra[slot].data(), item,
+                    sizeof(*item));
+        g_mission_result_item_fold.extra_present[slot] = true;
+        const bool written = WriteFoldedMissionResultItemLocked(
+            CurrentMissionResultState(), slot);
+        ReleaseSRWLockExclusive(&g_mission_result_item_fold_lock);
+        if (written) {
             aggregated = true;
             reason = "folded into native accumulator";
             g_mission_result_extra_item_aggregated_calls.fetch_add(
@@ -5252,6 +5708,9 @@ bool __fastcall MissionResultExecBeginHook(int32_t argument) {
     EDF5_DIAGNOSTIC_SCOPE(diagnostics_scope,
         "more_players", "mission_result_exec_begin", "before_original",
         static_cast<uint64_t>(static_cast<int64_t>(argument)), call);
+    // Exec_Begin zeroes the four native Items (0x42FD93..0x42FDCD); the
+    // folded table must start over with them.
+    ResetMissionResultItemFold();
     const bool accepted = g_mission_result_exec_begin
         ? g_mission_result_exec_begin(argument) : false;
     EDF5_DIAGNOSTIC_PHASE(diagnostics_scope, "original_returned", accepted ? 1 : 0, call);
@@ -5669,11 +6128,14 @@ void __fastcall MissionRewardResolveHook() {
             .UInt("observed_result_item_mask", observed_item_mask)
             .Bool("result_items_complete", item_matrix_complete)
             .UInt("resolve_rva", kMissionRewardResolveRva)
-            .Bool("reward_contents_logged", false)
+            .Raw("result_item_fields", MissionResultItemFieldsJson())
+            .Raw("resolver_counters", MissionRewardResolverCountersJson())
+            .Bool("reward_contents_logged", true)
             .Bool("payload_logged", false));
     EDF5_DIAGNOSTIC_SCOPE(diagnostics_scope,
         "more_players", "mission_reward_resolve", "before_original",
         call, static_cast<uint64_t>(static_cast<int64_t>(local_profiles)));
+    if constexpr (build_config::kDiagnostics) SnapshotMissionLocalProfiles();
     if (g_mission_reward_resolve) g_mission_reward_resolve();
     EDF5_DIAGNOSTIC_PHASE(diagnostics_scope, "original_returned", call, 1);
     EDF5_CAPTURE_EVENT(
@@ -5701,7 +6163,10 @@ void __fastcall MissionRewardResolveHook() {
             .Bool("result_items_complete", item_matrix_complete)
             .UInt("resolve_rva", kMissionRewardResolveRva)
             .Bool("returned", true)
-            .Bool("reward_contents_logged", false)
+            .Raw("result_item_fields", MissionResultItemFieldsJson())
+            .Raw("resolver_counters", MissionRewardResolverCountersJson())
+            .Raw("armor_context", MissionArmorContextJson())
+            .Bool("reward_contents_logged", true)
             .Bool("payload_logged", false));
 }
 
@@ -5785,7 +6250,9 @@ bool __fastcall MissionRewardApplyHook(bool is_mission_clear) {
             .Bool("result_items_complete", item_matrix_complete)
             .UInt("apply_rva", kMissionRewardApplyRva)
             .Bool("online_player_count_used", false)
-            .Bool("reward_contents_logged", false)
+            .Bool("reward_contents_logged", true)
+            .Raw("local_profile_changes", MissionLocalProfileDiffJson())
+            .Raw("armor_context", MissionArmorContextJson())
             .Bool("payload_logged", false));
     return native_result;
 }
@@ -5854,6 +6321,8 @@ void ArmMissionResultRecovery(uintptr_t caller_rva, uint64_t now,
             .Bool("host_only", true));
 }
 
+void DamageMeterOnResult(int32_t result);
+
 void __fastcall MissionResultApplyHook(void* ui, int32_t result) {
 #if defined(__clang__) || defined(__GNUC__)
     const uintptr_t return_address = reinterpret_cast<uintptr_t>(
@@ -5877,6 +6346,7 @@ void __fastcall MissionResultApplyHook(void* ui, int32_t result) {
         "more_players", "mission_result_apply", "before_original",
         static_cast<uint64_t>(static_cast<int64_t>(result)), call);
     if (g_mission_result_apply) g_mission_result_apply(ui, result);
+    DamageMeterOnResult(result);
     const int32_t after_state = ReadMissionUiState(ui);
     const int32_t after_result = ReadMissionUiResult(ui);
     EDF5_DIAGNOSTIC_PHASE(diagnostics_scope, "original_returned",
@@ -6362,6 +6832,17 @@ bool CompleteMissionResultTransition(const char* completion_signal) {
                       std::strcmp(completion_signal, "room_ui_update") == 0)
             .Bool("reward_contents_logged", false)
             .Bool("payload_logged", false));
+    // Separate from the completion event, whose analyzer contract forbids
+    // reward contents: did the soldier profile change by the room return?
+    EDF5_CAPTURE_EVENT(
+        "more_players", "mission_local_profile_changes_at_room",
+        capture::Fields()
+            .Int("result", g_mission_result_last_value.load(
+                     std::memory_order_acquire))
+            .Raw("local_profile_changes", MissionLocalProfileDiffJson())
+            .Raw("armor_context", MissionArmorContextJson())
+            .Bool("names_logged", false)
+            .Bool("payload_logged", false));
     return true;
 }
 
@@ -6836,14 +7317,16 @@ void QueueWheelDetents(int detents) {
 
 LRESULT CALLBACK GameWindowProc(HWND window, UINT message, WPARAM wparam,
                                 LPARAM lparam) {
+    // HUiRoom::Update keeps the roster "active" while room sub-menus such as
+    // weapon selection are open, so the wheel must still reach the game:
+    // swallowing it here (pre-0.6.72) froze every native list in the room.
+    // The native four-row PlayersGroup has no scroll of its own, so passing
+    // the message on does not double-scroll the roster.
     if (message == WM_MOUSEWHEEL && RoomRosterActive()) {
         const int wheel_delta = static_cast<short>(HIWORD(wparam));
         int detents = wheel_delta / WHEEL_DELTA;
         if (!detents && wheel_delta) detents = wheel_delta > 0 ? 1 : -1;
-        if (detents) {
-            QueueWheelDetents(detents);
-            return 0;
-        }
+        if (detents) QueueWheelDetents(detents);
     }
     const auto original = reinterpret_cast<WNDPROC>(
         g_original_window_proc.load(std::memory_order_acquire));
@@ -6877,7 +7360,8 @@ bool InstallGameWindowProc() {
                         std::memory_order_release);
     EDF5_CAPTURE_EVENT("more_players", "room_wheel_hook_installed",
                    capture::Fields().String("mode", "window_mouse_wheel")
-                       .Bool("cursor_hit_test", false));
+                       .Bool("cursor_hit_test", false)
+                       .Bool("message_passed_to_game", true));
     return true;
 }
 
@@ -7298,7 +7782,52 @@ PlayerInfoObservation FindPlayerInfoObservation(void* user) {
 void ClearMissionExtraLoadoutSidecars() {
     AcquireSRWLockExclusive(&g_mission_extra_loadout_sidecar_lock);
     for (auto& sidecar : g_mission_extra_loadout_sidecars) sidecar = {};
+    g_mission_extra_loadout_image_parser_call.fill(0);
     ReleaseSRWLockExclusive(&g_mission_extra_loadout_sidecar_lock);
+}
+
+void StoreMissionExtraLoadoutImage(const uint8_t* block,
+                                   int32_t logical_index,
+                                   unsigned parser_call) {
+    if (!block ||
+        logical_index < static_cast<int32_t>(kNativeMissionSourceCount) ||
+        logical_index >= static_cast<int32_t>(
+                             kMaximumMissionParticipants) ||
+        !parser_call) {
+        return;
+    }
+    const size_t slot = static_cast<size_t>(logical_index) -
+        kNativeMissionSourceCount;
+    AcquireSRWLockExclusive(&g_mission_extra_loadout_sidecar_lock);
+    std::memcpy(g_mission_extra_loadout_images[slot].data(), block,
+                kMissionClassLoadoutStride);
+    g_mission_extra_loadout_image_parser_call[slot] = parser_call;
+    ReleaseSRWLockExclusive(&g_mission_extra_loadout_sidecar_lock);
+}
+
+// Copies the stored image only if it came from the same parser call as the
+// sidecar used for class/weapons/armor, so the two can never disagree.
+bool CopyMissionExtraLoadoutImage(int32_t logical_index,
+                                  unsigned expected_parser_call,
+                                  uint8_t* destination) {
+    if (!destination || !expected_parser_call ||
+        logical_index < static_cast<int32_t>(kNativeMissionSourceCount) ||
+        logical_index >= static_cast<int32_t>(
+                             kMaximumMissionParticipants)) {
+        return false;
+    }
+    const size_t slot = static_cast<size_t>(logical_index) -
+        kNativeMissionSourceCount;
+    bool copied = false;
+    AcquireSRWLockShared(&g_mission_extra_loadout_sidecar_lock);
+    if (g_mission_extra_loadout_image_parser_call[slot] ==
+        expected_parser_call) {
+        std::memcpy(destination, g_mission_extra_loadout_images[slot].data(),
+                    kMissionClassLoadoutStride);
+        copied = true;
+    }
+    ReleaseSRWLockShared(&g_mission_extra_loadout_sidecar_lock);
+    return copied;
 }
 
 MissionExtraLoadoutSidecar FindMissionExtraLoadoutSidecar(
@@ -7348,9 +7877,14 @@ uint32_t MissionLoadoutWeaponValidMask(int32_t logical_index,
     return mask;
 }
 
+// `native_state_layout` is true when `block` is the overlapping native
+// address state+0x14B30+index*0x3E90 (some weapon fields alias the
+// participant count). Redirected parser blocks live in plugin memory and
+// have no overlapping fields.
 bool CaptureMissionExtraLoadoutSidecar(const uint8_t* block,
                                        int32_t logical_index,
-                                       unsigned parser_call) {
+                                       unsigned parser_call,
+                                       bool native_state_layout) {
     if (!block ||
         logical_index < static_cast<int32_t>(kNativeMissionSourceCount) ||
         logical_index >= static_cast<int32_t>(
@@ -7376,8 +7910,10 @@ bool CaptureMissionExtraLoadoutSidecar(const uint8_t* block,
             kMissionLoadoutRecordStride;
     std::memcpy(incoming.weapons.data(), active_record,
                 sizeof(incoming.weapons));
-    incoming.weapon_valid_mask = MissionLoadoutWeaponValidMask(
-        logical_index, incoming.selected_class);
+    incoming.weapon_valid_mask = native_state_layout
+        ? MissionLoadoutWeaponValidMask(logical_index,
+                                        incoming.selected_class)
+        : kMissionLoadoutWeaponMask;
     std::memcpy(&incoming.armor, block + kMissionLoadoutArmorOffset,
                 sizeof(incoming.armor));
     incoming.valid = true;
@@ -7687,6 +8223,46 @@ bool __fastcall FakeMissionLoadoutParser(int32_t, bool* failed) {
     const size_t extra_blocks = participant_capacity >
             kNativeMissionSourceCount
         ? participant_capacity - kNativeMissionSourceCount : 0;
+    // With the index relays installed the real parser writes P4+ into the
+    // plugin blocks, which have no field shared with the participant count.
+    uint8_t* const redirected = game_patches::MissionLoadoutParserExtraBlocks();
+    if (extra_blocks && redirected) {
+        const unsigned extra_players =
+            g_fake_mission_loadout_parser_extra_players.load(
+                std::memory_order_acquire);
+        for (unsigned extra = 0; extra < extra_players && extra < extra_blocks;
+             ++extra) {
+            auto* block = redirected + extra * kMissionClassLoadoutStride;
+            // Bulk image as the real parser copies it for indices 4..7 once
+            // its bound is raised: recognizable per-player bytes plus the
+            // block+4 field read by 0x8AE00.
+            std::memset(block + 0x100, static_cast<int>(0x40 + extra),
+                        0x3e60 - 0x100);
+            const int32_t derived = static_cast<int32_t>(77 + extra);
+            std::memcpy(block + 4, &derived, sizeof(derived));
+            const int32_t selected_class = static_cast<int32_t>(1 + extra % 3);
+            std::array<int32_t, kMissionLoadoutWeaponCount> weapons{};
+            for (size_t weapon = 0; weapon < weapons.size(); ++weapon) {
+                weapons[weapon] = static_cast<int32_t>(
+                    1040 + extra * 1010 + weapon);
+            }
+            const int32_t armor = static_cast<int32_t>(456 + extra * 333);
+            std::memcpy(block, &selected_class, sizeof(selected_class));
+            std::memcpy(
+                block + (kMissionLoadoutRecordOffset -
+                         kMissionSelectedLoadoutOffset) +
+                    static_cast<size_t>(selected_class) *
+                        kMissionLoadoutRecordStride,
+                weapons.data(), sizeof(weapons));
+            std::memcpy(block + kMissionLoadoutArmorOffset, &armor,
+                        sizeof(armor));
+        }
+        const int32_t participant_count = static_cast<int32_t>(
+            kNativeMissionSourceCount + extra_players);
+        std::memcpy(state + kMissionResultParticipantCountOffset,
+                    &participant_count, sizeof(participant_count));
+        return false;
+    }
     if (extra_blocks) {
         std::memset(state + kMissionExtraLoadoutBeginOffset, 0xa5,
                     extra_blocks * kMissionClassLoadoutStride);
@@ -7717,6 +8293,188 @@ bool __fastcall FakeMissionLoadoutParser(int32_t, bool* failed) {
     return false;
 }
 
+// With the 0x42F7C9/0x42F898 index relays installed, the parser writes blocks
+// 4..7 into plugin memory. Nothing outside the 0x24600-byte mission state is
+// written, so nothing has to be snapshotted or restored; only the
+// participant count, which 0x42FA69 stores inside the object, keeps its
+// validity contract.
+constexpr uint8_t kRedirectedParserBlockFill = 0xa5;
+
+bool CallRedirectedMissionLoadoutParser(int32_t argument, bool* failed,
+                                        unsigned parser_call,
+                                        uint8_t* blocks,
+                                        size_t extra_blocks,
+                                        unsigned participant_capacity) {
+    MissionLoadoutParserProtection& protection =
+        g_mission_loadout_parser_protection;
+    const size_t bytes = extra_blocks * kMissionClassLoadoutStride;
+    std::memset(blocks, kRedirectedParserBlockFill, bytes);
+    uint8_t* state = nullptr;
+    if (g_mission_loadout_state_slot &&
+        IsReadableMemoryRange(g_mission_loadout_state_slot,
+                              sizeof(void*))) {
+        std::memcpy(&state, g_mission_loadout_state_slot, sizeof(state));
+    }
+    const size_t counts_bytes = kMissionResultParticipantCountOffset +
+        sizeof(int32_t) - kMissionRewardLocalProfileCountOffset;
+    const bool counts_readable = state &&
+        IsReadableMemoryRange(state + kMissionRewardLocalProfileCountOffset,
+                              counts_bytes);
+    int32_t local_profiles_before = -1;
+    int32_t participant_count_before = -1;
+    if (counts_readable) {
+        std::memcpy(&local_profiles_before,
+                    state + kMissionRewardLocalProfileCountOffset,
+                    sizeof(local_profiles_before));
+        std::memcpy(&participant_count_before,
+                    state + kMissionResultParticipantCountOffset,
+                    sizeof(participant_count_before));
+    }
+    protection.active = true;
+    protection.state = state;
+    protection.bytes = 0;
+    g_mission_loadout_parser_protected_calls.fetch_add(
+        1, std::memory_order_acq_rel);
+
+    EDF5_DIAGNOSTIC_SCOPE(diagnostics_scope,
+        "more_players", "mission_loadout_parser",
+        "call_original_redirected", extra_blocks, bytes);
+    const bool result = g_mission_loadout_parser(argument, failed);
+    const bool parser_failed = failed && *failed;
+    EDF5_DIAGNOSTIC_PHASE(diagnostics_scope, "original_returned",
+                          result ? 1 : 0, parser_failed ? 1 : 0);
+    protection.active = false;
+    protection.state = nullptr;
+
+    size_t changed_bytes = 0;
+    uint32_t changed_block_mask = 0;
+    for (size_t index = 0; index < bytes; ++index) {
+        if (blocks[index] != kRedirectedParserBlockFill) {
+            ++changed_bytes;
+            changed_block_mask |= uint32_t{1} << static_cast<unsigned>(
+                index / kMissionClassLoadoutStride);
+        }
+    }
+    uint32_t captured_sidecar_mask = 0;
+    uint32_t invalid_sidecar_mask = 0;
+    uint32_t complete_sidecar_weapon_mask = 0;
+    uint32_t partial_sidecar_weapon_mask = 0;
+    uint32_t full_image_mask = 0;
+    for (size_t extra_index = 0; extra_index < extra_blocks;
+         ++extra_index) {
+        const uint32_t bit = uint32_t{1} <<
+            static_cast<unsigned>(extra_index);
+        if (!(changed_block_mask & bit)) continue;
+        const int32_t logical_index = static_cast<int32_t>(
+            kNativeMissionSourceCount + extra_index);
+        if (CaptureMissionExtraLoadoutSidecar(
+                blocks + extra_index * kMissionClassLoadoutStride,
+                logical_index, parser_call, false)) {
+            captured_sidecar_mask |= bit;
+            StoreMissionExtraLoadoutImage(
+                blocks + extra_index * kMissionClassLoadoutStride,
+                logical_index, parser_call);
+            full_image_mask |= bit;
+            const MissionExtraLoadoutSidecar sidecar =
+                FindMissionExtraLoadoutSidecar(logical_index);
+            if (sidecar.weapon_valid_mask == kMissionLoadoutWeaponMask) {
+                complete_sidecar_weapon_mask |= bit;
+            } else {
+                partial_sidecar_weapon_mask |= bit;
+            }
+        } else {
+            invalid_sidecar_mask |= bit;
+        }
+    }
+
+    uint8_t* current_state = nullptr;
+    if (g_mission_loadout_state_slot &&
+        IsReadableMemoryRange(g_mission_loadout_state_slot,
+                              sizeof(void*))) {
+        std::memcpy(&current_state, g_mission_loadout_state_slot,
+                    sizeof(current_state));
+    }
+    const bool state_stable = counts_readable && current_state == state;
+    int32_t local_profiles_after = -1;
+    int32_t participant_count_after = -1;
+    int32_t participant_count_preserved = -1;
+    bool participant_count_output_valid = false;
+    if (state_stable) {
+        std::memcpy(&local_profiles_after,
+                    state + kMissionRewardLocalProfileCountOffset,
+                    sizeof(local_profiles_after));
+        std::memcpy(&participant_count_after,
+                    state + kMissionResultParticipantCountOffset,
+                    sizeof(participant_count_after));
+        participant_count_output_valid =
+            !parser_failed && participant_count_after >= 0 &&
+            participant_count_after <=
+                static_cast<int32_t>(participant_capacity);
+        participant_count_preserved = participant_count_output_valid
+            ? participant_count_after : participant_count_before;
+        if (!participant_count_output_valid) {
+            std::memcpy(state + kMissionResultParticipantCountOffset,
+                        &participant_count_preserved,
+                        sizeof(participant_count_preserved));
+        }
+    }
+    // Nothing is restored any more: "restored" keeps its analyzer meaning of
+    // "reward state intact and participant count preserved".
+    const bool restored = state_stable &&
+        local_profiles_after == local_profiles_before;
+
+    EDF5_CAPTURE_EVENT(
+        restored ? capture::Level::Info : capture::Level::Warning,
+        "more_players", "mission_loadout_parser_extra_blocks_restored",
+        capture::Fields()
+            .Bool("redirected", true)
+            .UInt("full_loadout_image_mask", full_image_mask)
+            .Bool("foreign_memory_restored", false)
+            .Bool("mission_state_extra_blocks_written", false)
+            .UInt("protected_extra_blocks", extra_blocks)
+            .UInt("protected_bytes", bytes)
+            .UInt("changed_bytes_excluding_participant_count",
+                  changed_bytes)
+            .UInt("changed_extra_block_mask", changed_block_mask)
+            .UInt("captured_sidecar_mask", captured_sidecar_mask)
+            .UInt("invalid_sidecar_mask", invalid_sidecar_mask)
+            .UInt("complete_sidecar_weapon_mask",
+                  complete_sidecar_weapon_mask)
+            .UInt("partial_sidecar_weapon_mask",
+                  partial_sidecar_weapon_mask)
+            .UInt("parser_call", parser_call)
+            .Int("local_profile_count_before", local_profiles_before)
+            .Int("local_profile_count_during", local_profiles_after)
+            .Int("local_profile_count_after", local_profiles_after)
+            .Int("participant_count_before", participant_count_before)
+            .Int("participant_count_after_parser", participant_count_after)
+            .Int("participant_count_preserved", participant_count_preserved)
+            .Bool("participant_count_output_valid",
+                  participant_count_output_valid)
+            .String("participant_count_source",
+                    participant_count_output_valid
+                        ? "parser_output" : "pre_parser_fallback")
+            .Bool("local_profile_count_was_corrupted",
+                  local_profiles_after != local_profiles_before)
+            .Bool("parser_result", result)
+            .Bool("parser_failed", parser_failed)
+            .Bool("parser_return_controls_participant_count", false)
+            .Bool("state_stable", state_stable)
+            .Bool("restored", restored)
+            .Bool("sidecar_captured_before_restore",
+                  captured_sidecar_mask != 0)
+            .UInt("parser_rva", kMissionLoadoutParserRva)
+            .UInt("participant_count_write_rva",
+                  kMissionLoadoutParserParticipantCountWriteRva)
+            .UInt("redirect_hits_total",
+                  game_patches::MissionLoadoutParserRedirectHits())
+            .UInt("discarded_index_hits_total",
+                  game_patches::MissionLoadoutParserDiscardHits())
+            .Bool("loadout_contents_logged", false)
+            .Bool("pointer_logged", false));
+    return result;
+}
+
 bool __fastcall MissionLoadoutParserHook(int32_t argument, bool* failed) {
     const unsigned parser_call =
         g_mission_loadout_parser_calls.fetch_add(
@@ -7734,6 +8492,13 @@ bool __fastcall MissionLoadoutParserHook(int32_t argument, bool* failed) {
     const size_t extra_blocks = participant_capacity >
             kNativeMissionSourceCount
         ? participant_capacity - kNativeMissionSourceCount : 0;
+    uint8_t* const redirected_blocks = extra_blocks
+        ? game_patches::MissionLoadoutParserExtraBlocks() : nullptr;
+    if (redirected_blocks) {
+        return CallRedirectedMissionLoadoutParser(
+            argument, failed, parser_call, redirected_blocks, extra_blocks,
+            participant_capacity);
+    }
     const size_t bytes = extra_blocks * kMissionClassLoadoutStride;
     uint8_t* state = nullptr;
     if (bytes && g_mission_loadout_state_slot &&
@@ -7839,7 +8604,7 @@ bool __fastcall MissionLoadoutParserHook(int32_t argument, bool* failed) {
         if (CaptureMissionExtraLoadoutSidecar(
                 extra_begin +
                     extra_index * kMissionClassLoadoutStride,
-                logical_index, parser_call)) {
+                logical_index, parser_call, true)) {
             captured_sidecar_mask |= bit;
             const MissionExtraLoadoutSidecar sidecar =
                 FindMissionExtraLoadoutSidecar(logical_index);
@@ -7969,6 +8734,35 @@ bool PlayerInfoNameFingerprint(const uint8_t* player_info,
     return true;
 }
 
+// Copies the (truncated) display name for the damage summary chat lines.
+void CopyPlayerInfoDisplayName(
+    const uint8_t* player_info,
+    std::array<wchar_t, kPlayerInfoDisplayNameCopyLength>& out) {
+    out.fill(L'\0');
+    uint64_t length = 0;
+    uint64_t capacity = 0;
+    std::memcpy(&length, player_info + kPlayerInfoNameLengthOffset,
+                sizeof(length));
+    std::memcpy(&capacity, player_info + kPlayerInfoNameCapacityOffset,
+                sizeof(capacity));
+    if (!length || length > kPlayerInfoNameAuditMaximumLength ||
+        capacity < length) {
+        return;
+    }
+    const wchar_t* value = nullptr;
+    if (capacity <= kPlayerInfoNameInlineCapacity) {
+        value = reinterpret_cast<const wchar_t*>(
+            player_info + kPlayerInfoNameStorageOffset);
+    } else {
+        std::memcpy(&value, player_info + kPlayerInfoNameStorageOffset,
+                    sizeof(value));
+    }
+    const size_t copied = std::min<size_t>(static_cast<size_t>(length),
+                                           out.size() - 1);
+    if (!IsReadableMemoryRange(value, copied * sizeof(wchar_t))) return;
+    std::memcpy(out.data(), value, copied * sizeof(wchar_t));
+}
+
 void RecordPlayerInfoObservation(void* user, const uint8_t* player_info) {
     if (!IsRuntimeUserImpl(user) || !player_info) return;
     PlayerInfoObservation incoming;
@@ -7977,6 +8771,9 @@ void RecordPlayerInfoObservation(void* user, const uint8_t* player_info) {
     incoming.transport_route_index = TransportRouteIndex(user);
     incoming.name_valid = PlayerInfoNameFingerprint(
         player_info, incoming.name_fingerprint, incoming.name_length);
+    if (incoming.name_valid) {
+        CopyPlayerInfoDisplayName(player_info, incoming.display_name);
+    }
     incoming.shared_name_user_count = incoming.name_valid ? 1 : 0;
     incoming.shared_loadout_index_user_count =
         incoming.source_mission_loadout_index >= 0 ? 1 : 0;
@@ -8220,6 +9017,15 @@ bool InstallTemporaryMissionLoadoutBlock(void* requested_object,
     patch.source_index = native_loadout_index;
     patch.selected_class = requested.selected_class;
 
+    // Start from the extra player's own complete image when the redirected
+    // parser captured one in the same call as its sidecar; class, weapons and
+    // armor below are then re-applied from the selected source.
+    const MissionExtraLoadoutSidecar image_sidecar =
+        FindMissionExtraLoadoutSidecar(logical_loadout_index);
+    const bool full_image_installed = image_sidecar.valid &&
+        CopyMissionExtraLoadoutImage(logical_loadout_index,
+                                     image_sidecar.parser_call, block);
+
     // Static flow at 0x42f881..0x42f945 writes the selected class at block+0
     // and its six equipment ids at block+8+class*0x18. Character creation at
     // 0x31241a..0x3124d2 reads those exact fields. Rebuild only that active
@@ -8286,6 +9092,7 @@ bool InstallTemporaryMissionLoadoutBlock(void* requested_object,
             .UInt("fallback_weapon_mask", fallback_weapon_mask)
             .Int("armor", armor)
             .String("loadout_source", requested.source)
+            .Bool("full_loadout_image", full_image_installed)
             .Bool("armor_from_source", requested.armor_valid)
             .Bool("native_block_restored_after_factory", true)
             .Bool("loadout_contents_logged", false)
@@ -9465,6 +10272,1287 @@ uint32_t MissionPlayerControlAuditBit(int context,
     return uint32_t{1} << 31;
 }
 
+// ---------------------------------------------------------------------------
+// Damage meter.
+//
+// GameObjectBase::ApplyDamage(GameDamageInfo const&) at 0x2DB370 is the only
+// code that lowers object health (+0x1FC, clamped by +0x1F4/+0x1F8); its sole
+// caller is the 0x80000000 case (0x2DACCF) of the object message handler
+// 0x2DAC60 that every damageable class forwards to. GameDamageInfo keeps the
+// attacker as a weak_ptr {object +0x10, control block +0x18} and the amount
+// at +0x50. Projectiles queue 0xA0-byte damage entries in projectile+0x80,
+// flushed by 0x2D9720 from the projectile system (call sites 0x1437FE and
+// 0x1441E6, both "lea rcx,[projectile+0x80]"), so the projectile is known on
+// that thread while its damage is applied. The firing weapon is found inside
+// the projectile at runtime: the first pointer whose MSVC RTTI derives from
+// WeaponBase, cached per projectile class. Damage is credited only to the
+// soldier objects created for P0-P7 by 0x11CE60; health loss is measured
+// around the native call, so overkill, invulnerability and multipliers are
+// already applied. The host prints the summary to its room chat locally.
+// ---------------------------------------------------------------------------
+constexpr uintptr_t kObjectApplyDamageRva = 0x2db370;
+constexpr uint8_t kObjectApplyDamageSignature[] = {
+    0x48, 0x8b, 0xc4, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55,
+    0x41, 0x56, 0x41, 0x57, 0x48, 0x8d, 0xa8, 0x08, 0xff, 0xff,
+    0xff, 0x48, 0x81, 0xec, 0xc0, 0x01, 0x00, 0x00,
+};
+// comiss xmm6,[rsi+0x50] (GameDamageInfo amount) and
+// movss xmm0,[rdi+0x1fc] (object health) inside ApplyDamage.
+constexpr uintptr_t kObjectApplyDamageAmountReadRva = 0x2db47d;
+constexpr uint8_t kObjectApplyDamageAmountReadSignature[] = {
+    0x0f, 0x2f, 0x76, 0x50,
+};
+// Damage-list layout read by the source-side tally (0.6.79): data +0x08,
+// count +0x18 scaled by 0xA0, GameDamageInfo at entry +0x10, 0xA0 stride.
+constexpr uintptr_t kDamageListLayoutRva = 0x2d9744;
+constexpr uint8_t kDamageListLayoutSignature[] = {
+    0x48, 0x8b, 0x71, 0x08, 0x48, 0x8b, 0x41, 0x18,
+    0x48, 0x8d, 0x2c, 0x80, 0x48, 0xc1, 0xe5, 0x05,
+};
+constexpr uintptr_t kDamageListInfoRva = 0x2d97ff;
+constexpr uint8_t kDamageListInfoSignature[] = {0x48, 0x8d, 0x46, 0x10};
+constexpr uintptr_t kDamageListStrideRva = 0x2d98a2;
+constexpr uint8_t kDamageListStrideSignature[] = {
+    0x48, 0x81, 0xc6, 0xa0, 0x00, 0x00, 0x00,
+};
+constexpr uintptr_t kObjectApplyDamageHealthReadRva = 0x2db496;
+constexpr uint8_t kObjectApplyDamageHealthReadSignature[] = {
+    0xf3, 0x0f, 0x10, 0x87, 0xfc, 0x01, 0x00, 0x00,
+};
+// call 0x2DB370 in the 0x80000000 message case.
+constexpr uintptr_t kObjectMessageDamageCallRva = 0x2daccf;
+constexpr uint8_t kObjectMessageDamageCallSignature[] = {
+    0xe8, 0x9c, 0x06, 0x00, 0x00,
+};
+constexpr uintptr_t kDamageListFlushRva = 0x2d9720;
+constexpr uint8_t kDamageListFlushSignature[] = {
+    0x40, 0x53, 0x55, 0x56, 0x57, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
+    0x48, 0x83, 0xec, 0x70,
+};
+constexpr uintptr_t kProjectileDamageFlushListARva = 0x1437e2;
+constexpr uint8_t kProjectileDamageFlushListASignature[] = {
+    0x48, 0x8d, 0x8b, 0x80, 0x00, 0x00, 0x00,
+};
+constexpr uintptr_t kProjectileDamageFlushCallARva = 0x1437fe;
+constexpr uintptr_t kProjectileDamageFlushListBRva = 0x1441db;
+constexpr uint8_t kProjectileDamageFlushListBSignature[] = {
+    0x48, 0x8d, 0x8f, 0x80, 0x00, 0x00, 0x00,
+};
+constexpr uintptr_t kProjectileDamageFlushCallBRva = 0x1441e6;
+constexpr size_t kRel32CallSize = 5;
+constexpr size_t kProjectileDamageListOffset = 0x80;
+// Projectile code itself reads up to +0x3F0 at both flush sites.
+constexpr size_t kProjectileWeaponScanBegin = 0x08;
+constexpr size_t kProjectileWeaponScanEnd = 0x3f0;
+constexpr unsigned kProjectileWeaponScanAttempts = 8;
+constexpr size_t kGameObjectHealthOffset = 0x1fc;
+constexpr size_t kGameDamageInfoAttackerOffset = 0x10;
+constexpr size_t kGameDamageInfoAttackerControlOffset = 0x18;
+// Raw damage (negative heals), read by ApplyDamage at 0x2DB47D/0x2DB4CD.
+constexpr size_t kGameDamageInfoAmountOffset = 0x50;
+constexpr uintptr_t kWeaponBaseTypeDescriptorRva = 0x11b1ab0;
+constexpr uintptr_t kSoldierBaseTypeDescriptorRva = 0x11a4970;
+constexpr char kWeaponBaseTypeName[] = ".?AVWeaponBase@@";
+constexpr char kSoldierBaseTypeName[] = ".?AVSoldierBase@@";
+constexpr size_t kRttiTypeDescriptorNameOffset = 0x10;
+constexpr size_t kDamageMeterWeaponSlots = 8;
+constexpr size_t kDamageMeterLabelLength = 20;
+constexpr size_t kDamageMeterVtableCacheSize = 256;
+constexpr size_t kProjectileWeaponLinkCacheSize = 128;
+// Chat_Room vtable slot 1 (0x3F16C0) sends a player message over the room
+// transport and publishes it locally through 0x3F0B70.
+constexpr uintptr_t kChatRoomSendRva = 0x3f16c0;
+constexpr uint8_t kChatRoomSendSignature[] = {
+    0x40, 0x55, 0x53, 0x56, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
+    0x48, 0x8d, 0x6c, 0x24, 0xd0, 0x48, 0x81, 0xec, 0x30, 0x01, 0x00, 0x00,
+};
+
+using ObjectApplyDamageFn = void (__fastcall*)(uint8_t*, const uint8_t*);
+using DamageListFlushFn = uint8_t* (__fastcall*)(void*, uint8_t*, void*,
+                                                 uint64_t);
+using ChatRoomSendFn = bool (__fastcall*)(void*, const void*, const void*,
+                                          const wchar_t*);
+ObjectApplyDamageFn g_object_apply_damage = nullptr;
+DamageListFlushFn g_damage_list_flush = nullptr;
+ChatRoomSendFn g_chat_room_send = nullptr;
+std::atomic<bool> g_damage_meter_installed{false};
+thread_local const uint8_t* g_damage_meter_projectile = nullptr;
+
+struct RttiCompleteObjectLocator {
+    uint32_t signature;
+    uint32_t offset;
+    uint32_t constructor_displacement_offset;
+    int32_t type_descriptor;
+    int32_t class_descriptor;
+    int32_t self;
+};
+
+struct RttiClassHierarchyDescriptor {
+    uint32_t signature;
+    uint32_t attributes;
+    uint32_t base_count;
+    int32_t base_array;
+};
+
+enum class DamageMeterClassKind : uint8_t {
+    unknown = 0,
+    weapon = 1,
+    soldier = 2,
+    other = 3,
+};
+
+struct DamageMeterVtableClass {
+    uintptr_t vtable = 0;
+    DamageMeterClassKind kind = DamageMeterClassKind::unknown;
+    std::array<char, kDamageMeterLabelLength> label{};
+};
+
+struct ProjectileWeaponLink {
+    uintptr_t vtable = 0;
+    int32_t offset = -1;
+    unsigned attempts = 0;
+    std::array<char, kDamageMeterLabelLength> label{};
+};
+
+struct DamageMeterWeapon {
+    uintptr_t weapon = 0;
+    std::array<char, kDamageMeterLabelLength> label{};
+    double damage = 0.0;
+    uint32_t hits = 0;
+};
+
+struct DamageMeterParticipant {
+    // The factory output is a two-pointer handle; the soldier is whichever
+    // field RTTI identifies as a SoldierBase (live 0.6.74: only the attacker
+    // class matched, never the registered field), the other one is kept as a
+    // fallback key.
+    uintptr_t soldier = 0;
+    uintptr_t soldier_alt = 0;
+    // UserImpl identity (vtable slot 10), used for the Steam persona name.
+    uint64_t steam_id = 0;
+    double damage = 0.0;
+    uint32_t hits = 0;
+    uint32_t projectile_hits = 0;  // flushed by this machine's projectiles
+    // Source side: GameDamageInfo amounts this machine queued for the player
+    // (any damage-list flush), before the owner of the target applies them.
+    // Raw amounts (no target multiplier, overkill included).
+    double outgoing = 0.0;
+    uint32_t outgoing_hits = 0;
+    // Received side: raw GameDamageInfo amount (+0x50) of the applied hits
+    // and hits that reached ApplyDamage without lowering the health.
+    double received_amount = 0.0;
+    uint32_t zero_loss_hits = 0;
+    double unattributed = 0.0;
+    std::array<DamageMeterWeapon, kDamageMeterWeaponSlots> weapons{};
+    size_t weapon_count = 0;
+    std::array<wchar_t, kPlayerInfoDisplayNameCopyLength> name{};
+};
+
+struct DamageMeterOtherAttacker {
+    std::array<char, kDamageMeterLabelLength> label{};
+    double damage = 0.0;
+    uint32_t hits = 0;
+    // Distinct attacker objects of this class (capped): several soldiers of
+    // one class are an NPC squad, one would be an unmatched player.
+    std::array<uintptr_t, 16> objects{};
+    uint32_t distinct = 0;
+};
+
+constexpr size_t kDamageMeterOtherAttackerSlots = 12;
+
+struct DamageMeterState {
+    std::array<DamageMeterParticipant, kMaximumMissionParticipants>
+        players{};
+    // Diagnostics: damage by attacker class when no player soldier matched.
+    std::array<DamageMeterOtherAttacker, kDamageMeterOtherAttackerSlots>
+        other_attackers{};
+    uint64_t start_tick = 0;
+    uint64_t end_tick = 0;
+    bool active = false;
+    bool ended = false;
+    bool transition_pending = false;
+    int32_t result = 0;
+    double other_damage = 0.0;
+    uint64_t projectile_hits = 0;
+    uint64_t projectile_weapon_hits = 0;
+    uint64_t friendly_hits = 0;
+    uint64_t other_zero_loss_hits = 0;
+};
+
+SRWLOCK g_damage_meter_lock = SRWLOCK_INIT;
+DamageMeterState g_damage_meter{};
+std::array<DamageMeterVtableClass, kDamageMeterVtableCacheSize>
+    g_damage_meter_vtables{};
+std::array<ProjectileWeaponLink, kProjectileWeaponLinkCacheSize>
+    g_projectile_weapon_links{};
+std::atomic<bool> g_damage_meter_publish_pending{false};
+std::atomic<unsigned> g_damage_meter_publish_count{0};
+std::atomic<unsigned> g_chat_room_send_logs{0};
+// Offline self-test: classify objects without image RTTI.
+using DamageMeterClassifierFn = DamageMeterClassKind (*)(uintptr_t object);
+DamageMeterClassifierFn g_damage_meter_test_classifier = nullptr;
+
+bool DamageMeterEnabled() {
+    return Enabled() && capture::GetConfig().damage_meter_enabled;
+}
+
+bool ImageRange(uintptr_t address, size_t bytes) {
+    return g_module_base && g_module_image_size >= bytes &&
+           address >= g_module_base &&
+           address - g_module_base <= g_module_image_size - bytes;
+}
+
+const RttiCompleteObjectLocator* VtableLocator(uintptr_t vtable) {
+    if (!ImageRange(vtable - sizeof(void*), 2 * sizeof(void*))) {
+        return nullptr;
+    }
+    uintptr_t locator = 0;
+    std::memcpy(&locator, reinterpret_cast<const void*>(vtable - sizeof(void*)),
+                sizeof(locator));
+    if (!ImageRange(locator, sizeof(RttiCompleteObjectLocator))) {
+        return nullptr;
+    }
+    const auto* col =
+        reinterpret_cast<const RttiCompleteObjectLocator*>(locator);
+    if (col->signature != 1 || col->self < 0 ||
+        static_cast<uintptr_t>(col->self) != locator - g_module_base) {
+        return nullptr;
+    }
+    return col;
+}
+
+const char* RttiTypeName(const RttiCompleteObjectLocator* col) {
+    if (!col || col->type_descriptor <= 0) return nullptr;
+    const uintptr_t name = g_module_base +
+        static_cast<uint32_t>(col->type_descriptor) +
+        kRttiTypeDescriptorNameOffset;
+    return ImageRange(name, 8) ? reinterpret_cast<const char*>(name)
+                               : nullptr;
+}
+
+bool RttiDerivesFrom(const RttiCompleteObjectLocator* col,
+                     uintptr_t type_descriptor_rva) {
+    if (!col || col->class_descriptor <= 0) return false;
+    const uintptr_t chd_address =
+        g_module_base + static_cast<uint32_t>(col->class_descriptor);
+    if (!ImageRange(chd_address, sizeof(RttiClassHierarchyDescriptor))) {
+        return false;
+    }
+    const auto* chd =
+        reinterpret_cast<const RttiClassHierarchyDescriptor*>(chd_address);
+    const uint32_t count = std::min<uint32_t>(chd->base_count, 64);
+    if (chd->base_array <= 0) return false;
+    const uintptr_t array =
+        g_module_base + static_cast<uint32_t>(chd->base_array);
+    if (!ImageRange(array, count * sizeof(int32_t))) return false;
+    for (uint32_t index = 0; index < count; ++index) {
+        int32_t bcd_rva = 0;
+        std::memcpy(&bcd_rva,
+                    reinterpret_cast<const void*>(array + index * 4),
+                    sizeof(bcd_rva));
+        if (bcd_rva <= 0 ||
+            !ImageRange(g_module_base + static_cast<uint32_t>(bcd_rva),
+                        sizeof(int32_t))) {
+            continue;
+        }
+        int32_t base_type = 0;
+        std::memcpy(&base_type,
+                    reinterpret_cast<const void*>(
+                        g_module_base + static_cast<uint32_t>(bcd_rva)),
+                    sizeof(base_type));
+        if (base_type > 0 &&
+            static_cast<uintptr_t>(base_type) == type_descriptor_rva) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// ".?AVWeapon_Gatling@@" -> "Gatling"; bounded copy, ASCII only.
+[[maybe_unused]] void DamageMeterLabelFromTypeName(
+    const char* name, std::array<char, kDamageMeterLabelLength>& out) {
+    out.fill('\0');
+    if (!name) return;
+    const char* begin = name;
+    if (std::strncmp(begin, ".?AV", 4) == 0 ||
+        std::strncmp(begin, ".?AU", 4) == 0) {
+        begin += 4;
+    }
+    for (const char* prefix : {"HumanoidWeapon_", "Weapon_"}) {
+        const size_t length = std::strlen(prefix);
+        if (std::strncmp(begin, prefix, length) == 0) {
+            begin += length;
+            break;
+        }
+    }
+    size_t used = 0;
+    for (const char* cursor = begin;
+         *cursor && *cursor != '@' && used + 1 < out.size(); ++cursor) {
+        const char c = *cursor;
+        if (c < 0x20 || c > 0x7e) break;
+        out[used++] = c;
+    }
+}
+
+// Classifies an object pointer by its vtable (cached). Only pointers whose
+// vtable lives in the EDF5 image and whose COL is a primary (offset 0) one
+// are accepted, so the pointer is the complete object.
+DamageMeterClassKind ClassifyDamageMeterObject(
+    uintptr_t object, std::array<char, kDamageMeterLabelLength>* label) {
+    if (g_damage_meter_test_classifier) {
+        return g_damage_meter_test_classifier(object);
+    }
+    if (!object || (object & 7) || object < 0x10000 ||
+        ImageRange(object, 1) ||
+        !IsReadableMemoryRange(reinterpret_cast<const void*>(object),
+                               sizeof(void*))) {
+        return DamageMeterClassKind::unknown;
+    }
+    uintptr_t vtable = 0;
+    std::memcpy(&vtable, reinterpret_cast<const void*>(object),
+                sizeof(vtable));
+    const size_t slot = (vtable >> 3) % g_damage_meter_vtables.size();
+    AcquireSRWLockShared(&g_damage_meter_lock);
+    for (size_t probe = 0; probe < 8; ++probe) {
+        const auto& entry = g_damage_meter_vtables[
+            (slot + probe) % g_damage_meter_vtables.size()];
+        if (entry.vtable == vtable) {
+            const DamageMeterClassKind kind = entry.kind;
+            if (label) *label = entry.label;
+            ReleaseSRWLockShared(&g_damage_meter_lock);
+            return kind;
+        }
+        if (!entry.vtable) break;
+    }
+    ReleaseSRWLockShared(&g_damage_meter_lock);
+    const RttiCompleteObjectLocator* col = VtableLocator(vtable);
+    DamageMeterVtableClass incoming;
+    incoming.vtable = vtable;
+    if (!col || col->offset != 0) {
+        incoming.kind = DamageMeterClassKind::unknown;
+    } else if (RttiDerivesFrom(col, kWeaponBaseTypeDescriptorRva)) {
+        incoming.kind = DamageMeterClassKind::weapon;
+    } else if (RttiDerivesFrom(col, kSoldierBaseTypeDescriptorRva)) {
+        incoming.kind = DamageMeterClassKind::soldier;
+    } else {
+        incoming.kind = DamageMeterClassKind::other;
+    }
+    if (col) DamageMeterLabelFromTypeName(RttiTypeName(col), incoming.label);
+    if (label) *label = incoming.label;
+    if (!col) return incoming.kind;  // never cache non-image vtables
+    AcquireSRWLockExclusive(&g_damage_meter_lock);
+    for (size_t probe = 0; probe < 8; ++probe) {
+        auto& entry = g_damage_meter_vtables[
+            (slot + probe) % g_damage_meter_vtables.size()];
+        if (entry.vtable == vtable) break;
+        if (!entry.vtable) {
+            entry = incoming;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_damage_meter_lock);
+    return incoming.kind;
+}
+
+// Finds (once per projectile class) the projectile field that points at the
+// firing weapon and returns that weapon, or 0.
+std::atomic<unsigned> g_projectile_shape_logs{0};
+
+uintptr_t ProjectileWeapon(const uint8_t* projectile,
+                           std::array<char, kDamageMeterLabelLength>*
+                               projectile_label) {
+    if (!projectile) return 0;
+    uintptr_t vtable = 0;
+    std::memcpy(&vtable, projectile, sizeof(vtable));
+    if (!g_damage_meter_test_classifier &&
+        g_projectile_shape_logs.fetch_add(1, std::memory_order_acq_rel) < 6) {
+        // Is "flush list - 0x80" really a polymorphic projectile object?
+        const RttiCompleteObjectLocator* col = VtableLocator(vtable);
+        std::array<char, kDamageMeterLabelLength> label{};
+        if (col) DamageMeterLabelFromTypeName(RttiTypeName(col), label);
+        EDF5_CAPTURE_EVENT(
+            "more_players", "damage_meter_projectile_shape",
+            capture::Fields()
+                .Bool("vtable_in_image", ImageRange(vtable, 1))
+                .Bool("rtti_valid", col != nullptr)
+                .UInt("col_offset", col ? col->offset : 0)
+                .String("projectile_class", label.data())
+                .Bool("pointer_logged", false));
+    }
+    const size_t slot = (vtable >> 3) % g_projectile_weapon_links.size();
+    ProjectileWeaponLink link;
+    size_t link_index = g_projectile_weapon_links.size();
+    AcquireSRWLockShared(&g_damage_meter_lock);
+    for (size_t probe = 0; probe < 8; ++probe) {
+        const size_t index = (slot + probe) % g_projectile_weapon_links.size();
+        const auto& entry = g_projectile_weapon_links[index];
+        if (entry.vtable == vtable || !entry.vtable) {
+            if (entry.vtable == vtable) link = entry;
+            link_index = index;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_damage_meter_lock);
+    if (link_index == g_projectile_weapon_links.size()) return 0;
+    if (projectile_label) *projectile_label = link.label;
+    if (link.vtable && link.offset >= 0) {
+        uintptr_t weapon = 0;
+        std::memcpy(&weapon, projectile + link.offset, sizeof(weapon));
+        return ClassifyDamageMeterObject(weapon, nullptr) ==
+                DamageMeterClassKind::weapon
+            ? weapon : 0;
+    }
+    if (link.vtable && link.attempts >= kProjectileWeaponScanAttempts) {
+        return 0;
+    }
+    int32_t found = -1;
+    uintptr_t weapon = 0;
+    for (size_t offset = kProjectileWeaponScanBegin;
+         offset + sizeof(uintptr_t) <= kProjectileWeaponScanEnd;
+         offset += sizeof(uintptr_t)) {
+        uintptr_t candidate = 0;
+        std::memcpy(&candidate, projectile + offset, sizeof(candidate));
+        if (ClassifyDamageMeterObject(candidate, nullptr) ==
+            DamageMeterClassKind::weapon) {
+            found = static_cast<int32_t>(offset);
+            weapon = candidate;
+            break;
+        }
+    }
+    std::array<char, kDamageMeterLabelLength> label{};
+    if (!g_damage_meter_test_classifier) {
+        DamageMeterLabelFromTypeName(RttiTypeName(VtableLocator(vtable)),
+                                     label);
+    }
+    unsigned attempts = 0;
+    AcquireSRWLockExclusive(&g_damage_meter_lock);
+    auto& entry = g_projectile_weapon_links[link_index];
+    if (!entry.vtable || entry.vtable == vtable) {
+        entry.vtable = vtable;
+        entry.label = label;
+        if (found >= 0) entry.offset = found;
+        attempts = ++entry.attempts;
+    }
+    ReleaseSRWLockExclusive(&g_damage_meter_lock);
+    if (projectile_label) *projectile_label = label;
+    if (found >= 0 || attempts == kProjectileWeaponScanAttempts) {
+        EDF5_CAPTURE_EVENT(
+            "more_players", "damage_meter_projectile_weapon_link",
+            capture::Fields()
+                .String("projectile_class", label.data())
+                .Int("weapon_offset", found)
+                .UInt("attempts", attempts)
+                .Bool("weapon_found", found >= 0)
+                .Bool("pointer_logged", false));
+    }
+    return weapon;
+}
+
+void ResetDamageMeterLocked(uint64_t now) {
+    std::array<uintptr_t, kMaximumMissionParticipants> soldiers{};
+    for (size_t index = 0; index < soldiers.size(); ++index) {
+        soldiers[index] = g_damage_meter.players[index].soldier;
+    }
+    g_damage_meter = {};
+    for (size_t index = 0; index < soldiers.size(); ++index) {
+        g_damage_meter.players[index].soldier = soldiers[index];
+    }
+    g_damage_meter.start_tick = now;
+    g_damage_meter.active = true;
+}
+
+// Complete object of a polymorphic pointer (vtable at +0 may belong to a
+// base sub-object; its COL offset leads back to the object start).
+uintptr_t DamageMeterCompleteObject(uintptr_t object) {
+    if (!object || (object & 7) || object < 0x10000 ||
+        ImageRange(object, 1) ||
+        !IsReadableMemoryRange(reinterpret_cast<const void*>(object),
+                               sizeof(void*))) {
+        return 0;
+    }
+    uintptr_t vtable = 0;
+    std::memcpy(&vtable, reinterpret_cast<const void*>(object),
+                sizeof(vtable));
+    const RttiCompleteObjectLocator* col = VtableLocator(vtable);
+    if (!col || col->offset > object) return 0;
+    return object - col->offset;
+}
+
+// Steam persona of a participant, converted for the chat line (display
+// only; never logged).
+bool DamageMeterPersonaName(
+    uint64_t steam_id,
+    std::array<wchar_t, kPlayerInfoDisplayNameCopyLength>& out) {
+    std::string utf8;
+    if (!steam_id || !steam_capture::CopyFriendPersonaName(steam_id, utf8)) {
+        return false;
+    }
+    std::array<wchar_t, 128> wide{};
+    const int written = MultiByteToWideChar(
+        CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), wide.data(),
+        static_cast<int>(wide.size() - 1));
+    if (written <= 0) return false;
+    out.fill(L'\0');
+    const size_t copied = std::min<size_t>(static_cast<size_t>(written),
+                                           out.size() - 1);
+    std::copy_n(wide.data(), copied, out.data());
+    return true;
+}
+
+uint64_t DamageMeterUserSteamId(void* user) {
+    if (!IsRuntimeUserImpl(user)) return 0;
+    auto** vtable = *reinterpret_cast<void***>(user);
+    if (!vtable || !vtable[10]) return 0;
+    return reinterpret_cast<UserIdGetterFn>(vtable[10])(user);
+}
+
+// Called from the mission player factory for every participant. A first
+// registration after the previous mission ended starts a new measurement;
+// re-creation inside a two-part mission keeps the running totals.
+void DamageMeterRegisterSoldier(int32_t participant_index, void* first,
+                                void* second, void* user) {
+    if (!DamageMeterEnabled() || participant_index < 0 ||
+        participant_index >= static_cast<int32_t>(
+                                 kMaximumMissionParticipants)) {
+        return;
+    }
+    const PlayerInfoObservation info = FindPlayerInfoObservation(user);
+    const uint64_t steam_id = DamageMeterUserSteamId(user);
+    std::array<wchar_t, kPlayerInfoDisplayNameCopyLength> persona{};
+    const bool persona_known = DamageMeterPersonaName(steam_id, persona);
+    const uintptr_t first_address = reinterpret_cast<uintptr_t>(first);
+    const uintptr_t second_address = reinterpret_cast<uintptr_t>(second);
+    std::array<char, kDamageMeterLabelLength> first_label{};
+    std::array<char, kDamageMeterLabelLength> second_label{};
+    const bool first_soldier =
+        ClassifyDamageMeterObject(first_address, &first_label) ==
+        DamageMeterClassKind::soldier;
+    const bool second_soldier = !first_soldier &&
+        ClassifyDamageMeterObject(second_address, &second_label) ==
+            DamageMeterClassKind::soldier;
+    uintptr_t soldier = first_address;
+    uintptr_t soldier_alt = second_address;
+    const char* chosen = "both";
+    if (first_soldier) {
+        soldier_alt = 0;
+        chosen = "first";
+    } else if (second_soldier) {
+        soldier = second_address;
+        soldier_alt = 0;
+        chosen = "second";
+    }
+    AcquireSRWLockExclusive(&g_damage_meter_lock);
+    const bool recreated_without_transition =
+        g_damage_meter.players[static_cast<size_t>(participant_index)]
+            .soldier &&
+        !g_damage_meter.transition_pending;
+    if (!g_damage_meter.active || g_damage_meter.ended ||
+        recreated_without_transition) {
+        for (auto& player : g_damage_meter.players) player.soldier = 0;
+        ResetDamageMeterLocked(GetTickCount64());
+    }
+    auto& player =
+        g_damage_meter.players[static_cast<size_t>(participant_index)];
+    player.soldier = soldier;
+    player.soldier_alt = soldier_alt;
+    if (steam_id) player.steam_id = steam_id;
+    if (persona_known) {
+        player.name = persona;
+    } else if (info.display_name[0]) {
+        player.name = info.display_name;
+    }
+    ReleaseSRWLockExclusive(&g_damage_meter_lock);
+    EDF5_CAPTURE_EVENT(
+        "more_players", "damage_meter_soldier_registered",
+        capture::Fields()
+            .Int("participant_index", participant_index)
+            .String("soldier_field", chosen)
+            .String("soldier_class", first_soldier ? first_label.data()
+                                     : second_soldier ? second_label.data()
+                                                      : "")
+            .String("first_class", first_label.data())
+            .Bool("steam_id_known", steam_id != 0)
+            .Bool("name_known", persona_known || info.display_name[0] != 0)
+            .Bool("pointer_logged", false)
+            .Bool("name_logged", false));
+}
+
+void DamageMeterRecord(uintptr_t target, uintptr_t attacker,
+                       float health_loss, const uint8_t* projectile,
+                       float info_amount = 0.0f) {
+    const bool has_loss = health_loss > 0.0f && std::isfinite(health_loss);
+    const bool has_amount = info_amount > 0.0f && std::isfinite(info_amount);
+    if (!has_loss && !has_amount) return;
+    const double amount = has_loss ? static_cast<double>(health_loss) : 0.0;
+    int participant = -1;
+    bool target_is_player = false;
+    auto match = [&](uintptr_t attacker_key) {
+        AcquireSRWLockShared(&g_damage_meter_lock);
+        const bool active = g_damage_meter.active && !g_damage_meter.ended;
+        for (size_t index = 0; index < g_damage_meter.players.size();
+             ++index) {
+            const auto& player = g_damage_meter.players[index];
+            const auto is = [&](uintptr_t value) {
+                return value && (value == player.soldier ||
+                                 value == player.soldier_alt);
+            };
+            if (is(attacker_key)) participant = static_cast<int>(index);
+            if (is(target)) target_is_player = true;
+        }
+        ReleaseSRWLockShared(&g_damage_meter_lock);
+        return active;
+    };
+    const bool counting = match(attacker);
+    if (!counting) return;
+    if (participant < 0 && attacker && !g_damage_meter_test_classifier) {
+        const uintptr_t complete = DamageMeterCompleteObject(attacker);
+        if (complete && complete != attacker) match(complete);
+    }
+    if (target_is_player) {
+        if (has_loss) {
+            AcquireSRWLockExclusive(&g_damage_meter_lock);
+            ++g_damage_meter.friendly_hits;
+            ReleaseSRWLockExclusive(&g_damage_meter_lock);
+        }
+        return;
+    }
+    if (!has_loss) {
+        AcquireSRWLockExclusive(&g_damage_meter_lock);
+        if (participant >= 0) {
+            auto& player =
+                g_damage_meter.players[static_cast<size_t>(participant)];
+            player.received_amount += static_cast<double>(info_amount);
+            ++player.zero_loss_hits;
+        } else {
+            ++g_damage_meter.other_zero_loss_hits;
+        }
+        ReleaseSRWLockExclusive(&g_damage_meter_lock);
+        return;
+    }
+    std::array<char, kDamageMeterLabelLength> attacker_label{};
+    if constexpr (build_config::kDiagnostics) {
+        if (participant < 0 && attacker &&
+            ClassifyDamageMeterObject(attacker, &attacker_label) ==
+                DamageMeterClassKind::unknown &&
+            !attacker_label[0]) {
+            std::strncpy(attacker_label.data(), "unknown",
+                         attacker_label.size() - 1);
+        }
+    }
+    uintptr_t weapon = 0;
+    std::array<char, kDamageMeterLabelLength> weapon_label{};
+    if (participant >= 0 && projectile) {
+        weapon = ProjectileWeapon(projectile, nullptr);
+        if (weapon) ClassifyDamageMeterObject(weapon, &weapon_label);
+    }
+    AcquireSRWLockExclusive(&g_damage_meter_lock);
+    if (participant < 0) {
+        g_damage_meter.other_damage += amount;
+        if (attacker_label[0]) {
+            for (auto& entry : g_damage_meter.other_attackers) {
+                if (!entry.label[0] || entry.label == attacker_label) {
+                    entry.label = attacker_label;
+                    entry.damage += amount;
+                    ++entry.hits;
+                    bool known = false;
+                    for (const uintptr_t object : entry.objects) {
+                        if (object == attacker) known = true;
+                    }
+                    if (!known && entry.distinct < entry.objects.size()) {
+                        entry.objects[entry.distinct++] = attacker;
+                    }
+                    break;
+                }
+            }
+        }
+        ReleaseSRWLockExclusive(&g_damage_meter_lock);
+        return;
+    }
+    g_damage_meter.transition_pending = false;
+    auto& player = g_damage_meter.players[static_cast<size_t>(participant)];
+    player.damage += amount;
+    if (has_amount) player.received_amount += static_cast<double>(info_amount);
+    ++player.hits;
+    if (projectile) {
+        ++g_damage_meter.projectile_hits;
+        ++player.projectile_hits;
+    }
+    DamageMeterWeapon* slot = nullptr;
+    if (weapon) {
+        ++g_damage_meter.projectile_weapon_hits;
+        for (size_t index = 0; index < player.weapon_count; ++index) {
+            if (player.weapons[index].weapon == weapon) {
+                slot = &player.weapons[index];
+                break;
+            }
+        }
+        if (!slot && player.weapon_count < player.weapons.size()) {
+            slot = &player.weapons[player.weapon_count++];
+            slot->weapon = weapon;
+            slot->label = weapon_label;
+        }
+    }
+    if (slot) {
+        slot->damage += amount;
+        ++slot->hits;
+    } else {
+        player.unattributed += amount;
+    }
+    ReleaseSRWLockExclusive(&g_damage_meter_lock);
+}
+
+void __fastcall ObjectApplyDamageHook(uint8_t* object, const uint8_t* info) {
+    if (!g_damage_meter_installed.load(std::memory_order_acquire) ||
+        !object || !info) {
+        g_object_apply_damage(object, info);
+        return;
+    }
+    float before = 0.0f;
+    std::memcpy(&before, object + kGameObjectHealthOffset, sizeof(before));
+    g_object_apply_damage(object, info);
+    float after = 0.0f;
+    std::memcpy(&after, object + kGameObjectHealthOffset, sizeof(after));
+    uintptr_t attacker = 0;
+    uintptr_t control = 0;
+    std::memcpy(&attacker, info + kGameDamageInfoAttackerOffset,
+                sizeof(attacker));
+    std::memcpy(&control, info + kGameDamageInfoAttackerControlOffset,
+                sizeof(control));
+    float info_amount = 0.0f;
+    std::memcpy(&info_amount, info + kGameDamageInfoAmountOffset,
+                sizeof(info_amount));
+    // Only the attacker address is compared; it is never dereferenced here.
+    DamageMeterRecord(reinterpret_cast<uintptr_t>(object),
+                      control ? attacker : 0, before - after,
+                      g_damage_meter_projectile, info_amount);
+}
+
+// Damage list (0x2D9720): data at +0x08, count at +0x18, 0xA0-byte entries
+// {weak_ptr target +0x00, GameDamageInfo +0x10}; attacker object at entry
+// +0x20 and amount at entry +0x60. Live 0.6.77 showed the host applies only
+// the damage on objects it owns (remote players: 7..110 hits in 13 min), so
+// every machine also sums what its flushes send, attributed by attacker.
+constexpr size_t kDamageListDataOffset = 0x08;
+constexpr size_t kDamageListCountOffset = 0x18;
+constexpr size_t kDamageEntrySize = 0xa0;
+constexpr size_t kDamageEntryTargetOffset = 0x00;
+constexpr size_t kDamageEntryAttackerOffset =
+    0x10 + kGameDamageInfoAttackerOffset;
+constexpr size_t kDamageEntryAmountOffset =
+    0x10 + kGameDamageInfoAmountOffset;
+constexpr uint64_t kDamageListEntryLimit = 512;
+
+void DamageMeterRecordOutgoing(const void* list) {
+    if (!list) return;
+    const auto* bytes = static_cast<const uint8_t*>(list);
+    const uint8_t* data = nullptr;
+    uint64_t count = 0;
+    std::memcpy(&data, bytes + kDamageListDataOffset, sizeof(data));
+    std::memcpy(&count, bytes + kDamageListCountOffset, sizeof(count));
+    if (!data || !count || count > kDamageListEntryLimit ||
+        !IsReadableMemoryRange(data,
+                               static_cast<size_t>(count) * kDamageEntrySize)) {
+        return;
+    }
+    AcquireSRWLockExclusive(&g_damage_meter_lock);
+    if (g_damage_meter.active && !g_damage_meter.ended) {
+        for (uint64_t index = 0; index < count; ++index) {
+            const uint8_t* entry =
+                data + static_cast<size_t>(index) * kDamageEntrySize;
+            uintptr_t target = 0;
+            uintptr_t attacker = 0;
+            float amount = 0.0f;
+            std::memcpy(&target, entry + kDamageEntryTargetOffset,
+                        sizeof(target));
+            std::memcpy(&attacker, entry + kDamageEntryAttackerOffset,
+                        sizeof(attacker));
+            std::memcpy(&amount, entry + kDamageEntryAmountOffset,
+                        sizeof(amount));
+            if (!attacker || !(amount > 0.0f) || !std::isfinite(amount)) {
+                continue;
+            }
+            int participant = -1;
+            bool target_is_player = false;
+            for (size_t slot = 0; slot < g_damage_meter.players.size();
+                 ++slot) {
+                const auto& player = g_damage_meter.players[slot];
+                const auto is = [&](uintptr_t value) {
+                    return value && (value == player.soldier ||
+                                     value == player.soldier_alt);
+                };
+                if (is(attacker)) participant = static_cast<int>(slot);
+                if (is(target)) target_is_player = true;
+            }
+            if (participant < 0 || target_is_player) continue;
+            auto& player =
+                g_damage_meter.players[static_cast<size_t>(participant)];
+            player.outgoing += static_cast<double>(amount);
+            ++player.outgoing_hits;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_damage_meter_lock);
+}
+
+uint8_t* __fastcall DamageListFlushHook(void* list, uint8_t* out,
+                                        void* hit_set, uint64_t argument4) {
+#if defined(__clang__) || defined(__GNUC__)
+    const uintptr_t return_address =
+        reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+#else
+    const uintptr_t return_address = 0;
+#endif
+    const uintptr_t caller = return_address >= g_module_base
+        ? return_address - g_module_base : 0;
+    const uint8_t* previous = g_damage_meter_projectile;
+    if (list &&
+        (caller == kProjectileDamageFlushCallARva + kRel32CallSize ||
+         caller == kProjectileDamageFlushCallBRva + kRel32CallSize)) {
+        g_damage_meter_projectile =
+            static_cast<const uint8_t*>(list) - kProjectileDamageListOffset;
+    }
+    if (g_damage_meter_installed.load(std::memory_order_acquire)) {
+        DamageMeterRecordOutgoing(list);
+    }
+    uint8_t* result = g_damage_list_flush(list, out, hit_set, argument4);
+    g_damage_meter_projectile = previous;
+    return result;
+}
+
+void DamageMeterOnResult(int32_t result) {
+    if (!DamageMeterEnabled()) return;
+    AcquireSRWLockExclusive(&g_damage_meter_lock);
+    // Result 3 is the script transition of a two-part mission: the players
+    // are re-created and the measurement continues.
+    if (result == 3) {
+        g_damage_meter.transition_pending = true;
+        ReleaseSRWLockExclusive(&g_damage_meter_lock);
+        return;
+    }
+    const bool fresh = g_damage_meter.active && !g_damage_meter.ended;
+    if (fresh) {
+        g_damage_meter.ended = true;
+        g_damage_meter.end_tick = GetTickCount64();
+        g_damage_meter.result = result;
+    }
+    ReleaseSRWLockExclusive(&g_damage_meter_lock);
+    if (fresh) {
+        g_damage_meter_publish_pending.store(true, std::memory_order_release);
+    }
+}
+
+std::wstring WideAscii(const char* text) {
+    std::wstring out;
+    for (; text && *text; ++text) {
+        out += static_cast<wchar_t>(static_cast<unsigned char>(*text));
+    }
+    return out;
+}
+
+std::wstring WideRounded(double value) {
+    return std::to_wstring(static_cast<int64_t>(std::llround(value)));
+}
+
+std::wstring FormatDamageAmount(double value) {
+    if (value >= 1000000.0) {
+        const int64_t tenths = std::llround(value / 100000.0);
+        return std::to_wstring(tenths / 10) + L"." +
+            std::to_wstring(tenths % 10) + L"M";
+    }
+    if (value >= 10000.0) return WideRounded(value / 1000.0) + L"k";
+    return WideRounded(value);
+}
+
+std::wstring DamageMeterPlayerName(const DamageMeterParticipant& player,
+                                   size_t index) {
+    std::wstring name;
+    for (const wchar_t c : player.name) {
+        if (!c) break;
+        name += (c < 0x20 || c == 0x7f) ? L'?' : c;
+    }
+    if (name.empty()) name = L"P" + std::to_wstring(index + 1);
+    return name;
+}
+
+// Builds the chat lines (each short enough for one chat entry).
+std::vector<std::wstring> BuildDamageMeterSummary(const DamageMeterState& s,
+                                                  uint64_t now) {
+    std::vector<std::wstring> lines;
+    const uint64_t end = s.end_tick ? s.end_tick : now;
+    const double seconds = s.start_tick && end > s.start_tick
+        ? static_cast<double>(end - s.start_tick) / 1000.0 : 0.0;
+    const double divisor = seconds >= 1.0 ? seconds : 1.0;
+    std::array<size_t, kMaximumMissionParticipants> order{};
+    for (size_t index = 0; index < order.size(); ++index) order[index] = index;
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return s.players[a].damage > s.players[b].damage;
+    });
+    double team_damage = 0.0;
+    for (const auto& player : s.players) {
+        if (player.damage > 0.0) team_damage += player.damage;
+    }
+    lines.push_back(L"[DPS] Mission: " + WideRounded(seconds) +
+                    L"s - damage dealt per player");
+    for (const size_t index : order) {
+        const auto& player = s.players[index];
+        if (!(player.damage > 0.0)) continue;
+        lines.push_back(DamageMeterPlayerName(player, index) + L": " +
+                        WideRounded(player.damage / divisor) + L"/s (" +
+                        FormatDamageAmount(player.damage) + L", " +
+                        WideRounded(team_damage > 0.0
+                                        ? player.damage * 100.0 / team_damage
+                                        : 0.0) +
+                        L"%)");
+        std::array<size_t, kDamageMeterWeaponSlots> weapons{};
+        for (size_t w = 0; w < weapons.size(); ++w) weapons[w] = w;
+        std::stable_sort(weapons.begin(),
+                         weapons.begin() + static_cast<std::ptrdiff_t>(
+                                               player.weapon_count),
+                         [&](size_t a, size_t b) {
+                             return player.weapons[a].damage >
+                                    player.weapons[b].damage;
+                         });
+        std::wstring detail;
+        auto append = [&](const std::wstring& part) {
+            if (!detail.empty() && detail.size() + part.size() > 46) {
+                lines.push_back(L"  " + detail);
+                detail.clear();
+            }
+            if (!detail.empty()) detail += L", ";
+            detail += part;
+        };
+        for (size_t w = 0; w < player.weapon_count; ++w) {
+            const auto& weapon = player.weapons[weapons[w]];
+            const std::wstring label = weapon.label[0]
+                ? WideAscii(weapon.label.data())
+                : L"Weapon " + std::to_wstring(weapons[w] + 1);
+            append(label + L" " + WideRounded(weapon.damage / divisor) +
+                   L"/s");
+        }
+        if (player.weapon_count &&
+            player.unattributed >= player.damage * 0.01) {
+            append(L"other " + WideRounded(player.unattributed / divisor) +
+                   L"/s");
+        }
+        if (!detail.empty()) lines.push_back(L"  " + detail);
+    }
+    if (lines.size() == 1) lines.emplace_back(L"  (no damage recorded)");
+    return lines;
+}
+
+// Room update: the host prints the finished mission once. Every machine
+// logs the totals it measured (no names).
+void DamageMeterOnRoom() {
+    if (!g_damage_meter_publish_pending.load(std::memory_order_acquire)) {
+        return;
+    }
+    void* room = reinterpret_cast<void*>(
+        g_chat_room_instance.load(std::memory_order_acquire));
+    const bool room_valid = room && g_runtime_chat_room_vtable &&
+        IsReadableMemoryRange(room, sizeof(void*)) &&
+        *reinterpret_cast<void***>(room) == g_runtime_chat_room_vtable;
+    const bool host = g_owned_lobby.load(std::memory_order_acquire) != 0;
+    if (host && capture::GetConfig().damage_meter_chat &&
+        (!room_valid || !g_chat_system_message_publish)) {
+        AcquireSRWLockShared(&g_damage_meter_lock);
+        const uint64_t ended_at = g_damage_meter.end_tick;
+        ReleaseSRWLockShared(&g_damage_meter_lock);
+        const uint64_t now = GetTickCount64();
+        // Wait (bounded) for the room chat after the result screen.
+        if (ended_at && now >= ended_at && now - ended_at < 30000) return;
+    }
+    bool expected = true;
+    if (!g_damage_meter_publish_pending.compare_exchange_strong(
+            expected, false, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return;
+    }
+    DamageMeterState snapshot;
+    AcquireSRWLockShared(&g_damage_meter_lock);
+    snapshot = g_damage_meter;
+    ReleaseSRWLockShared(&g_damage_meter_lock);
+    uint32_t names_known = 0;
+    for (auto& player : snapshot.players) {
+        if (!player.name[0] && player.damage > 0.0) {
+            DamageMeterPersonaName(player.steam_id, player.name);
+        }
+        if (player.name[0] && player.damage > 0.0) ++names_known;
+    }
+    std::string totals = "[";
+    std::string hits = "[";
+    std::string outgoing = "[";
+    std::string received = "[";
+    uint32_t players_with_damage = 0;
+    uint32_t weapons_found = 0;
+    for (size_t index = 0; index < snapshot.players.size(); ++index) {
+        const auto& player = snapshot.players[index];
+        totals += (index ? "," : "") +
+            std::to_string(static_cast<int64_t>(std::llround(player.damage)));
+        hits += std::string(index ? "," : "") + "[" +
+            std::to_string(player.hits) + "," +
+            std::to_string(player.projectile_hits) + "]";
+        received += std::string(index ? "," : "") + "[" +
+            std::to_string(static_cast<int64_t>(
+                std::llround(player.received_amount))) +
+            "," + std::to_string(player.zero_loss_hits) + "]";
+        outgoing += std::string(index ? "," : "") + "[" +
+            std::to_string(static_cast<int64_t>(
+                std::llround(player.outgoing))) +
+            "," + std::to_string(player.outgoing_hits) + "]";
+        if (player.damage > 0.0) ++players_with_damage;
+        weapons_found += static_cast<uint32_t>(player.weapon_count);
+    }
+    totals += "]";
+    hits += "]";
+    outgoing += "]";
+    received += "]";
+    const auto lines = BuildDamageMeterSummary(snapshot, GetTickCount64());
+    std::string others = "[";
+    for (const auto& entry : snapshot.other_attackers) {
+        if (!entry.label[0]) continue;
+        others += std::string(others.size() > 1 ? "," : "") + "[\"" +
+            entry.label.data() + "\"," +
+            std::to_string(static_cast<int64_t>(std::llround(entry.damage))) +
+            "," + std::to_string(entry.hits) + "," +
+            std::to_string(entry.distinct) + "]";
+    }
+    others += "]";
+    // Measurement only unless DamageMeterChat=true: the host applies just the
+    // damage on objects it owns, so its totals are incomplete (0.6.79).
+    const bool chat_enabled = capture::GetConfig().damage_meter_chat;
+    const bool published = chat_enabled && host && room_valid &&
+                           g_chat_system_message_publish;
+    if (published) {
+        for (const auto& text : lines) {
+            g_chat_system_message_publish(room, text.c_str());
+        }
+        g_damage_meter_publish_count.fetch_add(1, std::memory_order_acq_rel);
+    }
+    EDF5_CAPTURE_EVENT(
+        "more_players", "damage_meter_summary",
+        capture::Fields()
+            .Bool("host", host)
+            .Bool("published_local_chat", published)
+            .Bool("chat_enabled", chat_enabled)
+            .Bool("chat_room_valid", room_valid)
+            .Int("result", snapshot.result)
+            .UInt("duration_ms",
+                  snapshot.end_tick > snapshot.start_tick
+                      ? snapshot.end_tick - snapshot.start_tick : 0)
+            .Raw("participant_damage", totals)
+            .Raw("participant_hits", hits)
+            // Source side for this machine's soldiers (raw amount, hits).
+            .Raw("participant_outgoing", outgoing)
+            // Applied on this machine: raw info amount, hits without loss.
+            .Raw("participant_received", received)
+            .UInt("other_zero_loss_hits", snapshot.other_zero_loss_hits)
+            .UInt("local_participant_mask",
+                  g_mission_local_participant_mask.load(
+                      std::memory_order_acquire))
+            .UInt("names_known", names_known)
+            .UInt("players_with_damage", players_with_damage)
+            .UInt("weapons_found", weapons_found)
+            .UInt("projectile_hits", snapshot.projectile_hits)
+            .UInt("projectile_weapon_hits", snapshot.projectile_weapon_hits)
+            .UInt("friendly_hits", snapshot.friendly_hits)
+            .Int("other_damage",
+                 static_cast<int64_t>(std::llround(snapshot.other_damage)))
+            .Raw("other_attacker_classes", others)
+            .UInt("chat_lines", lines.size())
+            .Bool("names_logged", false)
+            .Bool("message_text_logged", false));
+}
+
+void ResetDamageMeter() {
+    AcquireSRWLockExclusive(&g_damage_meter_lock);
+    g_damage_meter = {};
+    ReleaseSRWLockExclusive(&g_damage_meter_lock);
+    g_damage_meter_publish_pending.store(false, std::memory_order_release);
+}
+
+// Diagnostics: records how the native client calls Chat_Room::Send so the
+// summary can later be broadcast with the same identities. Logs only the
+// caller and how the two identity pointers relate to known objects.
+[[maybe_unused]] bool __fastcall ChatRoomSendHook(void* room,
+                                                  const void* identity_a,
+                                                  const void* identity_b,
+                                                  const wchar_t* text) {
+#if defined(__clang__) || defined(__GNUC__)
+    const uintptr_t return_address =
+        reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+#else
+    const uintptr_t return_address = 0;
+#endif
+    if (g_chat_room_send_logs.fetch_add(1, std::memory_order_acq_rel) < 8) {
+        const uintptr_t room_address = reinterpret_cast<uintptr_t>(room);
+        uintptr_t stack_marker = 0;
+        const uintptr_t stack = reinterpret_cast<uintptr_t>(&stack_marker);
+        auto describe = [&](const void* pointer, int64_t& room_offset,
+                            bool& on_stack, bool& in_image,
+                            uint64_t& value_kind) {
+            const uintptr_t address = reinterpret_cast<uintptr_t>(pointer);
+            room_offset = room_address && address >= room_address &&
+                    address - room_address < 0x400
+                ? static_cast<int64_t>(address - room_address) : -1;
+            on_stack = address && (address > stack ? address - stack
+                                                   : stack - address) <
+                                      0x10000;
+            in_image = ImageRange(address, 1);
+            value_kind = 0;
+            uint64_t value = 0;
+            if (address &&
+                IsReadableMemoryRange(pointer, sizeof(value))) {
+                std::memcpy(&value, pointer, sizeof(value));
+                if (value && value ==
+                        g_owned_lobby.load(std::memory_order_acquire)) {
+                    value_kind = 1;
+                } else if (value && value ==
+                               steam_capture::LocalUserSteamId()) {
+                    value_kind = 2;
+                } else if (value && value == g_chat_banner_lobby.load(
+                                                  std::memory_order_acquire)) {
+                    value_kind = 3;
+                } else if (value) {
+                    value_kind = 4;
+                }
+            }
+        };
+        int64_t a_offset = -1;
+        int64_t b_offset = -1;
+        bool a_stack = false;
+        bool b_stack = false;
+        bool a_image = false;
+        bool b_image = false;
+        uint64_t a_kind = 0;
+        uint64_t b_kind = 0;
+        describe(identity_a, a_offset, a_stack, a_image, a_kind);
+        describe(identity_b, b_offset, b_stack, b_image, b_kind);
+        EDF5_CAPTURE_EVENT(
+            "more_players", "chat_room_send_observed",
+            capture::Fields()
+                .UInt("caller_rva",
+                      return_address >= g_module_base
+                          ? return_address - g_module_base : 0)
+                .Bool("room_matches_captured",
+                      room_address == g_chat_room_instance.load(
+                                          std::memory_order_acquire))
+                .Int("identity_a_room_offset", a_offset)
+                .Bool("identity_a_on_stack", a_stack)
+                .Bool("identity_a_in_image", a_image)
+                .UInt("identity_a_value_kind", a_kind)
+                .Int("identity_b_room_offset", b_offset)
+                .Bool("identity_b_on_stack", b_stack)
+                .Bool("identity_b_in_image", b_image)
+                .UInt("identity_b_value_kind", b_kind)
+                .UInt("text_length", text ? std::wcslen(text) : 0)
+                .Bool("identity_logged", false)
+                .Bool("message_text_logged", false));
+    }
+    return g_chat_room_send(room, identity_a, identity_b, text);
+}
+
+bool ValidateDamageMeterLayout(uint8_t* base, size_t image_size) {
+    auto call_targets = [&](uintptr_t call_rva, uintptr_t target_rva) {
+        if (call_rva > image_size - kRel32CallSize ||
+            base[call_rva] != 0xe8) {
+            return false;
+        }
+        int32_t relative = 0;
+        std::memcpy(&relative, base + call_rva + 1, sizeof(relative));
+        return static_cast<int64_t>(call_rva + kRel32CallSize) + relative ==
+               static_cast<int64_t>(target_rva);
+    };
+    auto type_name_matches = [&](uintptr_t rva, const char* name) {
+        const size_t length = std::strlen(name) + 1;
+        return rva + kRttiTypeDescriptorNameOffset <= image_size - length &&
+               std::memcmp(base + rva + kRttiTypeDescriptorNameOffset, name,
+                           length) == 0;
+    };
+    return SignatureMatches(base, image_size, kObjectApplyDamageRva,
+                            kObjectApplyDamageSignature,
+                            sizeof(kObjectApplyDamageSignature)) &&
+           SignatureMatches(base, image_size, kObjectApplyDamageAmountReadRva,
+                            kObjectApplyDamageAmountReadSignature,
+                            sizeof(kObjectApplyDamageAmountReadSignature)) &&
+           SignatureMatches(base, image_size, kObjectApplyDamageHealthReadRva,
+                            kObjectApplyDamageHealthReadSignature,
+                            sizeof(kObjectApplyDamageHealthReadSignature)) &&
+           SignatureMatches(base, image_size, kObjectMessageDamageCallRva,
+                            kObjectMessageDamageCallSignature,
+                            sizeof(kObjectMessageDamageCallSignature)) &&
+           SignatureMatches(base, image_size, kDamageListFlushRva,
+                            kDamageListFlushSignature,
+                            sizeof(kDamageListFlushSignature)) &&
+           SignatureMatches(base, image_size, kDamageListLayoutRva,
+                            kDamageListLayoutSignature,
+                            sizeof(kDamageListLayoutSignature)) &&
+           SignatureMatches(base, image_size, kDamageListInfoRva,
+                            kDamageListInfoSignature,
+                            sizeof(kDamageListInfoSignature)) &&
+           SignatureMatches(base, image_size, kDamageListStrideRva,
+                            kDamageListStrideSignature,
+                            sizeof(kDamageListStrideSignature)) &&
+           SignatureMatches(base, image_size, kProjectileDamageFlushListARva,
+                            kProjectileDamageFlushListASignature,
+                            sizeof(kProjectileDamageFlushListASignature)) &&
+           SignatureMatches(base, image_size, kProjectileDamageFlushListBRva,
+                            kProjectileDamageFlushListBSignature,
+                            sizeof(kProjectileDamageFlushListBSignature)) &&
+           call_targets(kProjectileDamageFlushCallARva, kDamageListFlushRva) &&
+           call_targets(kProjectileDamageFlushCallBRva, kDamageListFlushRva) &&
+           type_name_matches(kWeaponBaseTypeDescriptorRva,
+                             kWeaponBaseTypeName) &&
+           type_name_matches(kSoldierBaseTypeDescriptorRva,
+                             kSoldierBaseTypeName);
+}
+
+// Optional feature: a mismatch disables the meter without quarantining the
+// rest of the plugin.
+void InstallDamageMeterHooks(uint8_t* base, size_t image_size) {
+    if (!DamageMeterEnabled()) {
+        EDF5_CAPTURE_EVENT("more_players", "damage_meter_disabled",
+                           capture::Fields().String("reason", "config"));
+        return;
+    }
+    if (!ValidateDamageMeterLayout(base, image_size)) {
+        EDF5_CAPTURE_EVENT(
+            "more_players", "damage_meter_disabled",
+            capture::Fields().String("reason", "signature_mismatch")
+                .UInt("apply_damage_rva", kObjectApplyDamageRva)
+                .UInt("damage_flush_rva", kDamageListFlushRva));
+        return;
+    }
+    const bool apply_hooked = hooks::Address(
+        base + kObjectApplyDamageRva,
+        reinterpret_cast<void*>(&ObjectApplyDamageHook),
+        reinterpret_cast<void**>(&g_object_apply_damage),
+        "GameObjectBase::ApplyDamage damage meter", false);
+    const bool flush_hooked = apply_hooked && hooks::Address(
+        base + kDamageListFlushRva,
+        reinterpret_cast<void*>(&DamageListFlushHook),
+        reinterpret_cast<void**>(&g_damage_list_flush),
+        "Projectile damage list flush attribution", false);
+    if constexpr (build_config::kDiagnostics) {
+        if (SignatureMatches(base, image_size, kChatRoomSendRva,
+                             kChatRoomSendSignature,
+                             sizeof(kChatRoomSendSignature))) {
+            hooks::Address(base + kChatRoomSendRva,
+                           reinterpret_cast<void*>(&ChatRoomSendHook),
+                           reinterpret_cast<void**>(&g_chat_room_send),
+                           "Chat_Room send identity telemetry", false);
+        }
+    }
+    g_damage_meter_installed.store(apply_hooked, std::memory_order_release);
+    EDF5_CAPTURE_EVENT(
+        "more_players", "damage_meter_ready",
+        capture::Fields()
+            .Bool("apply_damage_hooked", apply_hooked)
+            .Bool("projectile_flush_hooked", flush_hooked)
+            .UInt("apply_damage_rva", kObjectApplyDamageRva)
+            .UInt("damage_flush_rva", kDamageListFlushRva)
+            .UInt("health_offset", kGameObjectHealthOffset)
+            .String("summary", "host_local_chat"));
+}
+
 SharedProperty* __fastcall MissionPlayerCreateHook(
     void* owner, SharedProperty* output, void* spawn_transform,
     int32_t participant_index, int32_t local_controller_index,
@@ -9663,6 +11751,10 @@ SharedProperty* __fastcall MissionPlayerCreateHook(
         completed_trace, "player_create_return_fallback", false);
     g_mission_player_create_trace = previous_trace;
     const bool output_player_present = output && output->object;
+    if (output_player_present) {
+        DamageMeterRegisterSoldier(participant_index, output->control,
+                                   output->object, participant_user);
+    }
     EDF5_DIAGNOSTIC_PHASE(diagnostics_scope, "original_returned", output_player_present ? 1 : 0,
                             result == output ? 1 : 0);
     if (first_audit) {
@@ -9760,6 +11852,8 @@ SharedProperty* __fastcall MissionPlayerCreateHook(
     return result;
 }
 
+void ResetRosterScrollAnchor();
+
 void* __fastcall UiLayoutCastHook(void* output, void* component) {
 #if defined(__clang__) || defined(__GNUC__)
     const uintptr_t return_address =
@@ -9778,8 +11872,11 @@ void* __fastcall UiLayoutCastHook(void* output, void* component) {
                       g_runtime_ui_layout_vtable) {
         layout = nullptr;
     }
-    g_players_group_layout.store(reinterpret_cast<uintptr_t>(layout),
-                                 std::memory_order_release);
+    if (g_players_group_layout.exchange(reinterpret_cast<uintptr_t>(layout),
+                                        std::memory_order_acq_rel) !=
+        reinterpret_cast<uintptr_t>(layout)) {
+        ResetRosterScrollAnchor();
+    }
     g_players_group_capture_tick.store(layout ? GetTickCount64() : 0,
                                        std::memory_order_release);
     return result;
@@ -9795,17 +11892,246 @@ void* __fastcall UiLayoutDestructorHook(void* self, unsigned flags) {
     return g_ui_layout_destructor(self, flags);
 }
 
-bool AdjustRosterScrollModel(uint8_t* model, int detents, float& previous,
-                             float& position) {
+// The PlayersGroup scroll model stores a position normalized to the scroll
+// range (native clamp 0x4A9080 bounds it to 0..1). A fixed normalized step
+// therefore moved a quarter row with five players and a full row with
+// eight, and a roster change silently re-mapped the same fraction to a
+// different row (the list "jumped" when someone joined). Wheel input now
+// moves whole rows and the first visible row is kept across roster changes.
+constexpr int kRoomRosterVisibleRows = 4;
+std::atomic<int> g_roster_scroll_anchor_row{-1};
+std::atomic<int> g_roster_scroll_rows{-1};
+std::atomic<uint32_t> g_roster_scroll_last_position_bits{0};
+std::atomic<uint64_t> g_roster_scroll_rows_changed_tick{0};
+std::atomic<uint32_t> g_roster_scroll_content_bits{0};
+std::atomic<unsigned> g_roster_scroll_event_logs{0};
+constexpr unsigned kRosterScrollEventLogLimit = 64;
+// Native rebuilds can rewrite the position a few frames after the member
+// count changes; inside this window the anchored row wins.
+constexpr uint64_t kRosterRebuildWindowMs = 1500;
+// Layout+0x260 enables vt[8] (0x4AB180), which scrolls to keep the focused
+// child visible while the focus object (+0x88) is active. Those moves are
+// real navigation (keyboard/gamepad) and are followed, never overridden.
+constexpr size_t kUiLayoutFocusAutoScrollOffset = 0x260;
+// Scroll extent of the content: vt[8] normalizes by model+0x08 minus the
+// viewport. A change means the rows were rebuilt.
+constexpr size_t kUiScrollContentExtentOffset = 0x08;
+
+uint32_t FloatBits(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+float BitsFloat(uint32_t bits) {
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+// Rows in the room list: the member count the game last read for the room
+// lobby (synthetic members included). -1 when unknown.
+int RoomRosterRows() {
+    const int members = g_room_member_count.load(std::memory_order_acquire);
+    return members >= 1 ? members : -1;
+}
+
+void ResetRosterScrollAnchor() {
+    g_roster_scroll_anchor_row.store(-1, std::memory_order_release);
+    g_roster_scroll_rows.store(-1, std::memory_order_release);
+    g_roster_scroll_last_position_bits.store(0, std::memory_order_release);
+    g_roster_scroll_content_bits.store(0, std::memory_order_release);
+    g_roster_scroll_rows_changed_tick.store(0, std::memory_order_release);
+    g_roster_scroll_event_logs.store(0, std::memory_order_release);
+}
+
+// 1 = the layout's focus navigation is active (the game may scroll to keep
+// the focused row visible), 0 = inactive, -1 = unknown focus object.
+int RosterFocusState(const uint8_t* layout) {
+    if (!layout || !g_runtime_ui_focus_vtable ||
+        layout[kUiLayoutFocusAutoScrollOffset] == 0) {
+        return layout && layout[kUiLayoutFocusAutoScrollOffset] == 0 ? 0 : -1;
+    }
+    const auto* focus = *reinterpret_cast<uint8_t* const*>(
+        layout + kUiLayoutFocusOffset);
+    if (!focus ||
+        !IsReadableMemoryRange(focus, kUiFocusActiveOffset + 1) ||
+        *reinterpret_cast<void** const*>(focus) != g_runtime_ui_focus_vtable) {
+        return -1;
+    }
+    return focus[kUiFocusActiveOffset] != 0 ? 1 : 0;
+}
+
+// Moves the requested position by whole rows when the row count is known
+// (rows > visible rows); otherwise falls back to the historical 0.25 step.
+bool AdjustRosterScrollModel(uint8_t* model, int detents, int rows,
+                             float& previous, float& position,
+                             int& anchor_row) {
+    anchor_row = -1;
     if (!model || !detents || model[kUiScrollEnabledOffset] == 0) return false;
     previous = *reinterpret_cast<float*>(
         model + kUiScrollRequestedPositionOffset);
     if (!std::isfinite(previous)) return false;
-    position = std::max(0.0f, std::min(
-        1.0f, previous - static_cast<float>(detents) * kRosterWheelStep));
+    if (rows > kRoomRosterVisibleRows) {
+        const int range = rows - kRoomRosterVisibleRows;
+        const int current = static_cast<int>(std::lround(
+            std::max(0.0f, std::min(1.0f, previous)) *
+            static_cast<float>(range)));
+        anchor_row = std::max(0, std::min(range, current - detents));
+        position = static_cast<float>(anchor_row) /
+            static_cast<float>(range);
+    } else {
+        // Unknown count, or the model scrolls although the count says every
+        // row fits: the count is stale, so keep the historical step.
+        position = std::max(0.0f, std::min(
+            1.0f, previous - static_cast<float>(detents) * kRosterWheelStep));
+    }
     *reinterpret_cast<float*>(model + kUiScrollRequestedPositionOffset) =
         position;
     return true;
+}
+
+// Offline self-test stand-in for the native clamp 0x4A9080 (vertical only).
+[[maybe_unused]] void __fastcall SelfTestUiLayoutClamp(void* layout) {
+    auto* model = *reinterpret_cast<uint8_t**>(
+        static_cast<uint8_t*>(layout) + kUiLayoutVerticalScrollOffset);
+    if (!model) return;
+    auto* requested = reinterpret_cast<float*>(
+        model + kUiScrollRequestedPositionOffset);
+    *requested = std::max(0.0f, std::min(1.0f, *requested));
+    *reinterpret_cast<float*>(model) = *requested;
+}
+
+uint8_t* PlayersGroupScrollModel(uint8_t*& layout, uint64_t& capture_age) {
+    layout = reinterpret_cast<uint8_t*>(
+        g_players_group_layout.load(std::memory_order_acquire));
+    const uint64_t captured =
+        g_players_group_capture_tick.load(std::memory_order_acquire);
+    const uint64_t now = GetTickCount64();
+    capture_age = captured && now >= captured ? now - captured : 0;
+    const bool layout_valid = layout && captured &&
+                              *reinterpret_cast<void***>(layout) ==
+                                  g_runtime_ui_layout_vtable;
+    if (!layout_valid) {
+        layout = nullptr;
+        return nullptr;
+    }
+    return *reinterpret_cast<uint8_t**>(layout + kUiLayoutVerticalScrollOffset);
+}
+
+// Runs every HUiRoom::Update before wheel input. Once the user has scrolled
+// with the wheel, keeps the same first row visible when the roster changes
+// (member count or content extent) and when the game moves the list without
+// focus navigation. Moves made by focus navigation (keyboard/gamepad, vt[8])
+// are followed and become the new anchor.
+void MaintainRosterScrollAnchor() {
+    if (!RoomRosterActive() || !g_ui_layout_clamp) return;
+    uint8_t* layout = nullptr;
+    uint64_t capture_age = 0;
+    uint8_t* model = PlayersGroupScrollModel(layout, capture_age);
+    if (!model) return;
+    auto* requested_field = reinterpret_cast<float*>(
+        model + kUiScrollRequestedPositionOffset);
+    const float requested = *requested_field;
+    if (!std::isfinite(requested)) return;
+    const float content = *reinterpret_cast<const float*>(
+        model + kUiScrollContentExtentOffset);
+    const int rows = RoomRosterRows();
+    const int previous_rows =
+        g_roster_scroll_rows.exchange(rows, std::memory_order_acq_rel);
+    const uint32_t content_bits = FloatBits(content);
+    const uint32_t previous_content_bits = g_roster_scroll_content_bits.exchange(
+        content_bits, std::memory_order_acq_rel);
+    const bool rows_changed = rows != previous_rows;
+    const bool content_changed =
+        previous_content_bits != 0 && content_bits != previous_content_bits;
+    const uint64_t now = GetTickCount64();
+    if (rows_changed || content_changed) {
+        g_roster_scroll_rows_changed_tick.store(now,
+                                                std::memory_order_release);
+    }
+    int anchor = g_roster_scroll_anchor_row.load(std::memory_order_acquire);
+    const int range = rows - kRoomRosterVisibleRows;
+    if (anchor >= 0 && range <= 0) {
+        // The list fits again; the native clamp handles it.
+        g_roster_scroll_anchor_row.store(-1, std::memory_order_release);
+        anchor = -1;
+    }
+    if (anchor < 0 || model[kUiScrollEnabledOffset] == 0) {
+        // Never scrolled by the wheel, or nothing to scroll this frame:
+        // native behavior untouched.
+        g_roster_scroll_last_position_bits.store(
+            FloatBits(requested), std::memory_order_release);
+        return;
+    }
+    const float last = BitsFloat(g_roster_scroll_last_position_bits.load(
+        std::memory_order_acquire));
+    const uint64_t changed_tick =
+        g_roster_scroll_rows_changed_tick.load(std::memory_order_acquire);
+    const bool in_rebuild_window = changed_tick && now >= changed_tick &&
+        now - changed_tick <= kRosterRebuildWindowMs;
+    const bool native_moved = std::fabs(requested - last) > 0.0005f;
+    if (!rows_changed && !native_moved) return;
+    const int focus = RosterFocusState(layout);
+    const char* reason = nullptr;
+    if (rows_changed) {
+        reason = "member_count_changed";
+    } else if (in_rebuild_window) {
+        reason = "native_move_after_roster_change";
+    } else if (focus == 0) {
+        reason = "native_move_without_focus_navigation";
+    }
+    const bool log = g_roster_scroll_event_logs.fetch_add(
+        1, std::memory_order_acq_rel) < kRosterScrollEventLogLimit;
+    if (reason) {
+        anchor = std::min(anchor, range);
+        const float position =
+            static_cast<float>(anchor) / static_cast<float>(range);
+        *requested_field = position;
+        g_ui_layout_clamp(layout);
+        g_roster_scroll_anchor_row.store(anchor, std::memory_order_release);
+        g_roster_scroll_last_position_bits.store(
+            FloatBits(position), std::memory_order_release);
+        if (log) {
+            EDF5_CAPTURE_EVENT(
+                "more_players", "room_roster_scroll_anchor_kept",
+                capture::Fields()
+                    .Int("previous_rows", previous_rows)
+                    .Int("rows", rows)
+                    .Int("anchor_row", anchor)
+                    .Int("native_position_milli",
+                         static_cast<int64_t>(std::lround(requested * 1000.0f)))
+                    .Int("position_milli",
+                         static_cast<int64_t>(std::lround(position * 1000.0f)))
+                    .Int("content_extent_milli",
+                         std::isfinite(content)
+                             ? static_cast<int64_t>(std::lround(
+                                   content * 1000.0f))
+                             : -1)
+                    .Bool("content_changed", content_changed)
+                    .Int("focus_state", focus)
+                    .String("reason", reason));
+        }
+        return;
+    }
+    // Focus navigation (or an unknown focus object) moved the list: follow.
+    const int adopted = std::max(0, std::min(range, static_cast<int>(
+        std::lround(requested * static_cast<float>(range)))));
+    g_roster_scroll_anchor_row.store(adopted, std::memory_order_release);
+    g_roster_scroll_last_position_bits.store(FloatBits(requested),
+                                             std::memory_order_release);
+    if (log) {
+        EDF5_CAPTURE_EVENT(
+            "more_players", "room_roster_scroll_native_followed",
+            capture::Fields()
+                .Int("rows", rows)
+                .Int("previous_position_milli",
+                     static_cast<int64_t>(std::lround(last * 1000.0f)))
+                .Int("position_milli",
+                     static_cast<int64_t>(std::lround(requested * 1000.0f)))
+                .Int("adopted_anchor_row", adopted)
+                .Int("focus_state", focus));
+    }
 }
 
 void ApplyPendingWheelScroll() {
@@ -9813,25 +12139,25 @@ void ApplyPendingWheelScroll() {
         0, std::memory_order_acq_rel);
     if (!detents || !RoomRosterActive() || !g_ui_layout_clamp) return;
 
-    auto* layout = reinterpret_cast<uint8_t*>(
-        g_players_group_layout.load(std::memory_order_acquire));
-    const uint64_t captured =
-        g_players_group_capture_tick.load(std::memory_order_acquire);
-    const uint64_t now = GetTickCount64();
-    const uint64_t capture_age = captured && now >= captured
-        ? now - captured : 0;
-    bool layout_valid = layout && captured &&
-                        *reinterpret_cast<void***>(layout) ==
-                            g_runtime_ui_layout_vtable;
-    auto* model = layout_valid
-        ? *reinterpret_cast<uint8_t**>(layout + kUiLayoutVerticalScrollOffset)
-        : nullptr;
+    uint8_t* layout = nullptr;
+    uint64_t capture_age = 0;
+    uint8_t* model = PlayersGroupScrollModel(layout, capture_age);
+    const bool layout_valid = layout != nullptr;
     const bool model_enabled = model && model[kUiScrollEnabledOffset] != 0;
+    const int rows = RoomRosterRows();
     float previous = 0.0f;
     float position = 0.0f;
+    int anchor_row = -1;
     const bool applied = AdjustRosterScrollModel(
-        model, detents, previous, position);
-    if (applied) g_ui_layout_clamp(layout);
+        model, detents, rows, previous, position, anchor_row);
+    if (applied) {
+        g_ui_layout_clamp(layout);
+        g_roster_scroll_anchor_row.store(anchor_row,
+                                         std::memory_order_release);
+        g_roster_scroll_rows.store(rows, std::memory_order_release);
+        g_roster_scroll_last_position_bits.store(
+            FloatBits(position), std::memory_order_release);
+    }
     EDF5_CAPTURE_EVENT("more_players", "room_wheel_scroll_applied",
                    capture::Fields().Int("wheel_detents", detents)
                        .Bool("players_group", layout_valid)
@@ -9847,6 +12173,8 @@ void ApplyPendingWheelScroll() {
                             static_cast<int64_t>(std::lround(
                                 position * 1000.0f)))
                        .Bool("success", applied)
+                       .Int("rows", rows)
+                       .Int("anchor_row", anchor_row)
                        .Bool("cursor_hit_test", false));
 }
 
@@ -9904,7 +12232,9 @@ void* __fastcall HUiRoomUpdateHook(void* self, void* frame) {
     ApplyPendingReadyBots();
     ApplyPendingMissionGroups();
     ObserveLocalMissionHarnessMissionStartSnapshot("HUiRoom::Update");
+    MaintainRosterScrollAnchor();
     ApplyPendingWheelScroll();
+    DamageMeterOnRoom();
     return result;
 }
 
@@ -11706,6 +14036,7 @@ void ClearSyntheticState(bool reset_template) {
     g_diagnostic_real_gameplay_peers.store(0, std::memory_order_release);
     g_players_group_layout.store(0, std::memory_order_release);
     g_players_group_capture_tick.store(0, std::memory_order_release);
+    ResetRosterScrollAnchor();
     ResetMissionGroupSync();
     g_packets.clear();
     g_membership_changes.clear();
@@ -11974,12 +14305,17 @@ void ApplyPendingReadyBots() {
     TryReadyBots(lobby, feedback);
 }
 
-unsigned NextLocalMissionHarnessTarget(unsigned current) {
-    if (current == 0) return kLocalMissionHarnessBaselineDummies;
-    if (current == kLocalMissionHarnessBaselineDummies) {
-        return kLocalMissionHarnessProbeDummies;
+unsigned NextLocalMissionHarnessTarget(unsigned current,
+                                       unsigned max_players) {
+    // Off -> host+3 native baseline -> host+4 (P4) -> host+5 (P5) -> ... ->
+    // host+7 (P7) -> off. The host is a participant too, so the cycle wraps
+    // to off as soon as the next roster would exceed MaxPlayers.
+    const unsigned next = current == 0
+        ? kLocalMissionHarnessBaselineDummies : current + 1;
+    if (next > kLocalMissionHarnessMaximumDummies || next >= max_players) {
+        return 0;
     }
-    return 0;
+    return next;
 }
 
 bool TryCycleLocalMissionHarness(uint64_t lobby, bool user_feedback) {
@@ -12020,8 +14356,9 @@ bool TryCycleLocalMissionHarness(uint64_t lobby, bool user_feedback) {
                      hotkey, user_feedback);
         return false;
     }
-    const unsigned target = NextLocalMissionHarnessTarget(previous_target);
-    if (target >= MaxPlayers()) {
+    const unsigned target =
+        NextLocalMissionHarnessTarget(previous_target, MaxPlayers());
+    if (target != 0 && target >= MaxPlayers()) {
         RejectHotkey("MaxPlayers is below requested harness size", lobby,
                      hotkey, user_feedback);
         return false;
@@ -12060,9 +14397,9 @@ bool TryCycleLocalMissionHarness(uint64_t lobby, bool user_feedback) {
             .UInt("previous_dummy_target", previous_target)
             .UInt("dummy_target", target)
             .UInt("total_mission_participants", target + 1)
-            .String("mode", target == 0 ? "off" :
-                    (target == kLocalMissionHarnessBaselineDummies
-                         ? "native_baseline" : "p4_capacity_probe"))
+            .String("mode", LocalMissionHarnessModeName(target))
+            .UInt("maximum_dummy_target",
+                  kLocalMissionHarnessMaximumDummies)
             .Bool("ready_queued", ready_queued)
             .Bool("loadout_copies_host", target != 0)
             .Bool("dummy_control_mode_remote", target != 0)
@@ -12369,6 +14706,15 @@ bool InstallGameHooks() {
         base + kMissionLoadoutStateSlotRva);
     g_runtime_ui_layout_vtable = reinterpret_cast<void**>(
         base + kUiLayoutVtableRva);
+    {
+        auto** focus_vtable =
+            reinterpret_cast<void**>(base + kUiFocusVtableRva);
+        // Optional: without it the roster anchor treats focus as unknown and
+        // always follows the game's own scrolling.
+        g_runtime_ui_focus_vtable =
+            focus_vtable[1] == base + kUiFocusActiveGetterRva
+                ? focus_vtable : nullptr;
+    }
     g_runtime_chat_room_vtable = reinterpret_cast<void**>(
         base + kChatRoomVtableRva);
     g_chat_system_message_publish =
@@ -12820,6 +15166,8 @@ bool InstallGameHooks() {
                              kLocalMissionHarnessBaselineDummies)
                        .UInt("local_mission_harness_probe_dummies",
                              kLocalMissionHarnessProbeDummies)
+                       .UInt("local_mission_harness_maximum_dummies",
+                             kLocalMissionHarnessMaximumDummies)
                        .Bool("local_mission_harness_real_connections",
                              false)
                        .Bool("local_mission_harness_gameplay_ai", false)
@@ -13043,6 +15391,7 @@ bool InstallGameHooks() {
                        .Bool("mission_player_control_assignment_audit", true)
                        .Int("mission_clear_result", kMissionResultClear)
                        .UInt("identity_getter_rva", kUserIdGetterRva));
+    InstallDamageMeterHooks(base, image_size);
     return true;
 }
 
@@ -13086,6 +15435,8 @@ bool Start() {
                               kLocalMissionHarnessBaselineDummies)
                         .UInt("local_mission_harness_probe_dummies",
                               kLocalMissionHarnessProbeDummies)
+                        .UInt("local_mission_harness_maximum_dummies",
+                              kLocalMissionHarnessMaximumDummies)
                         .Bool("debug_stage_win_enabled",
                               capture::GetConfig().debug_stage_win_enabled)
                         .UInt("debug_stage_win_hotkey_vk",
@@ -13156,6 +15507,7 @@ void Stop() {
     g_pending_wheel_detents.store(0, std::memory_order_release);
     g_players_group_layout.store(0, std::memory_order_release);
     g_players_group_capture_tick.store(0, std::memory_order_release);
+    ResetRosterScrollAnchor();
     g_mission_source_recycle_logged_mask.store(0,
                                                 std::memory_order_release);
     g_mission_source_identity_repair_logged_mask.store(
@@ -13249,12 +15601,31 @@ int EffectiveMemberLimit(uint64_t lobby, int requested) {
     return std::max(requested, static_cast<int>(MaxPlayers()));
 }
 
+// Room visibility (0x459510 at creation, 0x454C10 on membership changes):
+// public_slot counts the host, private_slot the friend seats and
+// open_public = public seats still free. The native Steam type is Public (2)
+// only while open_public is non-zero, otherwise Private (0). A friends-only
+// room is public_slot 1 / private_slot 3 / open_public 0; with a fifth member
+// the native count underflows (open_public -1), which flips the room to
+// Public. The extra seats therefore go to the seat kind the host chose and a
+// non-public room never advertises public seats or becomes Public.
+std::atomic<int> g_owned_lobby_native_public_slots{-1};
+std::atomic<int> g_owned_lobby_private_type{0};
+std::atomic<unsigned> g_lobby_visibility_logs{0};
+constexpr int kSteamLobbyTypePrivate = 0;
+constexpr int kSteamLobbyTypePublic = 2;
+constexpr long kNativeRoomSeats = 4;
+
 void NotifyCreateLobby(int requested, int effective) {
     if (!Enabled()) return;
     const uint64_t flow_id = EDF5_CAPTURE_NEXT_FLOW_ID();
     g_diagnostic_flow_id.store(flow_id, std::memory_order_release);
     g_create_pending.store(true, std::memory_order_release);
     g_owned_lobby.store(0, std::memory_order_release);
+    g_owned_lobby_native_public_slots.store(-1, std::memory_order_release);
+    g_owned_lobby_private_type.store(kSteamLobbyTypePrivate,
+                                     std::memory_order_release);
+    g_lobby_visibility_logs.store(0, std::memory_order_release);
     g_join_lobby_pending.store(0, std::memory_order_release);
     g_chat_banner_lobby.store(0, std::memory_order_release);
     g_chat_banner_pending.store(false, std::memory_order_release);
@@ -13287,6 +15658,8 @@ void NotifyJoinLobby(uint64_t lobby) {
     ClearMissionExtraLoadoutSidecars();
     g_create_pending.store(false, std::memory_order_release);
     g_join_lobby_pending.store(lobby, std::memory_order_release);
+    g_room_lobby.store(lobby, std::memory_order_release);
+    g_room_member_count.store(-1, std::memory_order_release);
     g_chat_banner_lobby.store(0, std::memory_order_release);
     g_chat_banner_pending.store(false, std::memory_order_release);
     EDF5_CAPTURE_EVENT("more_players", "join_lobby_banner_pending",
@@ -13301,6 +15674,8 @@ void ObserveLobbyDataWrite(uint64_t lobby, const char* key) {
     if (std::strcmp(key, "public_slot") == 0 &&
         g_create_pending.exchange(false, std::memory_order_acq_rel)) {
         g_owned_lobby.store(lobby, std::memory_order_release);
+        g_room_lobby.store(lobby, std::memory_order_release);
+        g_room_member_count.store(-1, std::memory_order_release);
         EDF5_CAPTURE_EVENT("more_players", "owned_lobby_detected",
                        capture::Fields().UInt("lobby_steam_id", lobby)
                            .UInt("max_players", MaxPlayers()));
@@ -13319,6 +15694,13 @@ void ObserveLeaveLobby(uint64_t lobby) {
         g_chat_banner_pending.store(false, std::memory_order_release);
         g_chat_banner_lobby.store(0, std::memory_order_release);
     }
+    ResetDamageMeter();
+    uint64_t expected_room = lobby;
+    if (g_room_lobby.compare_exchange_strong(
+            expected_room, 0, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        g_room_member_count.store(-1, std::memory_order_release);
+    }
     if (g_owned_lobby.load(std::memory_order_acquire) != lobby) return;
     PublishDiagnosticState("leaving", true);
     CompleteMissionResultTransition("leave_lobby");
@@ -13330,34 +15712,97 @@ void ObserveLeaveLobby(uint64_t lobby) {
     PublishDiagnosticState("idle", true);
 }
 
+bool OwnedRoomIsPublic() {
+    return g_owned_lobby_native_public_slots.load(std::memory_order_acquire) >
+           1;
+}
+
+void LogLobbyVisibility(const char* key, long requested, long effective,
+                        bool public_room) {
+    if (g_lobby_visibility_logs.fetch_add(1, std::memory_order_acq_rel) >=
+        32) {
+        return;
+    }
+    EDF5_CAPTURE_EVENT("more_players", "lobby_visibility_adjusted",
+                       capture::Fields()
+                           .String("key", key)
+                           .Int("requested", requested)
+                           .Int("effective", effective)
+                           .Bool("public_room", public_room)
+                           .Int("native_public_slots",
+                                g_owned_lobby_native_public_slots.load(
+                                    std::memory_order_acquire))
+                           .UInt("max_players", MaxPlayers()));
+}
+
 bool RewriteLobbyData(uint64_t lobby, const char* key, const char* value,
                       std::string& rewritten) {
     if (!Enabled() || !key || !value ||
         lobby != g_owned_lobby.load(std::memory_order_acquire)) return false;
-    if (std::strcmp(key, "public_slot") == 0) {
-        char* end = nullptr;
-        long slots = std::strtol(value, &end, 10);
-        if (!end || *end != '\0') return false;
-        const long max_players = static_cast<long>(MaxPlayers());
-        slots += max_players - 4;
-        slots = std::max<long>(0, std::min(max_players, slots));
-        rewritten = std::to_string(slots);
-        return rewritten != value;
+    const bool public_slot = std::strcmp(key, "public_slot") == 0;
+    const bool private_slot = std::strcmp(key, "private_slot") == 0;
+    const bool open_public = std::strcmp(key, "open_public") == 0;
+    if (!public_slot && !private_slot && !open_public) return false;
+    char* end = nullptr;
+    const long native = std::strtol(value, &end, 10);
+    if (!end || *end != '\0') return false;
+    if (public_slot) {
+        g_owned_lobby_native_public_slots.store(
+            static_cast<int>(std::max<long>(0, std::min<long>(64, native))),
+            std::memory_order_release);
     }
-    if (std::strcmp(key, "open_public") == 0) {
-        char* end = nullptr;
-        long slots = std::strtol(value, &end, 10);
-        if (!end || *end != '\0') return false;
-        const long max_players = static_cast<long>(MaxPlayers());
-        slots += max_players - 4;
-        slots = std::max<long>(0, std::min(max_players, slots));
-        rewritten = std::to_string(slots);
-        return rewritten != value;
+    const bool public_room = OwnedRoomIsPublic();
+    const long max_players = static_cast<long>(MaxPlayers());
+    const long extra = std::max<long>(0, max_players - kNativeRoomSeats);
+    long slots = native;
+    if (public_slot) {
+        slots = public_room ? native + extra : native;
+    } else if (private_slot) {
+        slots = public_room ? native : native + extra;
+    } else {
+        // Free public seats: MaxPlayers - members in a public room, never
+        // any in a friends-only/private room.
+        slots = public_room ? native + extra : 0;
     }
-    return false;
+    slots = std::max<long>(0, std::min(max_players, slots));
+    rewritten = std::to_string(slots);
+    if (!public_room && (open_public || public_slot) && native != slots) {
+        LogLobbyVisibility(key, native, slots, public_room);
+    }
+    return rewritten != value;
 }
 
-int AdjustMemberCount(uint64_t lobby, int actual_count) {
+int AdjustLobbyType(uint64_t lobby, int type) {
+    if (!Enabled() || !lobby ||
+        lobby != g_owned_lobby.load(std::memory_order_acquire)) {
+        return type;
+    }
+    const int native_public =
+        g_owned_lobby_native_public_slots.load(std::memory_order_acquire);
+    if (native_public < 0) return type;
+    int effective = type;
+    if (native_public <= 1) {
+        if (type != kSteamLobbyTypePublic) {
+            g_owned_lobby_private_type.store(type, std::memory_order_release);
+        } else {
+            effective = g_owned_lobby_private_type.load(
+                std::memory_order_acquire);
+        }
+    } else if (type != kSteamLobbyTypePublic) {
+        // Native hides a public room once its four public seats are taken.
+        const int members =
+            g_room_member_count.load(std::memory_order_acquire);
+        if (members > 0 && members < static_cast<int>(MaxPlayers())) {
+            effective = kSteamLobbyTypePublic;
+        }
+    }
+    if (effective != type) {
+        LogLobbyVisibility("lobby_type", type, effective, native_public > 1);
+    }
+    return effective;
+}
+
+int AdjustSyntheticMemberCount(uint64_t lobby, int actual_count) {
     if (!AppliesToLobby(lobby) || actual_count < 0) return actual_count;
     const unsigned bots = g_bot_count.load(std::memory_order_acquire);
     if (!bots || actual_count >= static_cast<int>(MaxPlayers())) return actual_count;
@@ -13378,6 +15823,15 @@ int AdjustMemberCount(uint64_t lobby, int actual_count) {
         g_room_full_reported.store(false, std::memory_order_release);
     }
     return total;
+}
+
+int AdjustMemberCount(uint64_t lobby, int actual_count) {
+    const int count = AdjustSyntheticMemberCount(lobby, actual_count);
+    if (Enabled() && lobby && count > 0 &&
+        g_room_lobby.load(std::memory_order_acquire) == lobby) {
+        g_room_member_count.store(count, std::memory_order_release);
+    }
+    return count;
 }
 
 void ObserveMemberCount(uint64_t lobby, int actual_count) {
@@ -14576,6 +17030,136 @@ bool SelfTest(std::string& report) {
                 "sidecar did not capture P4 loadout before rollback");
         }
 
+        // Redirected parser (0.6.66): six participants. P4 and P5 land in the
+        // plugin blocks; the mission state past +0x24570 is never written,
+        // so local profiles stay intact and all six weapons are valid.
+        {
+            const std::vector<uint8_t> state_before_redirect =
+                fake_loadout_state;
+            const auto sidecars_before_redirect =
+                g_mission_extra_loadout_sidecars;
+            const unsigned parser_calls_before =
+                g_mission_loadout_parser_calls.load(
+                    std::memory_order_acquire);
+            const unsigned protected_calls_before =
+                g_mission_loadout_parser_protected_calls.load(
+                    std::memory_order_acquire);
+            const unsigned oob_calls_before =
+                g_mission_loadout_parser_oob_calls.load(
+                    std::memory_order_acquire);
+            const unsigned fake_calls_before =
+                g_fake_mission_loadout_parser_calls.load(
+                    std::memory_order_acquire);
+            std::memcpy(fake_loadout_state.data() +
+                            kMissionResultParticipantCountOffset,
+                        &participant_count_before_parser,
+                        sizeof(participant_count_before_parser));
+            const std::vector<uint8_t> redirect_expected_state = [&] {
+                std::vector<uint8_t> expected = fake_loadout_state;
+                const int32_t six = 6;
+                std::memcpy(expected.data() +
+                                kMissionResultParticipantCountOffset,
+                            &six, sizeof(six));
+                return expected;
+            }();
+            game_patches::SetMissionLoadoutParserRedirectForTest(true);
+            g_fake_mission_loadout_parser_extra_players.store(
+                2, std::memory_order_release);
+            g_mission_loadout_parser = &FakeMissionLoadoutParser;
+            bool redirect_failed = true;
+            const bool redirect_result =
+                MissionLoadoutParserHook(123, &redirect_failed);
+            g_mission_loadout_parser = nullptr;
+            g_fake_mission_loadout_parser_extra_players.store(
+                1, std::memory_order_release);
+            game_patches::SetMissionLoadoutParserRedirectForTest(false);
+            const MissionExtraLoadoutSidecar p4 =
+                FindMissionExtraLoadoutSidecar(4);
+            const MissionExtraLoadoutSidecar p5 =
+                FindMissionExtraLoadoutSidecar(5);
+            const std::array<int32_t, kMissionLoadoutWeaponCount>
+                expected_p4_weapons = {1040, 1041, 1042, 1043, 1044, 1045};
+            const std::array<int32_t, kMissionLoadoutWeaponCount>
+                expected_p5_weapons = {2050, 2051, 2052, 2053, 2054, 2055};
+            const bool redirect_ok =
+                !redirect_result && !redirect_failed &&
+                fake_loadout_state == redirect_expected_state &&
+                !g_mission_loadout_parser_protection.active &&
+                g_mission_loadout_parser_oob_calls.load(
+                    std::memory_order_acquire) == oob_calls_before &&
+                p4.valid && p4.selected_class == 1 &&
+                p4.weapons == expected_p4_weapons &&
+                p4.weapon_valid_mask == kMissionLoadoutWeaponMask &&
+                p4.armor == 456 &&
+                p5.valid && p5.selected_class == 2 &&
+                p5.weapons == expected_p5_weapons &&
+                p5.weapon_valid_mask == kMissionLoadoutWeaponMask &&
+                p5.armor == 789 &&
+                !FindMissionExtraLoadoutSidecar(6).valid;
+            auto read_i32 = [](const uint8_t* bytes) {
+                int32_t value = 0;
+                std::memcpy(&value, bytes, sizeof(value));
+                return value;
+            };
+            std::array<uint8_t, kMissionClassLoadoutStride> image{};
+            const bool p4_image =
+                CopyMissionExtraLoadoutImage(4, p4.parser_call,
+                                             image.data()) &&
+                image[0x200] == 0x40 && image[0x3e5f] == 0x40 &&
+                read_i32(image.data()) == 1 &&
+                read_i32(image.data() + 4) == 77 &&
+                read_i32(image.data() + kMissionLoadoutArmorOffset) == 456;
+            const bool p5_image =
+                CopyMissionExtraLoadoutImage(5, p5.parser_call,
+                                             image.data()) &&
+                image[0x200] == 0x41 && read_i32(image.data()) == 2 &&
+                read_i32(image.data() + 4) == 78 &&
+                !CopyMissionExtraLoadoutImage(5, p5.parser_call + 1,
+                                              image.data());
+            // Creating P4 on borrowed native block 0 must expose P4's whole
+            // image to the factory, then restore block 0 byte for byte.
+            const std::vector<uint8_t> state_before_install =
+                fake_loadout_state;
+            int dummy_extra_user = 0;
+            const bool installed = InstallTemporaryMissionLoadoutBlock(
+                &dummy_extra_user, 0, 4);
+            const uint8_t* native_block0 =
+                fake_loadout_state.data() + kMissionSelectedLoadoutOffset;
+            const bool image_visible = installed &&
+                native_block0[0x200] == 0x40 &&
+                read_i32(native_block0) == 1 &&
+                read_i32(native_block0 + 4) == 77 &&
+                read_i32(native_block0 + kMissionLoadoutArmorOffset) == 456;
+            const bool block_restored =
+                RestoreTemporaryMissionLoadoutBlock() &&
+                fake_loadout_state == state_before_install;
+            AcquireSRWLockExclusive(&g_mission_extra_loadout_sidecar_lock);
+            g_mission_extra_loadout_image_parser_call.fill(0);
+            ReleaseSRWLockExclusive(&g_mission_extra_loadout_sidecar_lock);
+            if (!p4_image || !p5_image || !image_visible ||
+                !block_restored) {
+                return fail(
+                    "extra player full loadout image was not captured, "
+                    "installed and restored");
+            }
+            std::copy(state_before_redirect.begin(),
+                      state_before_redirect.end(),
+                      fake_loadout_state.begin());
+            AcquireSRWLockExclusive(&g_mission_extra_loadout_sidecar_lock);
+            g_mission_extra_loadout_sidecars = sidecars_before_redirect;
+            ReleaseSRWLockExclusive(&g_mission_extra_loadout_sidecar_lock);
+            g_mission_loadout_parser_calls.store(
+                parser_calls_before, std::memory_order_release);
+            g_mission_loadout_parser_protected_calls.store(
+                protected_calls_before, std::memory_order_release);
+            g_fake_mission_loadout_parser_calls.store(
+                fake_calls_before, std::memory_order_release);
+            if (!redirect_ok) {
+                return fail(
+                    "redirected parser wrote the mission state or lost P4/P5");
+            }
+        }
+
         // Real 0.6.24 reports had no PlayerInfo observation for P4.  Exercise
         // that exact condition and the invalid native class (256/257) that
         // reached the HUD's fixed four-class text table.
@@ -14847,24 +17431,296 @@ bool SelfTest(std::string& report) {
     {
         std::array<uint8_t, 0x10> scroll_model{};
         scroll_model[kUiScrollEnabledOffset] = 1;
-        float initial = 0.5f;
-        std::memcpy(scroll_model.data() + kUiScrollRequestedPositionOffset,
-                    &initial, sizeof(initial));
+        auto set_position = [&](float value) {
+            std::memcpy(scroll_model.data() + kUiScrollRequestedPositionOffset,
+                        &value, sizeof(value));
+        };
+        set_position(0.5f);
         float previous = 0.0f;
         float position = 0.0f;
-        if (!AdjustRosterScrollModel(scroll_model.data(), -1, previous,
-                                     position) ||
+        int anchor_row = 0;
+        // Unknown row count keeps the historical normalized 0.25 step.
+        if (!AdjustRosterScrollModel(scroll_model.data(), -1, -1, previous,
+                                     position, anchor_row) ||
             std::fabs(previous - 0.5f) > 0.0001f ||
-            std::fabs(position - 0.75f) > 0.0001f ||
-            !AdjustRosterScrollModel(scroll_model.data(), 4, previous,
-                                     position) ||
+            std::fabs(position - 0.75f) > 0.0001f || anchor_row != -1 ||
+            !AdjustRosterScrollModel(scroll_model.data(), 4, -1, previous,
+                                     position, anchor_row) ||
             std::fabs(position) > 0.0001f) {
             return fail("PlayersGroup normalized scrolling model failed");
         }
+        // Known rows move exactly one row per detent: 8 rows -> 0.25 per row,
+        // 5 rows -> one detent reaches the end, 6 rows -> 0.5 per row.
+        set_position(0.0f);
+        if (!AdjustRosterScrollModel(scroll_model.data(), -1, 8, previous,
+                                     position, anchor_row) ||
+            anchor_row != 1 || std::fabs(position - 0.25f) > 0.0001f ||
+            !AdjustRosterScrollModel(scroll_model.data(), -3, 5, previous,
+                                     position, anchor_row) ||
+            anchor_row != 1 || std::fabs(position - 1.0f) > 0.0001f ||
+            !AdjustRosterScrollModel(scroll_model.data(), 1, 6, previous,
+                                     position, anchor_row) ||
+            anchor_row != 1 || std::fabs(position - 0.5f) > 0.0001f) {
+            return fail("PlayersGroup row scrolling model failed");
+        }
         scroll_model[kUiScrollEnabledOffset] = 0;
-        if (AdjustRosterScrollModel(scroll_model.data(), -1, previous,
-                                    position)) {
+        if (AdjustRosterScrollModel(scroll_model.data(), -1, 6, previous,
+                                    position, anchor_row)) {
             return fail("scrolling accepted a disabled model");
+        }
+    }
+
+    {
+        // Roster anchor: a fake PlayersGroup layout, scroll model and focus
+        // object drive the real wheel/anchor path through a test clamp.
+        const auto saved_layout_vtable = g_runtime_ui_layout_vtable;
+        const auto saved_focus_vtable = g_runtime_ui_focus_vtable;
+        const auto saved_clamp = g_ui_layout_clamp;
+        const auto saved_layout =
+            g_players_group_layout.load(std::memory_order_acquire);
+        const auto saved_capture =
+            g_players_group_capture_tick.load(std::memory_order_acquire);
+        const auto saved_room_tick =
+            g_last_room_model_tick.load(std::memory_order_acquire);
+        const auto saved_room_lobby =
+            g_room_lobby.load(std::memory_order_acquire);
+        const auto saved_room_members =
+            g_room_member_count.load(std::memory_order_acquire);
+        std::array<void*, 4> fake_layout_vtable{};
+        std::array<void*, 4> fake_focus_vtable{};
+        alignas(16) std::array<uint8_t, 0x280> layout{};
+        alignas(16) std::array<uint8_t, 0x40> focus{};
+        alignas(16) std::array<uint8_t, 0x10> model{};
+        auto** layout_vtable_field = reinterpret_cast<void***>(layout.data());
+        *layout_vtable_field = fake_layout_vtable.data();
+        *reinterpret_cast<uint8_t**>(layout.data() +
+                                     kUiLayoutVerticalScrollOffset) =
+            model.data();
+        *reinterpret_cast<uint8_t**>(layout.data() + kUiLayoutFocusOffset) =
+            focus.data();
+        *reinterpret_cast<void***>(focus.data()) = fake_focus_vtable.data();
+        model[kUiScrollEnabledOffset] = 1;
+        auto requested = [&]() {
+            float value = 0.0f;
+            std::memcpy(&value,
+                        model.data() + kUiScrollRequestedPositionOffset,
+                        sizeof(value));
+            return value;
+        };
+        auto set_requested = [&](float value) {
+            std::memcpy(model.data() + kUiScrollRequestedPositionOffset,
+                        &value, sizeof(value));
+        };
+        auto set_content = [&](float value) {
+            std::memcpy(model.data() + kUiScrollContentExtentOffset, &value,
+                        sizeof(value));
+        };
+        auto refresh_room = [&]() {
+            const uint64_t now = GetTickCount64();
+            g_players_group_capture_tick.store(now, std::memory_order_release);
+            g_last_room_model_tick.store(now, std::memory_order_release);
+        };
+        g_runtime_ui_layout_vtable = fake_layout_vtable.data();
+        g_runtime_ui_focus_vtable = fake_focus_vtable.data();
+        g_ui_layout_clamp = &SelfTestUiLayoutClamp;
+        constexpr uint64_t kAnchorTestLobby = 0x0186000000a5a5a5ULL;
+        g_room_lobby.store(kAnchorTestLobby, std::memory_order_release);
+        g_room_member_count.store(6, std::memory_order_release);
+        g_players_group_layout.store(reinterpret_cast<uintptr_t>(layout.data()),
+                                     std::memory_order_release);
+        ResetRosterScrollAnchor();
+        set_requested(0.0f);
+        set_content(600.0f);
+        refresh_room();
+        MaintainRosterScrollAnchor();
+        g_pending_wheel_detents.store(-1, std::memory_order_release);
+        ApplyPendingWheelScroll();
+        const bool wheel_ok =
+            std::fabs(requested() - 0.5f) < 0.0001f &&
+            g_roster_scroll_anchor_row.load(std::memory_order_acquire) == 1;
+        // A seventh member joins: row 1 of 3 instead of 1.5 rows.
+        g_room_member_count.store(7, std::memory_order_release);
+        refresh_room();
+        MaintainRosterScrollAnchor();
+        const bool join_ok = std::fabs(requested() - 1.0f / 3.0f) < 0.0001f;
+        // The game rebuilds the rows and resets the list to the top.
+        set_requested(0.0f);
+        set_content(700.0f);
+        refresh_room();
+        MaintainRosterScrollAnchor();
+        const bool rebuild_ok =
+            std::fabs(requested() - 1.0f / 3.0f) < 0.0001f;
+        // Focus navigation (gamepad/keyboard) moves the list: followed.
+        g_roster_scroll_rows_changed_tick.store(GetTickCount64() - 10000,
+                                                std::memory_order_release);
+        layout[kUiLayoutFocusAutoScrollOffset] = 1;
+        focus[kUiFocusActiveOffset] = 1;
+        set_requested(2.0f / 3.0f);
+        refresh_room();
+        MaintainRosterScrollAnchor();
+        const bool focus_ok =
+            std::fabs(requested() - 2.0f / 3.0f) < 0.0001f &&
+            g_roster_scroll_anchor_row.load(std::memory_order_acquire) == 2;
+        // A reset without focus navigation (someone changed loadout).
+        focus[kUiFocusActiveOffset] = 0;
+        set_requested(0.0f);
+        refresh_room();
+        MaintainRosterScrollAnchor();
+        const bool reset_ok = std::fabs(requested() - 2.0f / 3.0f) < 0.0001f;
+        // Back to four members: anchor released, native position kept.
+        g_room_member_count.store(4, std::memory_order_release);
+        set_requested(0.0f);
+        refresh_room();
+        MaintainRosterScrollAnchor();
+        const bool fits_ok =
+            std::fabs(requested()) < 0.0001f &&
+            g_roster_scroll_anchor_row.load(std::memory_order_acquire) == -1;
+        // The member count the game reads for the room lobby feeds the rows.
+        const int adjusted = AdjustMemberCount(kAnchorTestLobby, 5);
+        const bool count_ok = adjusted == 5 &&
+            g_room_member_count.load(std::memory_order_acquire) == 5;
+        ResetRosterScrollAnchor();
+        g_players_group_layout.store(saved_layout, std::memory_order_release);
+        g_players_group_capture_tick.store(saved_capture,
+                                           std::memory_order_release);
+        g_last_room_model_tick.store(saved_room_tick,
+                                     std::memory_order_release);
+        g_room_lobby.store(saved_room_lobby, std::memory_order_release);
+        g_room_member_count.store(saved_room_members,
+                                  std::memory_order_release);
+        g_pending_wheel_detents.store(0, std::memory_order_release);
+        g_runtime_ui_layout_vtable = saved_layout_vtable;
+        g_runtime_ui_focus_vtable = saved_focus_vtable;
+        g_ui_layout_clamp = saved_clamp;
+        if (!wheel_ok || !join_ok || !rebuild_ok || !focus_ok || !reset_ok ||
+            !fits_ok || !count_ok) {
+            return fail("PlayersGroup roster scroll anchor failed");
+        }
+    }
+
+    {
+        // Damage meter: projectile->weapon discovery, attribution, two-part
+        // mission continuity, friendly fire and the chat summary.
+        static constexpr uintptr_t kWeaponA = 0x10000010;
+        static constexpr uintptr_t kWeaponB = 0x10000020;
+        g_damage_meter_test_classifier = [](uintptr_t object) {
+            return object == kWeaponA || object == kWeaponB
+                ? DamageMeterClassKind::weapon
+                : DamageMeterClassKind::unknown;
+        };
+        g_projectile_weapon_links.fill({});
+        ResetDamageMeter();
+        alignas(16) std::array<uint8_t, 0x400> projectile_a{};
+        alignas(16) std::array<uint8_t, 0x400> projectile_b{};
+        const uintptr_t class_a = 0x7000;
+        const uintptr_t class_b = 0x7100;
+        std::memcpy(projectile_a.data(), &class_a, sizeof(class_a));
+        std::memcpy(projectile_b.data(), &class_b, sizeof(class_b));
+        std::memcpy(projectile_a.data() + 0x120, &kWeaponA, sizeof(kWeaponA));
+        std::memcpy(projectile_b.data() + 0x88, &kWeaponB, sizeof(kWeaponB));
+        auto* soldier0 = reinterpret_cast<void*>(uintptr_t{0x20000000});
+        auto* soldier1 = reinterpret_cast<void*>(uintptr_t{0x20000100});
+        const uintptr_t enemy = 0x30000000;
+        DamageMeterRegisterSoldier(0, soldier0, nullptr, nullptr);
+        DamageMeterRegisterSoldier(1, soldier1, nullptr, nullptr);
+        for (int shot = 0; shot < 3; ++shot) {
+            DamageMeterRecord(enemy, 0x20000000, 100.0f, projectile_a.data());
+        }
+        DamageMeterRecord(enemy, 0x20000100, 50.0f, projectile_b.data());
+        DamageMeterRecord(enemy, 0x20000000, 20.0f, nullptr);
+        DamageMeterRecord(0x20000100, 0x20000000, 70.0f,
+                          projectile_a.data());  // friendly fire
+        DamageMeterRecord(enemy, 0x40000000, 30.0f, nullptr);  // not a player
+        DamageMeterRecord(enemy, 0x20000000, -5.0f, nullptr);  // heal
+        // Reached ApplyDamage without lowering the health (e.g. invulnerable).
+        DamageMeterRecord(enemy, 0x20000000, 0.0f, nullptr, 40.0f);
+        {
+            // Source side: one damage list with own, friendly, foreign and
+            // heal entries (0xA0 stride; target +0, attacker +0x20, amount
+            // +0x60).
+            alignas(16) std::array<uint8_t, 5 * kDamageEntrySize> entries{};
+            const auto put = [&](size_t index, uintptr_t target,
+                                 uintptr_t attacker, float amount) {
+                uint8_t* entry = entries.data() + index * kDamageEntrySize;
+                std::memcpy(entry + kDamageEntryTargetOffset, &target,
+                            sizeof(target));
+                std::memcpy(entry + kDamageEntryAttackerOffset, &attacker,
+                            sizeof(attacker));
+                std::memcpy(entry + kDamageEntryAmountOffset, &amount,
+                            sizeof(amount));
+            };
+            put(0, enemy, 0x20000000, 100.0f);
+            put(1, 0x20000100, 0x20000000, 70.0f);  // friendly
+            put(2, enemy, 0x40000000, 30.0f);       // not a player
+            put(3, enemy, 0x20000100, 50.0f);
+            put(4, enemy, 0x20000000, -5.0f);       // heal
+            alignas(16) std::array<uint8_t, 0x20> list{};
+            const uint8_t* data = entries.data();
+            const uint64_t count = 5;
+            std::memcpy(list.data() + kDamageListDataOffset, &data,
+                        sizeof(data));
+            std::memcpy(list.data() + kDamageListCountOffset, &count,
+                        sizeof(count));
+            DamageMeterRecordOutgoing(list.data());
+        }
+        DamageMeterOnResult(3);  // two-part mission transition
+        DamageMeterRegisterSoldier(0, soldier0, nullptr, nullptr);
+        DamageMeterRegisterSoldier(1, soldier1, nullptr, nullptr);
+        DamageMeterRecord(enemy, 0x20000000, 100.0f, projectile_a.data());
+        DamageMeterOnResult(kMissionResultClear);
+        DamageMeterRecord(enemy, 0x20000000, 999.0f, nullptr);  // after end
+        DamageMeterState snapshot;
+        AcquireSRWLockExclusive(&g_damage_meter_lock);
+        g_damage_meter.start_tick = 1000;
+        g_damage_meter.end_tick = 11000;
+        snapshot = g_damage_meter;
+        ReleaseSRWLockExclusive(&g_damage_meter_lock);
+        const auto lines = BuildDamageMeterSummary(snapshot, 11000);
+        const bool totals_ok =
+            std::fabs(snapshot.players[0].damage - 420.0) < 0.001 &&
+            snapshot.players[0].weapon_count == 1 &&
+            snapshot.players[0].weapons[0].weapon == kWeaponA &&
+            std::fabs(snapshot.players[0].weapons[0].damage - 400.0) < 0.001 &&
+            std::fabs(snapshot.players[0].unattributed - 20.0) < 0.001 &&
+            std::fabs(snapshot.players[1].damage - 50.0) < 0.001 &&
+            snapshot.players[1].weapon_count == 1 &&
+            snapshot.players[1].weapons[0].weapon == kWeaponB &&
+            snapshot.friendly_hits == 1 &&
+            std::fabs(snapshot.other_damage - 30.0) < 0.001 &&
+            snapshot.ended && snapshot.result == kMissionResultClear &&
+            std::fabs(snapshot.players[0].outgoing - 100.0) < 0.001 &&
+            snapshot.players[0].outgoing_hits == 1 &&
+            std::fabs(snapshot.players[1].outgoing - 50.0) < 0.001 &&
+            snapshot.players[1].outgoing_hits == 1 &&
+            std::fabs(snapshot.players[0].received_amount - 40.0) < 0.001 &&
+            snapshot.players[0].zero_loss_hits == 1;
+        const bool summary_ok = lines.size() == 5 &&
+            lines[0] == L"[DPS] Mission: 10s - damage dealt per player" &&
+            lines[1] == L"P1: 42/s (420, 89%)" &&
+            lines[2] == L"  Weapon 1 40/s, other 2/s" &&
+            lines[3] == L"P2: 5/s (50, 11%)" &&
+            lines[4] == L"  Weapon 1 5/s";
+        // A re-created participant without a pending transition starts a
+        // new measurement (previous mission abandoned).
+        DamageMeterRegisterSoldier(0, soldier0, nullptr, nullptr);
+        DamageMeterRecord(enemy, 0x20000000, 10.0f, nullptr);
+        AcquireSRWLockShared(&g_damage_meter_lock);
+        const bool restart_ok =
+            std::fabs(g_damage_meter.players[0].damage - 10.0) < 0.001 &&
+            !g_damage_meter.ended;
+        ReleaseSRWLockShared(&g_damage_meter_lock);
+        const bool amounts_ok = FormatDamageAmount(9999.4) == L"9999" &&
+            FormatDamageAmount(152340.0) == L"152k" &&
+            FormatDamageAmount(2450000.0) == L"2.5M";
+        std::array<char, kDamageMeterLabelLength> label{};
+        DamageMeterLabelFromTypeName(".?AVWeapon_Gatling@@", label);
+        const bool label_ok = std::strcmp(label.data(), "Gatling") == 0;
+        g_damage_meter_test_classifier = nullptr;
+        g_projectile_weapon_links.fill({});
+        ResetDamageMeter();
+        if (!totals_ok || !summary_ok || !restart_ok || !amounts_ok ||
+            !label_ok) {
+            return fail("damage meter attribution or summary failed");
         }
     }
 
@@ -15002,6 +17858,65 @@ bool SelfTest(std::string& report) {
     NotifyCreateLobby(4, static_cast<int>(MaxPlayers()));
     ObserveLobbyDataWrite(test_lobby, "public_slot");
     ObserveMemberCount(test_lobby, 1);
+    {
+        // Room visibility: friends-only stays private and lists friend
+        // seats; a public room advertises MaxPlayers seats and stays Public
+        // until full. Uses the real rewrite and lobby-type policy.
+        const long max_players = static_cast<long>(MaxPlayers());
+        const long extra = max_players - 4;
+        auto rewrite = [&](const char* key, const char* value) {
+            std::string out;
+            return RewriteLobbyData(test_lobby, key, value, out)
+                ? out : std::string(value);
+        };
+        const int saved_members =
+            g_room_member_count.load(std::memory_order_acquire);
+        const std::string friends_public = rewrite("public_slot", "1");
+        const std::string friends_private = rewrite("private_slot", "3");
+        const std::string friends_open = rewrite("open_public", "0");
+        // Fifth member: the native count underflows to -1 and asks Public.
+        const std::string friends_open_underflow =
+            rewrite("open_public", "-1");
+        const int friends_type_initial =
+            AdjustLobbyType(test_lobby, kSteamLobbyTypePrivate);
+        const int friends_type_underflow =
+            AdjustLobbyType(test_lobby, kSteamLobbyTypePublic);
+        const bool friends_ok = friends_public == "1" &&
+            friends_private == std::to_string(3 + extra) &&
+            friends_open == "0" && friends_open_underflow == "0" &&
+            friends_type_initial == kSteamLobbyTypePrivate &&
+            friends_type_underflow == kSteamLobbyTypePrivate;
+        const std::string public_slots = rewrite("public_slot", "4");
+        const std::string public_private = rewrite("private_slot", "0");
+        const std::string public_open = rewrite("open_public", "3");
+        const std::string public_open_five = rewrite("open_public", "-1");
+        g_room_member_count.store(4, std::memory_order_release);
+        const int public_type_four =
+            AdjustLobbyType(test_lobby, kSteamLobbyTypePrivate);
+        g_room_member_count.store(static_cast<int>(max_players),
+                                  std::memory_order_release);
+        const int public_type_full =
+            AdjustLobbyType(test_lobby, kSteamLobbyTypePrivate);
+        g_room_member_count.store(saved_members, std::memory_order_release);
+        const bool public_ok =
+            public_slots == std::to_string(4 + extra) &&
+            public_private == "0" &&
+            public_open == std::to_string(3 + extra) &&
+            public_open_five == std::to_string(extra - 1) &&
+            public_type_four == (extra > 0 ? kSteamLobbyTypePublic
+                                           : kSteamLobbyTypePrivate) &&
+            public_type_full == kSteamLobbyTypePrivate;
+        std::string ignored;
+        const bool foreign_ok =
+            !RewriteLobbyData(test_lobby + 1, "open_public", "0", ignored) &&
+            AdjustLobbyType(test_lobby + 1, kSteamLobbyTypePublic) ==
+                kSteamLobbyTypePublic;
+        g_owned_lobby_native_public_slots.store(-1,
+                                                std::memory_order_release);
+        if (!friends_ok || !public_ok || !foreign_ok) {
+            return fail("room visibility policy failed");
+        }
+    }
     CaptureLocalMemberData("usr76561198000000001", "selftest-member-data");
     for (unsigned i = 0; i < desired_bots; ++i) {
         if (!TryAddBot(test_lobby, false)) return fail("sequential addition rejected");
@@ -15242,10 +18157,11 @@ bool SelfTest(std::string& report) {
     g_mission_update = &FakeMissionUpdate;
     std::array<void*, 11> hotkey_ready_vtable{};
     hotkey_ready_vtable[10] = reinterpret_cast<void*>(&FakeUserIdGetter);
-    std::array<FakeReadyUser, 5> hotkey_ready_users{};
+    std::array<FakeReadyUser, kLocalMissionHarnessMaximumDummies + 1>
+        hotkey_ready_users{};
     hotkey_ready_users[0].vtable = hotkey_ready_vtable.data();
     hotkey_ready_users[0].steam_id = local_id;
-    for (unsigned i = 0; i < 4; ++i) {
+    for (unsigned i = 0; i < kLocalMissionHarnessMaximumDummies; ++i) {
         hotkey_ready_users[i + 1].vtable = hotkey_ready_vtable.data();
         hotkey_ready_users[i + 1].steam_id = BotSteamId(i);
     }
@@ -15683,6 +18599,63 @@ bool SelfTest(std::string& report) {
         static_cast<int>(MissionResultSyncOrigin::Script),
         std::memory_order_release);
     FakeMissionResultSyncState fake_sync_state{};
+    {
+        // The native sink assigns its slot. An extra delivered first must
+        // survive the later native write, and re-sent Items must not be
+        // counted twice (P4 = slot 0, P5 = slot 1).
+        auto item_of = [](uint32_t field0, uint32_t field1) {
+            const std::array<uint32_t, 2> fields = {field0, field1};
+            uint64_t value = 0;
+            std::memcpy(&value, fields.data(), sizeof(value));
+            return value;
+        };
+        auto slot_fields = [&](unsigned slot) {
+            std::array<uint32_t, 2> fields{};
+            std::memcpy(fields.data(),
+                        fake_reward_state.data() +
+                            kMissionResultItemArrayOffset +
+                            slot * kMissionResultItemSize,
+                        sizeof(fields));
+            return fields;
+        };
+        std::memset(fake_reward_state.data() + kMissionResultItemArrayOffset,
+                    0,
+                    kMissionResultNativeItemCount * kMissionResultItemSize);
+        ResetMissionResultItemFold();
+        int32_t p0 = 0;
+        int32_t p1 = 1;
+        int32_t p4 = 4;
+        int32_t p5 = 5;
+        const uint64_t p0_item = item_of(1, 10);
+        const uint64_t p1_item = item_of(2, 20);
+        const uint64_t p4_item = item_of(5, 50);
+        const uint64_t p5_item = item_of(7, 70);
+        MissionResultItemSinkHook(nullptr, &p4, &p4_item);  // extra first
+        MissionResultItemSinkHook(nullptr, &p0, &p0_item);  // native erases
+        MissionResultItemSinkHook(nullptr, &p4, &p4_item);  // duplicate
+        MissionResultItemSinkHook(nullptr, &p0, &p0_item);  // duplicate
+        MissionResultItemSinkHook(nullptr, &p1, &p1_item);  // native first
+        MissionResultItemSinkHook(nullptr, &p5, &p5_item);
+        const auto slot0 = slot_fields(0);
+        const auto slot1 = slot_fields(1);
+        const auto slot2 = slot_fields(2);
+        std::memset(fake_reward_state.data() + kMissionResultItemArrayOffset,
+                    0,
+                    kMissionResultNativeItemCount * kMissionResultItemSize);
+        ResetMissionResultItemFold();
+        g_fake_mission_result_item_sink_calls.store(
+            0, std::memory_order_release);
+        g_mission_result_item_mask.store(0, std::memory_order_release);
+        g_mission_result_extra_item_mask.store(0, std::memory_order_release);
+        g_mission_result_extra_item_calls.store(0, std::memory_order_release);
+        g_mission_result_extra_item_aggregated_calls.store(
+            0, std::memory_order_release);
+        if (slot0[0] != 6 || slot0[1] != 60 || slot1[0] != 9 ||
+            slot1[1] != 90 || slot2[0] != 0 || slot2[1] != 0) {
+            return fail("result Item fold depended on delivery order or "
+                        "counted a re-sent Item twice");
+        }
+    }
     for (int32_t participant = 0;
          participant <
              static_cast<int32_t>(kMissionResultNativeItemCount);
@@ -15730,6 +18703,44 @@ bool SelfTest(std::string& report) {
                 &corrupted_local_profiles,
                 sizeof(corrupted_local_profiles));
     const bool fake_reward_native_result = MissionRewardApplyHook(true);
+    if constexpr (build_config::kDiagnostics) {
+        // The resolve hook snapshotted the local profile; one field changed
+        // afterwards (+34 at offset 0xF8) must be the only reported change.
+        auto* profile_field = fake_reward_state.data() +
+            kMissionLocalProfileBaseOffset + 0xf8;
+        int32_t field_before = 0;
+        std::memcpy(&field_before, profile_field, sizeof(field_before));
+        const int32_t field_after = field_before + 34;
+        std::memcpy(profile_field, &field_after, sizeof(field_after));
+        const std::string profile_diff = MissionLocalProfileDiffJson();
+        const std::string armor_context = MissionArmorContextJson();
+        std::memcpy(profile_field, &field_before, sizeof(field_before));
+        const int32_t profile_class = [&] {
+            int32_t value = 0;
+            std::memcpy(&value, fake_reward_state.data() +
+                                    kMissionLocalProfileBaseOffset,
+                        sizeof(value));
+            return value;
+        }();
+        if (armor_context.find("\"profile_classes\":[" +
+                               std::to_string(profile_class) + "]") ==
+                std::string::npos ||
+            armor_context.find("\"profile_class_armor\":[[" +
+                               std::to_string(field_after) + ",") ==
+                std::string::npos ||
+            armor_context.find("\"class_armor_totals_before\":[") ==
+                std::string::npos) {
+            return fail("armor context did not report profile class/armor");
+        }
+        const std::string expected_change = "[0,248," +
+            std::to_string(field_before) + "," +
+            std::to_string(field_after) + "]";
+        if (profile_diff.find(expected_change) == std::string::npos ||
+            profile_diff.find("\"changed_dwords\":1,") ==
+                std::string::npos) {
+            return fail("local profile diff did not isolate the changed field");
+        }
+    }
     g_mission_result_sync_test_origin.store(-1,
                                              std::memory_order_release);
     if (!fake_exec_queued || !fake_exec_accepted ||
@@ -16018,6 +19029,40 @@ bool SelfTest(std::string& report) {
         harness_name != "Harness Dummy 4") {
         return fail("P4 dummy did not receive an isolated harness name");
     }
+    // Continue through the P5-P7 probes. Each press adds exactly one dummy,
+    // which must be Ready with l1/l2 and carry its own harness name.
+    for (unsigned target = kLocalMissionHarnessProbeDummies + 1;
+         target <= kLocalMissionHarnessMaximumDummies; ++target) {
+        g_local_mission_harness_hotkey_test_override.store(
+            0, std::memory_order_release);
+        Sleep(100);
+        g_local_mission_harness_hotkey_test_override.store(
+            1, std::memory_order_release);
+        if (!wait_for_harness(target) ||
+            !LocalMissionHarnessSessionReady() ||
+            hotkey_ready_users[target].ready.load(
+                std::memory_order_acquire) != 1 ||
+            !hotkey_ready_users[target].cm_ready.load(
+                std::memory_order_acquire) ||
+            !hotkey_ready_users[target].ds_ready.load(
+                std::memory_order_acquire)) {
+            return fail("F3 did not create the next local P5-P7 probe");
+        }
+        if (!TryGetBotName(BotSteamId(target - 1), harness_name) ||
+            harness_name != "Harness Dummy " + std::to_string(target)) {
+            return fail("P5-P7 dummy did not receive an isolated name");
+        }
+    }
+    if (NextLocalMissionHarnessTarget(0, 5) !=
+            kLocalMissionHarnessBaselineDummies ||
+        NextLocalMissionHarnessTarget(kLocalMissionHarnessProbeDummies, 5) !=
+            0 ||
+        NextLocalMissionHarnessTarget(5, 6) != 0 ||
+        NextLocalMissionHarnessTarget(5, 8) != 6 ||
+        NextLocalMissionHarnessTarget(kLocalMissionHarnessMaximumDummies,
+                                      8) != 0) {
+        return fail("F3 cycle does not respect MaxPlayers");
+    }
     g_local_mission_harness_hotkey_test_override.store(
         0, std::memory_order_release);
     Sleep(100);
@@ -16025,7 +19070,7 @@ bool SelfTest(std::string& report) {
         1, std::memory_order_release);
     if (!wait_for_harness(0) ||
         g_mission_groups_pending.load(std::memory_order_acquire)) {
-        return fail("third F3 did not disable and empty the harness");
+        return fail("F3 after host+7 did not disable and empty the harness");
     }
     g_local_mission_harness_hotkey_test_override.store(
         0, std::memory_order_release);
@@ -16033,7 +19078,7 @@ bool SelfTest(std::string& report) {
     g_ready_user_test_mode.store(false, std::memory_order_release);
     Stop();
     reset_state();
-    report = "ok: dynamic room up to 8/8; one native local EDF5_MultiSlotMod/version banner per create/join without identity or Steam send; PlayerInfo RAX preserved; P4-P7 parser safely captures sidecars, accepts valid count despite false return, masks overlapping weapon and restores out-of-range blocks without losing participants/rewards; extra class uses PlayerInfo/sidecar within 0..3; direct/fallback UserImpl source; fifth-player scratch synthesizes/restores class-weapons-armor and restores the unique index before map consumers; private distinct PlayerInfo name tokens/source indices; isolated per-participant sender/owner correlation without real chat text; registered order/local subset and participant-control assignment; replication detects duplicate UserImpl; dynamic receive table detects missing/duplicate P0 route and per-participant 0x3300/0x3400; runtime spawn multiplies 10->20, repairs 0/4 during call, restores zero and preserves concurrent mutation; GeneratorPoll preserves Update and RAX/AL, correlates update/base/gate/spawn/boundary and classifies cooldown/quota/false/accepted returns; native host-only recovery publishes UI event 1/2, closes object id 2 and returns effective result 1; independent Exec_Begin/Sync_MissionResult/ResolveResult/ApplyResult pipeline checks extra Items mask, defensively restores local count 0->1 before rewards, proves native Exec_Begin cancels the queue without requeue/duplication and new generations discard all previous mission state; Local Mission Harness F3 cycles host+3/host+4/off with distinct UserImpl, Ready, early l1/l2, preceding controller gate limited to states 1..5 and zero real peers, fail-closed global Matching 4->5 without fabricated packets and local result sync; loadout, PlayersGroup, callbacks, P2P, authentication and F8/F7/F6/F5/wheel validated";
+    report = "ok: dynamic room up to 8/8; one native local EDF5_MultiSlotMod/version banner per create/join without identity or Steam send; PlayerInfo RAX preserved; P4-P7 parser safely captures sidecars (six players redirected to plugin blocks without writing the mission state), accepts valid count despite false return, masks overlapping weapon and restores out-of-range blocks without losing participants/rewards; extra class uses PlayerInfo/sidecar within 0..3; direct/fallback UserImpl source; fifth-player scratch synthesizes/restores class-weapons-armor and restores the unique index before map consumers; private distinct PlayerInfo name tokens/source indices; isolated per-participant sender/owner correlation without real chat text; registered order/local subset and participant-control assignment; replication detects duplicate UserImpl; dynamic receive table detects missing/duplicate P0 route and per-participant 0x3300/0x3400; runtime spawn multiplies 10->20, repairs 0/4 during call, restores zero and preserves concurrent mutation; GeneratorPoll preserves Update and RAX/AL, correlates update/base/gate/spawn/boundary and classifies cooldown/quota/false/accepted returns; native host-only recovery publishes UI event 1/2, closes object id 2 and returns effective result 1; independent Exec_Begin/Sync_MissionResult/ResolveResult/ApplyResult pipeline checks extra Items mask, defensively restores local count 0->1 before rewards, proves native Exec_Begin cancels the queue without requeue/duplication and new generations discard all previous mission state; Local Mission Harness F3 cycles host+3/host+4/host+5/host+6/host+7/off within MaxPlayers with distinct UserImpl, Ready, early l1/l2, preceding controller gate limited to states 1..5 and zero real peers, fail-closed global Matching 4->5 without fabricated packets and local result sync; loadout, PlayersGroup, callbacks, P2P, authentication and F8/F7/F6/F5/wheel validated";
     return true;
 }
 

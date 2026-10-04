@@ -26,6 +26,15 @@ using MiniDumpWriteDumpFn = BOOL(WINAPI*)(
     HANDLE, DWORD, HANDLE, MINIDUMP_TYPE,
     const MINIDUMP_EXCEPTION_INFORMATION*, const MINIDUMP_USER_STREAM_INFORMATION*,
     const MINIDUMP_CALLBACK_INFORMATION*);
+using StackWalk64Fn = BOOL(WINAPI*)(
+    DWORD, HANDLE, HANDLE, LPSTACKFRAME64, PVOID,
+    PREAD_PROCESS_MEMORY_ROUTINE64, PFUNCTION_TABLE_ACCESS_ROUTINE64,
+    PGET_MODULE_BASE_ROUTINE64, PTRANSLATE_ADDRESS_ROUTINE64);
+
+// Crash JSON stack frames are module+RVA pairs only: they survive report
+// sanitization and can be resolved offline against the pinned EDF5.exe or
+// the plugin PDB without sharing absolute addresses.
+constexpr unsigned kMaxCrashStackFrames = 48;
 
 struct BreadcrumbSlot {
     std::atomic_flag writing = ATOMIC_FLAG_INIT;
@@ -68,7 +77,9 @@ HANDLE g_snapshot_event = nullptr;
 HANDLE g_worker_thread = nullptr;
 HANDLE g_hotkey_thread = nullptr;
 HMODULE g_dbghelp = nullptr;
+HMODULE g_plugin_module = nullptr;
 MiniDumpWriteDumpFn g_minidump_write = nullptr;
+StackWalk64Fn g_stack_walk = nullptr;
 LPTOP_LEVEL_EXCEPTION_FILTER g_previous_filter = nullptr;
 PVOID g_vectored_handler = nullptr;
 CrashJob g_crash_job{};
@@ -89,6 +100,7 @@ void ReleaseCrashResources() {
     if (g_dbghelp) FreeLibrary(g_dbghelp);
     g_dbghelp = nullptr;
     g_minidump_write = nullptr;
+    g_stack_walk = nullptr;
 }
 
 bool FailInitialization() {
@@ -257,6 +269,151 @@ void AddressInfo(uintptr_t address, wchar_t* module_name,
     module_name[module_capacity - 1] = L'\0';
 }
 
+// dbghelp's unwinder reads the stack through this callback. ReadProcessMemory
+// fails cleanly on a corrupted frame instead of faulting inside the crash
+// writer, so a smashed stack only truncates the trace.
+BOOL CALLBACK SafeStackRead(HANDLE process, DWORD64 address, PVOID buffer,
+                            DWORD size, LPDWORD bytes_read) {
+    SIZE_T copied = 0;
+    const BOOL ok = ReadProcessMemory(
+        process, reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(address)),
+        buffer, size, &copied);
+    if (bytes_read) *bytes_read = static_cast<DWORD>(copied);
+    return ok && copied == size;
+}
+
+PVOID CALLBACK StackFunctionTable(HANDLE, DWORD64 address) {
+    DWORD64 image_base = 0;
+    return RtlLookupFunctionEntry(address, &image_base, nullptr);
+}
+
+DWORD64 CALLBACK StackModuleBase(HANDLE, DWORD64 address) {
+    DWORD64 image_base = 0;
+    if (RtlLookupFunctionEntry(address, &image_base, nullptr)) {
+        return image_base;
+    }
+    MEMORY_BASIC_INFORMATION information{};
+    if (VirtualQuery(reinterpret_cast<void*>(static_cast<uintptr_t>(address)),
+                     &information, sizeof(information)) &&
+        information.Type == MEM_IMAGE) {
+        return reinterpret_cast<DWORD64>(information.AllocationBase);
+    }
+    return 0;
+}
+
+// Writes `"stack_frames":[{"module":"EDF5.exe","rva":N,"rva_hex":"0x.."},...]`
+// for the faulting thread. Runs on the crash worker only: dbghelp is not
+// thread-safe and the worker is its single user (dumps included).
+bool AdvanceFormatted(size_t& used, size_t capacity, int wrote) {
+    if (wrote <= 0 || used >= capacity ||
+        static_cast<size_t>(wrote) >= capacity - used) {
+        return false;
+    }
+    used += static_cast<size_t>(wrote);
+    return true;
+}
+
+void BuildStackFramesJson(char* output, size_t capacity,
+                          const CONTEXT& start, DWORD thread_id) {
+    size_t used = 0;
+    AdvanceFormatted(used, capacity,
+                     std::snprintf(output, capacity, "\"stack_frames\":["));
+    unsigned frames = 0;
+    bool truncated = false;
+    if (g_stack_walk) {
+        CONTEXT context = start;
+        STACKFRAME64 frame{};
+        frame.AddrPC.Offset = context.Rip;
+        frame.AddrPC.Mode = AddrModeFlat;
+        frame.AddrStack.Offset = context.Rsp;
+        frame.AddrStack.Mode = AddrModeFlat;
+        frame.AddrFrame.Offset = context.Rbp;
+        frame.AddrFrame.Mode = AddrModeFlat;
+        HANDLE thread = OpenThread(THREAD_QUERY_INFORMATION |
+                                       THREAD_GET_CONTEXT,
+                                   FALSE, thread_id);
+        uint64_t previous_pc = 0;
+        uint64_t previous_sp = 0;
+        while (frames < kMaxCrashStackFrames &&
+               g_stack_walk(IMAGE_FILE_MACHINE_AMD64, GetCurrentProcess(),
+                            thread ? thread : GetCurrentThread(), &frame,
+                            &context, SafeStackRead, StackFunctionTable,
+                            StackModuleBase, nullptr)) {
+            const uint64_t pc = frame.AddrPC.Offset;
+            const uint64_t sp = frame.AddrStack.Offset;
+            if (!pc || (pc == previous_pc && sp == previous_sp)) break;
+            previous_pc = pc;
+            previous_sp = sp;
+            wchar_t module[64]{};
+            uintptr_t rva = 0;
+            AddressInfo(static_cast<uintptr_t>(pc), module, std::size(module),
+                        rva);
+            if (used >= capacity ||
+                !AdvanceFormatted(
+                    used, capacity,
+                    std::snprintf(output + used, capacity - used,
+                                  "%s{\"module\":\"%ls\",\"rva\":%llu,"
+                                  "\"rva_hex\":\"0x%llx\"}",
+                                  frames ? "," : "", module,
+                                  static_cast<unsigned long long>(rva),
+                                  static_cast<unsigned long long>(rva)))) {
+                truncated = true;
+                break;
+            }
+            ++frames;
+        }
+        if (thread) CloseHandle(thread);
+        if (frames == kMaxCrashStackFrames) truncated = true;
+    }
+    if (used >= capacity ||
+        !AdvanceFormatted(
+            used, capacity,
+            std::snprintf(output + used, capacity - used,
+                          "],\r\n  \"stack_frame_count\":%u,"
+                          "\r\n  \"stack_walk_available\":%s,"
+                          "\r\n  \"stack_frames_truncated\":%s",
+                          frames, g_stack_walk ? "true" : "false",
+                          truncated ? "true" : "false"))) {
+        std::snprintf(output, capacity,
+                      "\"stack_frames\":[],\r\n  \"stack_frame_count\":0,"
+                      "\r\n  \"stack_walk_available\":false,"
+                      "\r\n  \"stack_frames_truncated\":true");
+    }
+}
+
+void BuildRegistersJson(char* output, size_t capacity,
+                        const CONTEXT& context) {
+    std::snprintf(
+        output, capacity,
+        "\"instruction_pointer\":\"0x%llx\",\r\n"
+        "  \"stack_pointer\":\"0x%llx\",\r\n"
+        "  \"frame_pointer\":\"0x%llx\",\r\n"
+        "  \"register_rax\":\"0x%llx\",\"register_rbx\":\"0x%llx\","
+        "\"register_rcx\":\"0x%llx\",\"register_rdx\":\"0x%llx\",\r\n"
+        "  \"register_rsi\":\"0x%llx\",\"register_rdi\":\"0x%llx\","
+        "\"register_r8\":\"0x%llx\",\"register_r9\":\"0x%llx\",\r\n"
+        "  \"register_r10\":\"0x%llx\",\"register_r11\":\"0x%llx\","
+        "\"register_r12\":\"0x%llx\",\"register_r13\":\"0x%llx\",\r\n"
+        "  \"register_r14\":\"0x%llx\",\"register_r15\":\"0x%llx\"",
+        static_cast<unsigned long long>(context.Rip),
+        static_cast<unsigned long long>(context.Rsp),
+        static_cast<unsigned long long>(context.Rbp),
+        static_cast<unsigned long long>(context.Rax),
+        static_cast<unsigned long long>(context.Rbx),
+        static_cast<unsigned long long>(context.Rcx),
+        static_cast<unsigned long long>(context.Rdx),
+        static_cast<unsigned long long>(context.Rsi),
+        static_cast<unsigned long long>(context.Rdi),
+        static_cast<unsigned long long>(context.R8),
+        static_cast<unsigned long long>(context.R9),
+        static_cast<unsigned long long>(context.R10),
+        static_cast<unsigned long long>(context.R11),
+        static_cast<unsigned long long>(context.R12),
+        static_cast<unsigned long long>(context.R13),
+        static_cast<unsigned long long>(context.R14),
+        static_cast<unsigned long long>(context.R15));
+}
+
 MINIDUMP_TYPE DumpType(bool full) {
     ULONG flags = MiniDumpNormal | MiniDumpWithThreadInfo |
                   MiniDumpWithUnloadedModules |
@@ -414,7 +571,14 @@ void WriteCrashArtifacts() {
     const capture::RuntimeState state = capture::GetRuntimeState();
     char runtime[1024]{};
     BuildRuntimeJson(runtime, sizeof(runtime), state);
-    char json[8192]{};
+    char registers[1024]{};
+    BuildRegistersJson(registers, sizeof(registers), g_crash_job.context);
+    // The first write must not depend on unwinding: the stack is walked only
+    // after the basic context is on disk and is added by the final write.
+    char stack_frames[8192]{};
+    std::snprintf(stack_frames, sizeof(stack_frames),
+                  "\"stack_frames\":[],\r\n  \"stack_frames_pending\":true");
+    char json[16384]{};
     int length = std::snprintf(
         json, sizeof(json),
         "{\r\n  \"schema\":2,\r\n  \"kind\":\"crash\",\r\n"
@@ -426,6 +590,7 @@ void WriteCrashArtifacts() {
         "  \"module_rva\":%llu,\r\n  \"hook\":{\"component\":"
         "\"%s\",\"operation\":\"%s\",\"phase\":\"%s\","
         "\"value_a\":%llu,\"value_b\":%llu},\r\n  %s,\r\n"
+        "  %s,\r\n  %s,\r\n"
         "  \"dump_requested\":%s,\r\n  \"dump_ok\":false\r\n}\r\n",
         utc, GetCurrentProcessId(), g_crash_job.thread_id,
         g_crash_job.record.ExceptionCode, g_crash_job.record.ExceptionFlags,
@@ -439,12 +604,15 @@ void WriteCrashArtifacts() {
         g_crash_job.hook.operation, g_crash_job.hook.phase,
         static_cast<unsigned long long>(g_crash_job.hook.value_a),
         static_cast<unsigned long long>(g_crash_job.hook.value_b), runtime,
+        registers, stack_frames,
         capture::GetConfig().crash_dump_mode == capture::CrashDumpMode::Off
             ? "false"
             : "true");
     WriteText(json_path, json, FormattedTextSize(length, sizeof(json)));
     bool breadcrumb_ok = WriteBreadcrumbFile(breadcrumb_path);
     DWORD breadcrumb_error = breadcrumb_ok ? ERROR_SUCCESS : GetLastError();
+    BuildStackFramesJson(stack_frames, sizeof(stack_frames),
+                         g_crash_job.context, g_crash_job.thread_id);
 
     const capture::CrashDumpMode dump_mode =
         capture::GetConfig().crash_dump_mode;
@@ -476,6 +644,7 @@ void WriteCrashArtifacts() {
         "  \"module_rva\":%llu,\r\n  \"hook\":{\"component\":"
         "\"%s\",\"operation\":\"%s\",\"phase\":\"%s\","
         "\"value_a\":%llu,\"value_b\":%llu},\r\n  %s,\r\n"
+        "  %s,\r\n  %s,\r\n"
         "  \"dump_mode\":\"%s\",\r\n  \"dump_ok\":%s,\r\n"
         "  \"breadcrumbs_ok\":%s,\r\n"
         "  \"breadcrumbs_win32_error\":%lu,\r\n"
@@ -492,6 +661,7 @@ void WriteCrashArtifacts() {
         g_crash_job.hook.operation, g_crash_job.hook.phase,
         static_cast<unsigned long long>(g_crash_job.hook.value_a),
         static_cast<unsigned long long>(g_crash_job.hook.value_b), runtime,
+        registers, stack_frames,
         dump_mode_name, dump_ok ? "true" : "false",
         breadcrumb_ok ? "true" : "false", breadcrumb_error,
         dump_file_json);
@@ -633,8 +803,7 @@ uintptr_t MainImageRva(uintptr_t address) {
     return address - image_base;
 }
 
-uintptr_t MainImageCodeRva(uintptr_t address) {
-    auto* base = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
+uintptr_t ImageCodeRva(const uint8_t* base, uintptr_t address) {
     if (!base) return 0;
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
     if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0) return 0;
@@ -659,6 +828,18 @@ uintptr_t MainImageCodeRva(uintptr_t address) {
         }
     }
     return 0;
+}
+
+uintptr_t MainImageCodeRva(uintptr_t address) {
+    return ImageCodeRva(
+        reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr)), address);
+}
+
+// Hooks run inside game frames, so a fault in the plugin (or a return into
+// it) must be visible in the first-chance scan as well.
+uintptr_t PluginCodeRva(uintptr_t address) {
+    return ImageCodeRva(reinterpret_cast<const uint8_t*>(g_plugin_module),
+                        address);
 }
 
 const char* AccessType(const EXCEPTION_RECORD* record) {
@@ -692,12 +873,13 @@ void WriteFirstChanceEmergency(EXCEPTION_POINTERS* pointers) {
             record->ExceptionInformation[1]);
     }
     constexpr size_t kEmergencyStackBytes = 0x800;
-    constexpr size_t kEmergencyCodeCandidateCount = 8;
+    constexpr size_t kEmergencyCodeCandidateCount = 16;
     std::array<uintptr_t,
                kEmergencyStackBytes / sizeof(uintptr_t)> stack_words{};
     std::array<uintptr_t, 4> return_addresses{};
     std::array<uintptr_t, kEmergencyCodeCandidateCount> stack_code_rvas{};
     std::array<size_t, kEmergencyCodeCandidateCount> stack_code_offsets{};
+    std::array<bool, kEmergencyCodeCandidateCount> stack_code_plugin{};
     SIZE_T stack_bytes = 0;
 #if defined(_M_X64) || defined(__x86_64__)
     ReadProcessMemory(GetCurrentProcess(),
@@ -712,13 +894,19 @@ void WriteFirstChanceEmergency(EXCEPTION_POINTERS* pointers) {
     for (size_t index = 0;
          index < words_read &&
              stack_code_count < stack_code_rvas.size(); ++index) {
-        const uintptr_t candidate_rva = MainImageCodeRva(stack_words[index]);
+        uintptr_t candidate_rva = MainImageCodeRva(stack_words[index]);
+        bool plugin_candidate = false;
+        if (!candidate_rva) {
+            candidate_rva = PluginCodeRva(stack_words[index]);
+            plugin_candidate = candidate_rva != 0;
+        }
         if (!candidate_rva) continue;
         stack_code_rvas[stack_code_count] = candidate_rva;
         stack_code_offsets[stack_code_count] = index * sizeof(uintptr_t);
+        stack_code_plugin[stack_code_count] = plugin_candidate;
         ++stack_code_count;
     }
-    char stack_code_json[1024]{};
+    char stack_code_json[2048]{};
     size_t stack_code_json_used = 0;
     stack_code_json_used += static_cast<size_t>(std::snprintf(
         stack_code_json, sizeof(stack_code_json), "["));
@@ -727,9 +915,12 @@ void WriteFirstChanceEmergency(EXCEPTION_POINTERS* pointers) {
         const int wrote = std::snprintf(
             stack_code_json + stack_code_json_used,
             sizeof(stack_code_json) - stack_code_json_used,
-            "%s{\"stack_offset\":%llu,\"module_rva\":%llu}",
+            "%s{\"stack_offset\":%llu,\"module\":\"%s\","
+            "\"module_rva\":%llu,\"rva_hex\":\"0x%llx\"}",
             index ? "," : "",
             static_cast<unsigned long long>(stack_code_offsets[index]),
+            stack_code_plugin[index] ? "plugin" : "main",
+            static_cast<unsigned long long>(stack_code_rvas[index]),
             static_cast<unsigned long long>(stack_code_rvas[index]));
         if (wrote <= 0) break;
         stack_code_json_used += std::min<size_t>(
@@ -980,9 +1171,10 @@ void HookScope::Phase(const char* phase, uint64_t value_a, uint64_t value_b) {
                value_a, value_b);
 }
 
-bool Initialize(HMODULE) {
+bool Initialize(HMODULE plugin_module) {
     if (g_initialized.exchange(true, std::memory_order_acq_rel)) return true;
     g_stopped.store(false, std::memory_order_release);
+    g_plugin_module = plugin_module;
     if (!capture::GetConfig().diagnostics_enabled ||
         capture::SessionDirectory().empty())
         return true;
@@ -999,6 +1191,7 @@ bool Initialize(HMODULE) {
     g_dbghelp = LoadLibraryW(L"dbghelp.dll");
     g_minidump_write = Resolve<MiniDumpWriteDumpFn>(
         g_dbghelp, "MiniDumpWriteDump");
+    g_stack_walk = Resolve<StackWalk64Fn>(g_dbghelp, "StackWalk64");
     g_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_crash_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_crash_done_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);

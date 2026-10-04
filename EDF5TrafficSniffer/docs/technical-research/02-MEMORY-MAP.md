@@ -148,9 +148,17 @@ PlayersGroup is a `ui::Layout`, not an HUiScrollBar:
 - Vertical model: `Layout+0xC0`.
 - Rendered position: `model+0x00`.
 - Requested position: `model+0x04`.
+- Content extent: `model+0x08` (focus-follow `0x4AB180` divides by it minus
+  the viewport).
 - Enabled flag: `model+0x0C`.
-- Mod wheel step: `0.25`.
-- Native clamp: `0x4A9080`.
+- Native clamp: `0x4A9080` (bounds `+0x04` to 0..1 and copies it to `+0x00`).
+- Focus-follow: Layout vt[8] `0x4AB180`, gated by `Layout+0x260` and by the
+  focus object at `Layout+0x88` (vtable `0xEC8450`, active byte `+0x20`).
+- The position is normalized to the scroll range, so the same value shows a
+  different row when the member count changes. Since 0.6.73 the wheel moves
+  whole rows (`row / (members - 4)`; `0.25` only when the count is unknown)
+  and the first visible row is re-applied after member-count/extent changes
+  and after any move made without active focus navigation.
 
 ## Mission loadout/result state
 
@@ -180,7 +188,23 @@ state+0x245A0  logical participant count
 ```
 
 Items occupy exactly `0x2457C..0x2459B`. Direct P4-P7 parsing corrupts results
-and rewards. The hook snapshots the extra range, captures only sanitized fields
+and rewards.
+
+The state object itself is only `0x24600` bytes: both constructors
+(`0x3D6BA4`, `0x926F3`) call the allocator with `mov ecx,0x24600`, alignment
+16. Parser `0x42F480` bounds only its bulk block copy with `cmp ecx,4`
+(`0x42F7E5`); for every index it still writes the armor (`+0xF8`), class
+(`+0`), six weapon ids (`+8+class*0x18`) and the block's last 48 bytes
+(`+0x3E60`). P4's tail therefore already lands at `state+0x283D0` and P5's
+block at `state+0x28400..0x2C290`, in other heap allocations. The current
+snapshot/restore covers `0x24570..0x33FB0` (four extra blocks, ~63 KiB of
+foreign memory) around each parser call. It is bytewise-correct for the
+parser but can revert concurrent writes made by other threads to that
+foreign memory during the call. Since 0.6.66 the parser's two
+`imul ...,0x3E90` sites (`0x42F7C9`, `0x42F898`) are relayed: indices 0..3
+keep the native product, 4..7 resolve to four plugin-owned `0x3E90` blocks
+(result `block - 0xF0 - r14`) and larger indices to a discard block. The
+snapshot/restore path remains only as a fallback when the relays are absent. The hook snapshots the extra range, captures only sanitized fields
 into sidecars and restores the range bytewise. The participant-count write at
 `0x42FA69` is unconditional and can be valid even when the parser returns false.
 
@@ -213,6 +237,12 @@ Helper `0x126C90` originally had an int32 array at `rsp+0x68` and /GS cookie
 at `rsp+0x78`; the fifth write already reached the cookie. Two relays replace
 only call arguments with an external eight-int32 buffer, preserving frame/unwind.
 
+Mission entry `0x11D860` keeps four control ints at `rbp+0x1D0`, four 16-byte
+spawn records at `rbp+0x1E0..0x21F` and its /GS cookie at `rbp+0x230`. Its
+first loop transforms `spawn[index]` for every participant, so index 5 (the
+sixth player) overwrote the cookie. The 0.6.65 backedge relay stops that loop
+at four records.
+
 ## Relay page
 
 A `0x2000`-byte executable page is allocated within `0x70000000` of the
@@ -235,6 +265,13 @@ original site to keep rel32 jumps/calls in range.
 | `0x30` | Stride of each scaling relay (not a separate region) |
 | `0x1100` | Total clamp counter |
 | `0x1108` | Clamped-site mask |
+| `0x1110` | Spawn transform loop clamp counter (0.6.65) |
+| `0x1118` | Parser block base (plugin blocks - `0xF0`) (0.6.66) |
+| `0x1120` | Parser extra-block redirect counter |
+| `0x1128` | Parser discarded-index counter |
+| `0x1180` | Spawn transform backedge relay (`0x11DB21`) |
+| `0x1200` | Parser block-offset relay (`0x42F7C9`, `r10`) |
+| `0x1280` | Parser record-offset relay (`0x42F898`, `r9`) |
 
 ## Enemy spawn and GeneratorPoll
 

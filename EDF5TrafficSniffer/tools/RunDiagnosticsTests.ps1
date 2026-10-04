@@ -307,6 +307,15 @@ if ($spawnResultLayout -notcontains $expectedSpawnResultLayout) {
     throw 'Spawn/result layout summary changed; review ABI and offsets.'
 }
 Write-Host 'Spawn/result byte audit passed: ABI, 24 enemy callers, 56 scaling reads, GeneratorPoll update/base/gate/spawn chain, result storage and both Exec_Begin callers are unchanged.'
+# Startup hook signatures are validated after game_patches already wrote its
+# relays. A plain signature over a patched byte quarantines the plugin in the
+# real EDF5.exe only, so it must be caught here (0.6.66 regression).
+$signatureOverlap = & $Python (Join-Path $project 'tools\check_signature_patch_overlap.py')
+if ($LASTEXITCODE -ne 0) {
+    $signatureOverlap | Write-Host
+    throw 'A startup signature check overlaps bytes patched by the plugin.'
+}
+$signatureOverlap | Write-Host
 
 & $Python $playerControlAnalyzer $playerControlFixture `
     --expected-players 2 --strict

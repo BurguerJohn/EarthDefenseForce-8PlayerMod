@@ -83,6 +83,12 @@ struct Config {
     bool local_mission_harness_enabled = true;
     unsigned local_mission_harness_hotkey_vk = VK_F3;
     bool debug_stage_win_enabled = true;
+    bool damage_meter_enabled = true;
+    // Post the summary in the host's room chat (off: log only).
+    bool damage_meter_chat = false;
+    bool extended_enemy_health_scaling = true;
+    // EnemyHealth5Players..EnemyHealth8Players; 0 = automatic step.
+    float enemy_health_multipliers[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     unsigned debug_stage_win_hotkey_vk = VK_F5;
     uint64_t bot_steam_id = 76561202255233023ULL;
     unsigned payload_preview_bytes = 64;

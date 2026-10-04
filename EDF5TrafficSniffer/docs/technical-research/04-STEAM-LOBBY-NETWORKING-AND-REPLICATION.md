@@ -32,7 +32,19 @@ After CreateLobby, the first public_slot write identifies the host's owned lobby
 Only a confirmed owned lobby can have its capacity rewritten.
 
 - Creation/member-limit arguments use max(requested value, MaxPlayers).
-- public_slot/open_public add MaxPlayers - 4, clamped to 0..MaxPlayers.
+- Room keys written by `0x459510` (creation) and `0x454C10` (membership):
+  `public_slot` (public seats, host included), `private_slot` (friend seats),
+  `open_public` (free public seats). Native Steam type is Public (2) only when
+  `public_slot > 1` at creation and while `open_public` is non-zero, otherwise
+  Private (0); joiners without the friend/invite flag need `open_public > 0`
+  (`0x458970`). Friends-only = 1/3/0.
+- Since 0.6.75 the MaxPlayers - 4 extra seats follow the room kind: public
+  rooms (native `public_slot > 1`) add them to `public_slot`/`open_public`
+  and stay Public until MaxPlayers members; friends-only/private rooms add
+  them to `private_slot`, keep `open_public` at 0 and never become Public.
+  Before 0.6.75 a fifth member underflowed the native count (`open_public`
+  -1), the game switched the room to Public and the mod advertised 3 free
+  public seats, so strangers found and joined friends-only rooms.
 - Other or unconfirmed lobbies pass through unchanged.
 - Join/Leave clear relevant synthetic state to prevent identities crossing rooms.
 

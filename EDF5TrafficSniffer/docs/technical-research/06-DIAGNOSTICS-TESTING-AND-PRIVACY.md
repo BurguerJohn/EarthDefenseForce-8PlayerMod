@@ -33,6 +33,21 @@ The crash handler avoids allocation/complex operations on fragile paths, records
 breadcrumbs and respects dump mode Off. Missing dumps must not hide structured
 exception evidence when writing remains possible.
 
+Since 0.6.65 the crash JSON (including /GS fast-fail) also records all general
+registers and `stack_frames`: up to 48 frames unwound with dbghelp
+`StackWalk64` on the crash worker, reading memory only through
+`ReadProcessMemory` so a smashed stack truncates the trace instead of faulting.
+Each frame is `{module, rva, rva_hex}`; absolute addresses are never emitted,
+so frames survive the sanitized report while registers are redacted. The
+first-chance record's heuristic stack scan now also recognizes plugin code
+(`"module":"plugin"`) besides the main image.
+
+`tools/EnableCrashDumps.ps1` (with a `.bat` wrapper) is an out-of-process
+fallback for any build flavor: it enables Windows Error Reporting LocalDumps
+for EDF5.exe (Mini by default, elevated automatically) and `-Action Status`
+lists recent `Application Error` events as module/code/offset only. WER dumps
+contain process memory and are never part of the sanitized report.
+
 ## Privacy boundaries
 
 Local diagnostics, especially deep captures, can contain SteamIDs, network

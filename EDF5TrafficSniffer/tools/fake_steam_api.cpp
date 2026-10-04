@@ -48,6 +48,7 @@ int g_original_cancel_auth_ticket_count = 0;
 SteamId g_last_invite_dialog_lobby = 0;
 char g_public_slot[32]{};
 char g_open_public[32]{};
+char g_private_slot[32]{};
 char g_member_data[256]{};
 char g_member_data_key[64]{};
 
@@ -100,6 +101,7 @@ FAKE_NOINLINE const char* GetLobbyData(void*, SteamId, const char* key) {
     InterlockedIncrement(&g_effect);
     if (key && std::strcmp(key, "public_slot") == 0) return g_public_slot;
     if (key && std::strcmp(key, "open_public") == 0) return g_open_public;
+    if (key && std::strcmp(key, "private_slot") == 0) return g_private_slot;
     return "";
 }
 
@@ -114,6 +116,9 @@ FAKE_NOINLINE bool SetLobbyData(void*, SteamId, const char* key, const char* val
     } else if (std::strcmp(key, "open_public") == 0) {
         destination = g_open_public;
         capacity = sizeof(g_open_public);
+    } else if (std::strcmp(key, "private_slot") == 0) {
+        destination = g_private_slot;
+        capacity = sizeof(g_private_slot);
     }
     if (destination) {
         std::snprintf(destination, capacity, "%s", value);
@@ -340,6 +345,10 @@ extern "C" __declspec(dllexport) uint64_t FakeSteam_GetLastInviteDialogLobby() {
 
 extern "C" __declspec(dllexport) const char* FakeSteam_GetPublicSlot() {
     return g_public_slot;
+}
+
+extern "C" __declspec(dllexport) const char* FakeSteam_GetPrivateSlot() {
+    return g_private_slot;
 }
 
 extern "C" __declspec(dllexport) const char* FakeSteam_GetOpenPublic() {

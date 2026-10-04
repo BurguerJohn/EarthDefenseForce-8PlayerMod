@@ -148,7 +148,7 @@ The explicit opt-in is required even if the numeric multiplier changes.
 The local room chat displays this once after create/join:
 
 ```text
-*** EDF5_MultiSlotMod v0.6.64 ***
+*** EDF5_MultiSlotMod v0.6.66 ***
 If you have 4 players in the room,
 press F4 to invite more.
 ```
@@ -159,12 +159,14 @@ does not send the banner through Steam chat or require a player identity.
 | Control | Action |
 | --- | --- |
 | F4 | Open Steam's invite dialog for the locally created room |
-| Mouse wheel | Scroll the room list anywhere in the room window |
+| Mouse wheel | Scroll the room list anywhere in the room window; the game still receives the wheel for its own menus |
 | F8 | Add one synthetic filler up to the effective room limit |
 | F7 | Remove the newest filler |
 | F6 | Reapply EDF5 filler Ready properties |
-| F3 | Cycle host-only mission harness: host+3, host+4, Off |
+| F3 | Cycle host-only mission harness: host+3, host+4 ... host+7, Off |
 | F5 | Request mission-clear result during an active stage, when debug mode is enabled |
+| (automatic) | Measures damage per player per mission in the diagnostic log (`DamageMeterEnabled`); room chat summary only with `DamageMeterChat=true` (under validation) |
+| (automatic) | With 5-8 players enemy HP keeps scaling past the four-player table (`ExtendedEnemyHealthScaling`, `EnemyHealth5Players`..`EnemyHealth8Players`) |
 | F9 | Diagnostics live snapshot/minidump |
 | F10 | Toggle bounded deep capture in Diagnostics |
 
@@ -192,8 +194,11 @@ members registered in Steam's lobby backend and have no AI or combat commands.
 ### Local Mission Harness
 
 Start with host+3 as the native four-player baseline, then return to the room
-and select host+4 to probe P4. A third F3 removes all harness dummies. Each has
-a distinct native `UserImpl`, a `Harness Dummy N` name and copied host loadout.
+and select host+4 to probe P4. Each further F3 adds one dummy (host+5, host+6,
+host+7) to probe P5-P7, i.e. six to eight mission participants; the cycle
+returns to Off after host+7 or as soon as the next roster would exceed
+`MaxPlayers`. Each dummy has a distinct native `UserImpl`, a `Harness Dummy N`
+name and copied host loadout.
 
 The host-only gate requires exact target counts, complete Ready/l1/l2/contact
 masks, zero real gameplay peers and the pinned global object. Native state 0

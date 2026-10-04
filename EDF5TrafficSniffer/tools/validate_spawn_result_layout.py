@@ -191,6 +191,100 @@ SIGNATURES = (
     # Exec_Begin and returns the original script argument.
     ("result_exec_begin_script_wrapper", 0x42AC40,
      "40534883ec208bd9e8d35000008bc34883c4205bc3"),
+    # Mission entry 0x11d860 keeps its /GS cookie at rbp+0x230 and exactly
+    # four 16-byte spawn records at rbp+0x1e0..0x21f. Its first loop
+    # transforms spawn[edi] in place until edi equals the participant count
+    # at [rsp+0x50], with no four-record bound: participant 5 (sixth player)
+    # writes the cookie. The plugin relays the backedge at 0x11db21 so the
+    # loop stops after the four native records.
+    ("mission_entry_stack_cookie_store", 0x11D8A7, "48898530020000"),
+    ("mission_entry_spawn_record_init_four", 0x11D9E3,
+     "b904000000488d85e8010000"),
+    ("mission_entry_spawn_transform_index", 0x11DAB1,
+     "4863c748c1e004488d8de00100004803c8"),
+    ("mission_entry_spawn_transform_backedge", 0x11DB1B,
+     "ffc74883c3103b7c2450758a"),
+    ("mission_entry_stack_cookie_check", 0x11E414,
+     "488b8d300200004833cce81d8a8a00"),
+    # The mission state object is allocated with exactly 0x24600 bytes.
+    ("mission_state_allocation_size", 0x3D6BA4, "b900460200"),
+    ("mission_state_allocation_size_alt", 0x926F3, "b900460200"),
+    # Parser 0x42F480: r14 = state+0x14A40, block offset = index*0x3E90 in
+    # r10 (armor written before the four-block bound) and again in r9.
+    ("loadout_parser_block_base", 0x42F77F, "4c8db6404a0100"),
+    ("loadout_parser_block_offset", 0x42F7C9,
+     "4c69d1903e00008b850c01000043898432e8010000"),
+    ("loadout_parser_bulk_copy_bound", 0x42F7E5, "83f9040f8393000000"),
+    ("loadout_parser_record_offset", 0x42F898, "4d69c9903e0000"),
+    # Message builders: fixed 0x2E8 reserve, then unchecked payload memcpy.
+    ("message_1100_reserve", 0x43309E, "bae8020000488bcbe845f6ffff"),
+    ("message_1100_payload_copy", 0x433100,
+     "498d4d0c4c8bc3e8f8505900488d43044c8d60084981fc78050000"),
+    ("message_3300_reserve", 0x432D65, "bae8020000488d4d07e89d2fbfff"),
+    ("message_3300_payload_copy", 0x432DDD, "4903cf4c8bc3e81c545900"),
+    # Damage meter (0.6.74): ApplyDamage, its health/amount reads, the single
+    # message-handler call, the damage-list flush and both projectile sites.
+    ("damage_apply", 0x2DB370,
+     "488bc4555657415441554156415748"
+     "8da808ffffff4881ecc0010000"),
+    ("damage_apply_amount_read", 0x2DB47D, "0f2f7650"),
+    ("damage_apply_health_read", 0x2DB496, "f30f1087fc010000"),
+    ("damage_message_call", 0x2DACCF, "e89c060000"),
+    ("damage_list_flush", 0x2D9720, "40535556574155415641574883ec70"),
+    # Source-side tally (0.6.79): list data/count*0xA0, info +0x10, stride.
+    ("damage_list_layout", 0x2D9744, "488b7108488b4118488d2c8048c1e505"),
+    ("damage_list_info", 0x2D97FF, "488d4610"),
+    ("damage_list_stride", 0x2D98A2, "4881c6a0000000"),
+    ("projectile_flush_site_a", 0x1437E2, "488d8b80000000"),
+    ("projectile_flush_call_a", 0x1437FE, "e81d5f1900"),
+    ("projectile_flush_site_b", 0x1441DB, "488d8f80000000"),
+    ("projectile_flush_call_b", 0x1441E6, "e835551900"),
+    # Script record relays (0.6.77): 0x121BE0/0x127260 index the four
+    # mission records at +0x138 by the real participant count.
+    ("script_record_a_index", 0x121C40, "4863c7"),
+    ("script_record_a_address", 0x121C43, "488d4814488d0c48488d0cce"),
+    ("script_record_a_lock", 0x121C4F, "488d542420e8d7baf4ff"),
+    ("script_record_b_index", 0x127390, "4863c7"),
+    ("script_record_b_address", 0x127393,
+     "488d4814488d0c48488d0ccd0000000049" "03cd"),
+    ("script_record_b_lock", 0x1273A6, "488d542450e88063f4ff"),
+    ("participant_count_getter", 0x11E48E, "8b80a0450200"),
+    # Caliban/car rear seat pickers and the 24 enemy HP multiplies (0.6.78).
+    ("rear_seat_caliban", 0x34F9AD, "45892e418d45014863d045892c96"),
+    ("rear_seat_car", 0x374EED, "45892e418d45014863d045892c96"),
+    ("rear_seat_caliban_after", 0x34F9BB, "4d8bc6498bd7488bcde897660000"),
+    ("rear_seat_car_after", 0x374EFB, "4d8bc6498bd7488bcde85711feff"),
+    ("vehicle_seat_layout", 0x356066, "4c6991280400004003000048"),
+    ("health_scaling_1cff15", 0x1CFF15, "f30f59449108"),
+    ("health_scaling_1ddc40", 0x1DDC40, "f3410f59448008"),
+    ("health_scaling_1e4266", 0x1E4266, "f3420f59448208"),
+    ("health_scaling_1e64c3", 0x1E64C3, "f30f595c9108"),
+    ("health_scaling_1ecbc0", 0x1ECBC0, "f30f59449108"),
+    ("health_scaling_1f876e", 0x1F876E, "f30f59448208"),
+    ("health_scaling_1f89f0", 0x1F89F0, "f30f594c9108"),
+    ("health_scaling_1ff765", 0x1FF765, "f30f59449108"),
+    ("health_scaling_20aa1c", 0x20AA1C, "f30f59449108"),
+    ("health_scaling_214f44", 0x214F44, "f30f595c9108"),
+    ("health_scaling_21ec83", 0x21EC83, "f30f59449108"),
+    ("health_scaling_22a994", 0x22A994, "f3410f59448008"),
+    ("health_scaling_26ec24", 0x26EC24, "f30f594c9108"),
+    ("health_scaling_278732", 0x278732, "f3410f59448008"),
+    ("health_scaling_283468", 0x283468, "f30f59449108"),
+    ("health_scaling_28c706", 0x28C706, "f30f59449108"),
+    ("health_scaling_29495a", 0x29495A, "f30f594c9108"),
+    ("health_scaling_297f22", 0x297F22, "f30f594c9108"),
+    ("health_scaling_29a9a2", 0x29A9A2, "f30f594c9108"),
+    ("health_scaling_2a141a", 0x2A141A, "f30f59449108"),
+    ("health_scaling_2a7419", 0x2A7419, "f3410f59448008"),
+    ("health_scaling_2c075c", 0x2C075C, "f30f59449108"),
+    ("health_scaling_2cadca", 0x2CADCA, "f30f59449108"),
+    ("health_scaling_2d4b7e", 0x2D4B7E, "f3410f59448008"),
+    ("chat_room_send", 0x3F16C0,
+     "405553564154415541564157488d6c24d04881ec30010000"),
+    ("rtti_weapon_base_name", 0x11B1AC0,
+     "2e3f4156576561706f6e426173654040"),
+    ("rtti_soldier_base_name", 0x11A4980,
+     "2e3f4156536f6c64696572426173654040"),
 )
 
 

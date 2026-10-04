@@ -9,25 +9,25 @@
 namespace mod_info {
 
 inline constexpr char kName[] = "EDF5_MultiSlotMod";
-inline constexpr char kVersion[] = "0.6.64";
+inline constexpr char kVersion[] = "0.6.79";
 inline constexpr wchar_t kChatBanner[] =
-    L"*** EDF5_MultiSlotMod v0.6.64 ***";
+    L"*** EDF5_MultiSlotMod v0.6.79 ***";
 inline constexpr wchar_t kChatInviteHintLine1[] =
     L"If you have 4 players in the room,";
 inline constexpr wchar_t kChatInviteHintLine2[] =
     L"press F4 to invite more.";
 #if EDF5_COMPILE_DIAGNOSTICS
 inline constexpr char kBuildId[] =
-    "edf5mp-0.6.64-diagnostics-win64";
+    "edf5mp-0.6.79-diagnostics-win64";
 inline constexpr char kBuildFlavor[] = "Diagnostics";
 #else
-inline constexpr char kBuildId[] = "edf5mp-0.6.64-users-win64";
+inline constexpr char kBuildId[] = "edf5mp-0.6.79-users-win64";
 inline constexpr char kBuildFlavor[] = "Users";
 #endif
 
 inline constexpr unsigned kVersionMajor = 0;
 inline constexpr unsigned kVersionMinor = 6;
-inline constexpr unsigned kVersionPatch = 64;
+inline constexpr unsigned kVersionPatch = 79;
 inline constexpr unsigned kVersionRevision = 0;
 
 inline constexpr const char* NameForGame(game::Id game_id) {

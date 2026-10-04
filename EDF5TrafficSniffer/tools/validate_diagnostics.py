@@ -86,6 +86,21 @@ def read_json(path: Path) -> dict:
     return value
 
 
+def stack_walk_recorded(context: dict) -> bool:
+    """A crash context must carry an unwound, module-relative stack."""
+    frames = context.get("stack_frames")
+    if not isinstance(frames, list) or len(frames) < 2:
+        return False
+    if context.get("stack_frame_count") != len(frames):
+        return False
+    return any(
+        isinstance(frame, dict) and
+        str(frame.get("module", "")).lower().endswith(".exe") and
+        int(frame.get("rva", 0)) > 0 and
+        frame.get("rva_hex") == f"0x{int(frame.get('rva', 0)):x}"
+        for frame in frames)
+
+
 def read_events(session: Path) -> tuple[list[dict], list[Path]]:
     paths = sorted(session.glob("events*.jsonl"), key=event_part)
     if not paths:
@@ -368,6 +383,11 @@ def validate_mode(mode: str, mode_root: Path, results: Results) -> None:
                           "runtime flow state recorded")
             results.check(context.get("runtime", {}).get("real_gameplay_peers") == 1,
                           "real gameplay peer count recorded")
+            results.check(stack_walk_recorded(context),
+                          "crash stack walk recorded as module+RVA frames")
+            results.check("register_rcx" in context and
+                          context.get("instruction_pointer"),
+                          "crash registers recorded")
             if mode == "crash_off":
                 results.check(context.get("dump_mode") == "Off", "dump mode Off recorded")
                 results.check(context.get("dump_file") is None, "no dump file advertised")
@@ -395,6 +415,8 @@ def validate_mode(mode: str, mode_root: Path, results: Results) -> None:
             results.check(context.get("hook", {}).get("operation") ==
                           "simulated_fast_fail",
                           "fast-fail hook scope recorded")
+            results.check(stack_walk_recorded(context),
+                          "fast-fail stack walk recorded as module+RVA frames")
             try:
                 streams = dump_streams(dump)
                 results.check(6 in streams,
@@ -468,6 +490,10 @@ def validate_report(path: Path, results: Results) -> None:
                       "crash hook scope preserved")
         results.check(re.search(r'"phase"\s*:\s*"matching"', combined) is not None,
                       "crash flow phase preserved")
+        results.check(re.search(r'"stack_frames"\s*:\s*\[', combined) is not None and
+                      re.search(r'"rva_hex"\s*:\s*"0x[0-9a-f]{1,8}"',
+                                combined) is not None,
+                      "crash stack frames survive sanitization")
     if path.name.startswith("enabled-"):
         aliases = ("lobby_1", "steam_", "identity_1")
         results.check(all(alias in combined for alias in aliases),

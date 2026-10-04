@@ -117,6 +117,14 @@ int AdjustMemberCount(uint64_t lobby, int actual_count) {
         ? more_players::AdjustMemberCount(lobby, actual_count) : actual_count;
 }
 
+int AdjustLobbyType(uint64_t lobby, int type) {
+#if EDF5_COMPILE_DIAGNOSTICS
+    if (UsesEdf41CoopPolicy()) return type;
+#endif
+    return UsesEdf5CoopPolicy()
+        ? more_players::AdjustLobbyType(lobby, type) : type;
+}
+
 void ObserveMemberCount(uint64_t lobby, int actual_count) {
 #if EDF5_COMPILE_DIAGNOSTICS
     if (UsesEdf41CoopPolicy()) {

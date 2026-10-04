@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -33,9 +34,36 @@ bool RestoreInstalledPatches();
 // clamp to the native four-player scaling profile has occurred.
 void PollMissionRelayTelemetry();
 
+// Plugin-owned destination of mission-loadout parser blocks for logical
+// indices 4..7 (four contiguous 0x3E90-byte blocks), or nullptr while the
+// parser index relays are not installed in this EDF5 process. When non-null,
+// the parser never writes those blocks into the 0x24600-byte mission state,
+// and its four-block bulk-copy bound is raised, so every block it touches
+// for indices 4..7 holds the complete native-format loadout image.
+uint8_t* MissionLoadoutParserExtraBlocks();
+uint64_t MissionLoadoutParserRedirectHits();
+uint64_t MissionLoadoutParserDiscardHits();
+// Offline self-test only: report the redirect as installed without patching.
+void SetMissionLoadoutParserRedirectForTest(bool enabled);
+
 // Aggregate evidence for the 56 proven mission-state participant-count reads.
 // The real stored participant count is not modified by these relays.
 uint64_t NativeParticipantScalingClampHits();
+
+// With 5-8 participants, continue each enemy HP table's last per-player step
+// (4-player factor + (count - 4) * (4-player - 3-player factor)) instead of
+// staying on the 4-player factor (24 enemy initializers). Takes effect for
+// enemies created afterwards; may be called before or after
+// InstallRosterCapacity. Default: enabled.
+void SetExtendedEnemyHealthScaling(bool enabled);
+bool ExtendedEnemyHealthScaling();
+
+// Optional fixed enemy HP for 5..8 participants as a multiple of the
+// four-player HP (multipliers[0] = 5 players). 0 or a value outside 0.1..20
+// keeps the continued per-player step for that count.
+void SetEnemyHealthMultipliers(const float* multipliers, size_t count);
+// 0 = automatic step, otherwise the multiplier in effect for that count.
+float EnemyHealthMultiplier(unsigned participants);
 uint64_t NativeParticipantScalingClampMask();
 
 // Replays the exact v0.4.6 append-loop crash fixture in an isolated helper

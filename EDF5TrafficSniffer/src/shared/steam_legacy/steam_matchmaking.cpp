@@ -393,9 +393,12 @@ int GetMemberLimit(void* self, SteamId lobby) {
 }
 
 bool SetLobbyType(void* self, SteamId lobby, int type) {
-    const bool result = o_set_lobby_type(self, lobby, type);
+    const int effective_type = steam_game_policy::AdjustLobbyType(lobby, type);
+    const bool result = o_set_lobby_type(self, lobby, effective_type);
     EDF5_CAPTURE_EVENT("steam_matchmaking", "set_lobby_type",
-                   capture::Fields().UInt("lobby_steam_id", lobby).Int("lobby_type", type)
+                   capture::Fields().UInt("lobby_steam_id", lobby)
+                       .Int("requested_lobby_type", type)
+                       .Int("lobby_type", effective_type)
                        .Bool("result", result));
     return result;
 }

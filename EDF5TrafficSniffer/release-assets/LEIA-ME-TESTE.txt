@@ -1,3 +1,174 @@
+EDF5_MultiSlotMod v0.6.79 - PACOTE DE TESTE (6+ JOGADORES)
+
+Pre-requisito:
+- EDFModLoader 1.0.10 instalado em cada computador.
+- Todos os computadores com este MESMO pacote Diagnostics (nao a versao
+  Users/Nexus: ela nao grava log nenhum).
+
+Instalacao:
+1. Feche o jogo.
+2. Apague versoes antigas do mod em Mods\Plugins, se existirem:
+   EDF5TrafficSniffer.dll, EDF5_MultiSlotMod.dll e EDF5_MultiSlotMod.ini.
+3. Extraia este ZIP na pasta raiz de EARTH DEFENSE FORCE 5 (onde fica o
+   EDF5.exe) e confirme a mesclagem da pasta Mods.
+4. Confira que existem Mods\Plugins\EDF5_MultiSlotMod.dll e .ini.
+5. Ao criar/entrar numa sala, o chat deve mostrar
+   `*** EDF5_MultiSlotMod v0.6.79 ***`.
+   Se a linha nao aparecer, o mod se desativou por seguranca: envie o arquivo
+   Mods\TrafficSniffer\startup-failures.log.
+6. NAO use a v0.6.66: ela se desativava sozinha ao abrir o jogo.
+
+IMPORTANTE - SE O JOGO FECHAR AO ENTRAR EM SALA COM 5+ JOGADORES:
+- Quase sempre e o Windows bloqueando o mod (o jogo roda sem mod e fecha).
+  Confira em Mods\..\ModLoader.log (ou no relatorio) a linha
+  "Failed to load plugin: error 4551" = bloqueado pelo Windows.
+- Solucao: feche o jogo, clique com o botao direito no ZIP baixado,
+  Propriedades, marque "Desbloquear" e OK. Extraia e copie de novo.
+  Ou no PowerShell, na pasta do jogo:
+    Get-ChildItem .\Mods -Recurse | Unblock-File
+- Se ainda bloquear, e o "Controle Inteligente de Aplicativos" (Smart App
+  Control) do Windows 11, em Seguranca do Windows > Controle de aplicativos
+  e do navegador.
+
+Novidade da 0.6.79:
+- O DPS no chat foi desligado por enquanto: os numeros estavam errados para
+  quem nao e o host. O mod continua medindo no log (de todos os jogadores)
+  para corrigirmos. Quem quiser ver mesmo assim: DamageMeterChat=true no
+  EDF5_MultiSlotMod.ini do host.
+- Para ajudar: depois de uma fase, rode Mods\TrafficSniffer\CreateDebugReport
+  e mande o ZIP (host e clientes).
+
+Novidade da 0.6.78:
+- Caliban (e carros com 5+ lugares): jogadores 5 a 8 agora conseguem ir no
+  banco de tras (antes so podiam dirigir, e o jogo escrevia fora da lista de
+  bancos). Contribuicao de outro usuario (PR #1 do repositorio do mod).
+- HP dos inimigos continua subindo com 5 a 8 jogadores (o jogo parava em 4).
+  No Inferno: 1,25 / 1,30 / 1,35 / 1,40 para 5/6/7/8 jogadores. Configuravel
+  em EDF5_MultiSlotMod.ini: ExtendedEnemyHealthScaling=false desliga;
+  EnemyHealth5Players..EnemyHealth8Players aceitam um multiplo do HP de 4
+  jogadores (ex.: 1.5). Tambem da mesma contribuicao.
+
+Novidade da 0.6.77:
+- Corrigido crash em fases com certos gatilhos de script (com 5+ jogadores).
+  Dois comandos de script do jogo percorriam a lista de jogadores e liam
+  dados que so existem para 4; agora os jogadores 5 a 8 usam os dados que
+  o mod guarda para eles.
+
+Novidade da 0.6.76:
+- Medidor de DPS mostra o nick da Steam de cada jogador e a porcentagem do
+  dano total do time, por exemplo:
+    Nome: 77/s (75k, 84%)
+- Mais informacao no log para conferir se o dano esta certo (quantos
+  acertos cada jogador teve e quantos soldados NPC causaram dano).
+
+Novidade da 0.6.75:
+- Sala "Somente amigos" voltou a ser privada. Com 5 ou mais jogadores o
+  jogo transformava a sala em publica e o mod anunciava vagas publicas,
+  entao desconhecidos encontravam a sala e tentavam entrar. Agora salas de
+  amigos/privadas nunca ficam publicas (as vagas extras sao de amigos), e
+  salas publicas continuam visiveis ate encher as 8 vagas.
+- Medidor de DPS corrigido: a 0.6.74 mostrava "(no damage recorded)"
+  porque o mod guardava o ponteiro errado do soldado de cada jogador.
+
+Novidade da 0.6.74:
+- Medidor de dano (DPS). Durante a fase o mod mede o dano que cada jogador
+  causa. Ao voltar para a sala, o HOST ve no chat da sala o DPS de cada
+  jogador e, quando o jogo permite identificar, de cada arma.
+  Nesta versao so o host ve a mensagem; mandar para todos fica para a
+  proxima versao. Para ajudar: o host deve digitar qualquer coisa no chat
+  da sala uma vez e mandar o relatorio (CreateDebugReport) depois de uma
+  missao completa.
+- Pode ser desligado em EDF5_MultiSlotMod.ini: DamageMeterEnabled=false
+- As mensagens do medidor saem em ingles, por exemplo:
+    [DPS] Mission: 312s - damage dealt per player
+    Nome: 488/s (152k)
+      Gatling 289/s, PileBanker 180/s, other 19/s
+
+Novidade da 0.6.73:
+- Lista de jogadores com 5+ pessoas: a roda do mouse agora anda uma linha
+  inteira por vez, e a lista nao pula mais quando alguem entra, sai ou muda
+  algo (arma, classe, pronto). Navegar com controle/teclado continua
+  funcionando normalmente.
+- Log de armor mais completo: agora registra qual classe o jogo usou para
+  dividir a armor, a classe de cada jogador e o limite de armor por classe.
+  Quem estiver "sem ganhar armor" deve mandar o relatorio depois de uma
+  missao completa e dizer qual classe estava usando.
+
+Novidade da 0.6.72:
+- A roda do mouse volta a rolar os menus do jogo dentro da sala (ex.: escolha
+  de armas). Antes o mod usava a roda so para a lista de jogadores e o jogo
+  nao recebia nada.
+
+Novidade da 0.6.71:
+- Diagnostico de armor: o log agora mostra o que mudou no perfil do soldado
+  local ao creditar a recompensa e ao voltar para a sala. Quem achar que nao
+  ganhou armor: termine a fase, volte para a sala e rode
+  CreateDebugReport.bat. Anote tambem o armor da classe antes e depois.
+
+Novidade da 0.6.70:
+- Recompensas com 5+ jogadores: as caixas pegas pelo 5o-8o jogador podiam
+  sumir do total de TODOS, dependendo da ordem em que os resultados chegavam
+  no fim da fase (o jogo sobrescreve o slot do jogador 1-4 que o mod usa para
+  somar o jogador extra). Agora a soma independe da ordem e de reenvios.
+
+Novidade da 0.6.69:
+- O log agora registra os numeros de recompensa no fim da fase (caixas de
+  armadura/arma somadas de todos os jogadores e o total creditado). Se alguem
+  nao ganhar armor, rode CreateDebugReport.bat nesse PC logo depois da fase.
+
+Novidade da 0.6.68:
+- Armas dos jogadores 5-8: o 5o/6o jogador recebia classe, armas e armadura
+  certas, mas o resto dos dados do loadout (melhorias de cada arma: municao,
+  recarga, cadencia) vinha emprestado do jogador 1-4 em cujo bloco o
+  personagem era criado. Era o caso da 2a arma do Fencer mais fraca. Agora o
+  personagem extra e criado com os dados completos dele.
+
+Correcoes para 6+ jogadores (desde 0.6.66/0.6.67):
+1. Mensagem de inicio de missao (0x1100): o jogo reserva 744 bytes e copia
+   o conteudo sem checar o tamanho. Com 5 jogadores ela tinha ate 724 bytes;
+   com 6 passa de 744 e estourava a memoria do HOST ao carregar a fase
+   (0xC0000374, o crash de 03/10). O mod aumenta a reserva para 2048 bytes
+   (tambem na mensagem 0x3300/0x3400, que usa o mesmo padrao).
+2. Loadout dos jogadores 5-8: o parser do jogo gravava classe, armas e
+   armadura desses jogadores fora do objeto de estado da missao (na memoria
+   de outros objetos). Agora essas gravacoes vao para uma area do proprio mod.
+   Efeito colateral bom: em uma das classes, a 5a arma do 5o jogador caia em
+   cima do contador de jogadores e era descartada; agora as 6 armas chegam.
+3. Entrada na missao (0x11D860): o loop dos pontos de spawn nao parava em 4;
+   o 6o jogador sobrescrevia o cookie /GS e fecharia o jogo (0xC0000409) em
+   todos os computadores. O loop agora para nos 4 pontos nativos.
+- No report, com 6+ participantes devem aparecer
+  `mission_loadout_parser_redirect_hit` e
+  `mission_spawn_transform_loop_clamped`.
+
+Melhorias de log:
+- O JSON de crash agora traz registradores e a pilha (`stack_frames`) como
+  modulo+RVA. A pilha continua no relatorio sanitizado.
+- Mods\TrafficSniffer\EnableCrashDumps.bat liga o dump do proprio Windows
+  para o EDF5.exe (pede administrador). Funciona mesmo se o mod nao conseguir
+  gravar nada. `EnableCrashDumps.bat -Action Status` lista os ultimos crashes
+  do EDF5 registrados pelo Windows (modulo, codigo e offset).
+  Os dumps (.dmp) contem memoria do jogo: envie so em particular ao
+  desenvolvedor, nunca em publico.
+
+Teste local antes de juntar 6 pessoas (somente o host):
+1. Crie uma sala sozinho e pressione F3 varias vezes:
+   host+3 -> host+4 -> host+5 -> host+6 -> host+7 -> desligado.
+   host+5 = 6 participantes, host+6 = 7, host+7 = 8.
+2. Com host+5, inicie uma missao e confirme que ela carrega, que ha inimigos
+   e que F5 (debug) completa a fase e volta para a sala.
+3. Repita com host+6 e host+7.
+
+Teste real com 6 jogadores:
+1. Todos rodam EnableCrashDumps.bat uma vez (opcional, recomendado).
+2. Jogue ate o ponto do problema (ou ate completar 2 missoes).
+3. Se alguem crashar, essa pessoa roda Mods\TrafficSniffer\CreateDebugReport.bat
+   e envia o ZIP gerado. Anote em que momento aconteceu (sala, Ready,
+   carregamento, gameplay, resultado, volta para sala).
+
+------------------------------------------------------------------------------
+Historico das versoes anteriores:
+
 EDF5_MultiSlotMod v0.6.52 - PACOTE DE TESTE LOCAL/COORDENADO
 
 Pre-requisito:

@@ -31,6 +31,10 @@ bool RewriteLobbyData(uint64_t lobby, const char* key, const char* value,
                       std::string& rewritten);
 
 int AdjustMemberCount(uint64_t lobby, int actual_count);
+// Keeps the Steam visibility of the owned room consistent with the room the
+// host created (friends/private rooms never become Public; public rooms stay
+// listed until MaxPlayers members).
+int AdjustLobbyType(uint64_t lobby, int type);
 void ObserveMemberCount(uint64_t lobby, int actual_count);
 bool TryGetSyntheticMember(uint64_t lobby, int actual_count, int index,
                            uint64_t& user);

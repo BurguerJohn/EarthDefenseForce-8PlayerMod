@@ -93,6 +93,31 @@ PlayerInfo is 0x60 bytes: name storage +0x08, length +0x18, capacity +0x20
 (inline up to 7), class +0x28, secondary +0x2C, weapons +0x30, validity +0x48,
 armor +0x54.
 
+`0x3F16C0` is Chat_Room vtable slot 1, the player send: it transmits through
+`0x44D940` and publishes locally through `0x3F0B70` with kind 2. Its two
+identity arguments are neither the lobby nor the SteamID (live 0.6.71 log);
+0.6.74 Diagnostics records how the native caller builds them.
+
+## Damage
+
+| RVA | Meaning |
+|---:|---|
+| `0x2DAC60` | GameObjectBase message handler (vtable slot 6); message `0x80000000` = damage |
+| `0x2DACCF` | its only call to ApplyDamage |
+| `0x2DB370` | GameObjectBase::ApplyDamage(GameDamageInfo const&) |
+| `0x2DBA50` | damage-allowed check (friendly fire, invulnerability) |
+| `0x2D9720` | damage-list flush (0xA0-byte entries, GameDamageInfo at +0x10) |
+| `0x1437FE/0x1441E6` | projectile-system flush calls (`lea rcx,[projectile+0x80]`) |
+| `0x146D80` | projectile system update (called from `0x3D84F1`) |
+| `0x4FCE0` | GameObject SendMessage (vtable +0x38/+0x30/+0x40) |
+| `0x11B1AB0` / `0x11A4970` | RTTI TypeDescriptor WeaponBase / SoldierBase |
+
+Object health is `+0x1FC` (min `+0x1F4`, max `+0x1F8`, damage multiplier
+`+0x294`). GameDamageInfo: attacker weak_ptr `+0x10/+0x18`, team `+0x24`,
+amount `+0x50` (negative heals), flags `+0x5C`, hit list vector `+0x70`.
+Player soldiers are `AssultSoldier` (SoldierBase). Weapon classes keep their
+projectile InitParam template at class-specific offsets (e.g. `+0x1200`).
+
 ## Capacity patches
 
 ```text
@@ -122,6 +147,12 @@ The 24 experimental pairs and eleven holds are listed in
 | `0x126D24` | lookup call |
 | `0x7E240` | source lookup |
 | `0x11D860` | spawn/create function |
+| `0x11D8A7` | /GS cookie store at `rbp+0x230` |
+| `0x11D9E3` | four spawn records initialized at `rbp+0x1E0` |
+| `0x11DAB1` | spawn transform loop top (`spawn[edi]`) |
+| `0x11DB21/0x11DB27` | spawn transform backedge (relayed)/exit |
+| `0x11E414` | /GS cookie check of `0x11D860` |
+| `0x11E7A0` | secondary script creation (cookie at `rbp+0x110`) |
 | `0x11CE60` | player builder |
 | `0x6E010` | shared copy |
 | `0x6E022` | dereference exposing a null source |
@@ -262,6 +293,11 @@ loadout block stride 3E90
 selected +14B30; records +14B38 stride 18; armor +F8
 fifth block 24570 (overlaps result; never materialize)
 Items base 2457C; rewards count 2459C; participant count 245A0
+mission state allocation 24600 bytes (0x3D6BA4 and 0x926F3, align 10)
+parser writes per index i >= 4 at +0, +8+class*18, +F8, +3E60..3E90 of
+  14B30+i*3E90: P4 already reaches 283D0, P5 28400..2C290 (outside object)
+mission entry 0x11D860: controls rbp+1D0 (4 ints), spawn rbp+1E0 (4 x 10),
+  /GS cookie rbp+230, saved xmm9/xmm8 from rbp+240
 
 enemy scale owner: numerator +290; denominator +294; source +2B0
 native spawn cap 400; sane denominator max 1,000,000

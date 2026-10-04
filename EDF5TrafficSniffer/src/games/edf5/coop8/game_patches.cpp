@@ -17,6 +17,7 @@
 #include <iterator>
 #include <limits>
 #include <string>
+#include <utility>
 
 namespace game_patches {
 namespace {
@@ -395,7 +396,165 @@ constexpr std::array<uint8_t, 7> kMissionRecordAppendRedirectOriginal = {
     0x49, 0x8b, 0xf4,              // mov rsi,r12
     0x49, 0x83, 0xc4, 0x18,        // add r12,0x18
 };
-constexpr size_t kMissionRelayPageSize = 0x2000;
+
+// Before the per-participant creation loop, 0x11d860 runs a first loop at
+// 0x11dab1..0x11db25 that normalizes and rotates spawn[index] in place at
+// rbp+0x1e0+index*0x10 for every participant. Only four native 16-byte records
+// exist and the function's /GS cookie is at rbp+0x230: index 4 lands in unused
+// padding (so five players survive), index 5 overwrites the cookie and the
+// function fast-fails with 0xc0000409 on return, and indices 6..7 overwrite the
+// caller's saved xmm9/xmm8. The creation loop already reuses spawn[index % 4]
+// through the primary relay, so the transform loop must stop after the four
+// physical records. The relay keeps the native loop body, frame and unwind
+// data intact and only replaces its backedge compare.
+constexpr uintptr_t kMissionSpawnTransformLoopTopRva = 0x11dab1;
+constexpr uintptr_t kMissionSpawnTransformLoopCompareRva = 0x11db21;
+constexpr uintptr_t kMissionSpawnTransformLoopExitRva = 0x11db27;
+constexpr std::array<uint8_t, 6> kMissionSpawnTransformLoopOriginal = {
+    0x3b, 0x7c, 0x24, 0x50,        // cmp edi,[rsp+0x50]
+    0x75, 0x8a,                    // jne 0x11dab1
+};
+static_assert(kMissionSpawnTransformLoopCompareRva +
+                      kMissionSpawnTransformLoopOriginal.size() ==
+                  kMissionSpawnTransformLoopExitRva,
+              "spawn transform backedge must end at the loop exit");
+// Two mission-script helpers walk the real participant count (0x11E460)
+// over the four native participant records at mission+0x138 and lock the
+// weak_ptr at record+0x08 through 0x6D730: 0x121BE0 (script dispatcher
+// 0x116418) and 0x127260 (called from 0x115833). Index 4 already reads past
+// the array; live 0.6.76 crashed in a stage trigger locking control block 0xE
+// (AV reading 0x16 at 0x6D757). The relays keep indexes 0..3 native, read
+// P4-P7 from the relay-page sidecars (same 0x18-byte layout written by the
+// mission-entry relays) and give indexes >= 8 an empty record whose lock
+// yields null, so the helper skips that slot. rax/rcx/flags are dead until
+// the following lea rdx / call 0x6D730.
+constexpr uintptr_t kMissionScriptRecordReadARva = 0x121c43;
+constexpr uintptr_t kMissionScriptRecordReadAReturnRva = 0x121c4f;
+constexpr std::array<uint8_t, 12> kMissionScriptRecordReadAOriginal = {
+    0x48, 0x8d, 0x48, 0x14,        // lea rcx,[rax+0x14]
+    0x48, 0x8d, 0x0c, 0x48,        // lea rcx,[rax+rcx*2]
+    0x48, 0x8d, 0x0c, 0xce,        // lea rcx,[rsi+rcx*8]
+};
+constexpr uintptr_t kMissionScriptRecordReadBRva = 0x127393;
+constexpr uintptr_t kMissionScriptRecordReadBReturnRva = 0x1273a6;
+constexpr std::array<uint8_t, 19> kMissionScriptRecordReadBOriginal = {
+    0x48, 0x8d, 0x48, 0x14,                          // lea rcx,[rax+0x14]
+    0x48, 0x8d, 0x0c, 0x48,                          // lea rcx,[rax+rcx*2]
+    0x48, 0x8d, 0x0c, 0xcd, 0x00, 0x00, 0x00, 0x00,  // lea rcx,[rcx*8]
+    0x49, 0x03, 0xcd,                                // add rcx,r13
+};
+static_assert(kMissionScriptRecordReadARva +
+                      kMissionScriptRecordReadAOriginal.size() ==
+                  kMissionScriptRecordReadAReturnRva &&
+              kMissionScriptRecordReadBRva +
+                      kMissionScriptRecordReadBOriginal.size() ==
+                  kMissionScriptRecordReadBReturnRva,
+              "script record relays must return after the replaced bytes");
+// Unpatched context: movsxd rax,edi before each site; the weak_ptr lock call
+// after it.
+constexpr std::array<uint8_t, 3> kMissionScriptRecordIndexLoad = {
+    0x48, 0x63, 0xc7,                                // movsxd rax,edi
+};
+constexpr std::array<uint8_t, 10> kMissionScriptRecordReadALock = {
+    0x48, 0x8d, 0x54, 0x24, 0x20,                    // lea rdx,[rsp+0x20]
+    0xe8, 0xd7, 0xba, 0xf4, 0xff,                    // call 0x6d730
+};
+constexpr std::array<uint8_t, 10> kMissionScriptRecordReadBLock = {
+    0x48, 0x8d, 0x54, 0x24, 0x50,                    // lea rdx,[rsp+0x50]
+    0xe8, 0x80, 0x63, 0xf4, 0xff,                    // call 0x6d730
+};
+constexpr size_t kMissionScriptRecordWeakOffset = 0x08;
+static_assert(kMissionSpawnTransformLoopCompareRva < kMissionRecordRedirectRva,
+              "spawn patch protection range must start at the backedge");
+
+// Outgoing game-message builders reserve a fixed 0x2E8-byte buffer and then
+// memcpy the caller's payload behind a 12-byte (0x1100, builder 0x433000) or
+// 4-byte (0x3300/0x3400, builder 0x432D20) header without checking it; the
+// 0x1100 builder compares the total with the 0x578-byte packet limit only
+// after the copy (0x433114). Mission-start 0x1100 grows with the roster:
+// five-player reports peaked at 724 bytes, six players need about 857, so
+// the host overflowed its heap block during stage load (0xC0000374).
+// Raising both reservations to 0x800 covers the native 0x578 limit plus
+// headers; the transmitted length is still the builder's own count.
+constexpr unsigned kGameMessageOriginalReserve = 0x2e8;
+constexpr unsigned kGameMessageExpandedReserve = 0x800;
+constexpr std::array<BytePatchSite, 2> kGameMessageReserveSites = {{
+    // 0x1100: mov edx,0x2e8; mov rcx,rbx; call 0x4326F0 (resize)
+    {0x43309e,
+     {0xba, 0xe8, 0x02, 0x00, 0x00, 0x48, 0x8b, 0xcb,
+      0xe8, 0x45, 0xf6, 0xff, 0xff},
+     {0xba, 0x00, 0x08, 0x00, 0x00, 0x48, 0x8b, 0xcb,
+      0xe8, 0x45, 0xf6, 0xff, 0xff},
+     13},
+    // 0x3300/0x3400: mov edx,0x2e8; lea rcx,[rbp+7]; call 0x25D10 (reserve)
+    {0x432d65,
+     {0xba, 0xe8, 0x02, 0x00, 0x00, 0x48, 0x8d, 0x4d, 0x07,
+      0xe8, 0x9d, 0x2f, 0xbf, 0xff},
+     {0xba, 0x00, 0x08, 0x00, 0x00, 0x48, 0x8d, 0x4d, 0x07,
+      0xe8, 0x9d, 0x2f, 0xbf, 0xff},
+     14},
+}};
+static_assert(kGameMessageExpandedReserve >= 0x578 + 12,
+              "expanded message reserve must cover the native packet limit");
+static_assert(kGameMessageReserveSites[0].original[1] ==
+                      (kGameMessageOriginalReserve & 0xff) &&
+                  kGameMessageReserveSites[0].original[2] ==
+                      (kGameMessageOriginalReserve >> 8) &&
+                  kGameMessageReserveSites[1].replacement[1] ==
+                      (kGameMessageExpandedReserve & 0xff) &&
+                  kGameMessageReserveSites[1].replacement[2] ==
+                      (kGameMessageExpandedReserve >> 8),
+              "message reserve signatures must encode the named sizes");
+static_assert(0x432d65 >= 0x8adcf && 0x43309e + 13 <= 0x448974,
+              "message reserve sites must lie inside the capacity window");
+
+// Mission-loadout parser 0x42F480 addresses block i of the 0x24600-byte
+// mission state as r14 (state+0x14A40) + i*0x3E90, computed in r10 at
+// 0x42F7C9 and again in r9 at 0x42F898. Only its bulk copy is bounded to four
+// (0x42F7E5); armor (+0xF8), class (+0), six weapon ids (+8+class*0x18) and
+// the block's last 48 bytes (+0x3E60) are written for every index. P4 already
+// reaches state+0x283D0 and P5 lands about 16 KiB past the allocation, inside
+// other heap blocks (heap corruption 0xC0000374 at stage load). Both
+// multiplications are relayed: indices 0..3 keep the native product, 4..7
+// select a plugin-owned block and larger indices a discard block. The
+// parser's own displacements are unchanged, so the relays produce
+// block - 0xF0 - r14.
+constexpr uintptr_t kMissionLoadoutParserBlockOffsetRva = 0x42f7c9;
+constexpr uintptr_t kMissionLoadoutParserBlockOffsetReturnRva = 0x42f7d0;
+constexpr uintptr_t kMissionLoadoutParserRecordOffsetRva = 0x42f898;
+constexpr uintptr_t kMissionLoadoutParserRecordOffsetReturnRva = 0x42f89f;
+constexpr std::array<uint8_t, 7> kMissionLoadoutParserBlockOffsetOriginal = {
+    0x4c, 0x69, 0xd1, 0x90, 0x3e, 0x00, 0x00,  // imul r10,rcx,0x3e90
+};
+constexpr std::array<uint8_t, 7> kMissionLoadoutParserRecordOffsetOriginal = {
+    0x4d, 0x69, 0xc9, 0x90, 0x3e, 0x00, 0x00,  // imul r9,r9,0x3e90
+};
+constexpr size_t kMissionLoadoutParserBlockStride = 0x3e90;
+constexpr size_t kMissionLoadoutParserBlockDisplacement = 0xf0;
+constexpr unsigned kMissionLoadoutParserNativeBlocks = 4;
+constexpr unsigned kMissionLoadoutParserExtraBlocks = 4;
+// The parser copies a participant's 0x3E60-byte loadout image (per-weapon
+// data consumed by the character factory, e.g. 0x8AE00 reads block+4) only
+// when `cmp ecx,4` at 0x42F7E5 passes. Once both index relays are installed
+// that copy's destination (state+0x14B30+r10) is the plugin block, so the
+// bound is raised to eight in the same transaction; without it P4-P7 kept a
+// borrowed P0-P3 image (wrong weapon stats). Indices >= 8 stay skipped.
+constexpr uintptr_t kMissionLoadoutParserBulkBoundRva = 0x42f7e5;
+constexpr std::array<uint8_t, 3> kMissionLoadoutParserBulkBoundOriginal = {
+    0x83, 0xf9, 0x04,  // cmp ecx,4
+};
+constexpr std::array<uint8_t, 3> kMissionLoadoutParserBulkBoundReplacement = {
+    0x83, 0xf9, 0x08,  // cmp ecx,8
+};
+static_assert(kMissionLoadoutParserBlockOffsetRva +
+                      kMissionLoadoutParserBlockOffsetOriginal.size() ==
+                  kMissionLoadoutParserBlockOffsetReturnRva &&
+              kMissionLoadoutParserRecordOffsetRva +
+                      kMissionLoadoutParserRecordOffsetOriginal.size() ==
+                  kMissionLoadoutParserRecordOffsetReturnRva,
+              "parser relays must return after the replaced imul");
+// 0x2000..0x3800 holds the 24 enemy-health relays (0.6.78).
+constexpr size_t kMissionRelayPageSize = 0x4000;
 constexpr size_t kMissionRedirectStubOffset = 0x000;
 constexpr size_t kMissionCopyStubOffset = 0x080;  // legacy harness layout
 constexpr size_t kMissionExistingRedirectStubOffset = 0x100;
@@ -408,6 +567,159 @@ constexpr size_t kParticipantScalingStubOffset = 0x600;
 constexpr size_t kParticipantScalingStubStride = 0x30;
 constexpr size_t kParticipantScalingClampHitsOffset = 0x1100;
 constexpr size_t kParticipantScalingClampMaskOffset = 0x1108;
+constexpr size_t kMissionSpawnTransformClampCounterOffset = 0x1110;
+constexpr size_t kMissionLoadoutParserBaseOffset = 0x1118;
+constexpr size_t kMissionLoadoutParserRedirectCounterOffset = 0x1120;
+constexpr size_t kMissionLoadoutParserDiscardCounterOffset = 0x1128;
+constexpr size_t kMissionSpawnTransformStubOffset = 0x1180;
+constexpr size_t kMissionSpawnTransformStubSize = 0x40;
+constexpr size_t kMissionLoadoutParserBlockStubOffset = 0x1200;
+constexpr size_t kMissionLoadoutParserRecordStubOffset = 0x1280;
+constexpr size_t kMissionLoadoutParserStubSize = 0x80;
+constexpr size_t kMissionScriptRecordStubAOffset = 0x1300;
+constexpr size_t kMissionScriptRecordStubBOffset = 0x1380;
+constexpr size_t kMissionScriptRecordStubSize = 0x80;
+constexpr size_t kMissionScriptEmptyRecordOffset = 0x1400;
+constexpr size_t kMissionScriptRecordRedirectCounterOffset = 0x1420;
+constexpr size_t kMissionScriptRecordEmptyCounterOffset = 0x1428;
+static_assert(kMissionLoadoutParserRecordStubOffset +
+                      kMissionLoadoutParserStubSize <=
+                  kMissionScriptRecordStubAOffset &&
+              kMissionScriptRecordStubAOffset +
+                      kMissionScriptRecordStubSize <=
+                  kMissionScriptRecordStubBOffset &&
+              kMissionScriptRecordStubBOffset +
+                      kMissionScriptRecordStubSize <=
+                  kMissionScriptEmptyRecordOffset &&
+              kMissionScriptEmptyRecordOffset + 0x18 <=
+                  kMissionScriptRecordRedirectCounterOffset &&
+              kMissionScriptRecordEmptyCounterOffset + sizeof(uint64_t) <=
+                  kMissionRelayPageSize,
+              "script record relays overlap the relay page layout");
+
+// Global slot holding the 0x24600-byte mission state (also read by
+// the parser and the scaling relays).
+constexpr uintptr_t kMissionStateSlotRva = 0x125ab30;
+
+// The online seat pickers of Vehicle507_Rescuetank (Caliban, 0x34F880) and
+// Vehicle_Car (0x374DB0, cars with at least five seats) allow the driver seat
+// plus one dedicated rear seat per player: vec[0] = vec[index + 1] = index in
+// an int vector sized by the seat count [vehicle+0x428]. 0x356060 then takes
+// the first allowed seat that 0x355BE0 accepts (team, class, occupancy,
+// distance). A five-seat Caliban has no rear seat for player indices 4..7
+// (players 5/6 could only drive it, live 2026-10-03) and the native write
+// lands past the vector. Give those players the rear seat of player
+// index % rear_seats, and let anyone whose preferred rear seat is already
+// taken use every rear seat. Boarding sends the chosen seat index, so the
+// other machines follow unchanged.
+constexpr uintptr_t kCalibanSeatRva = 0x34f9ad;
+constexpr uintptr_t kCalibanSeatReturnRva = 0x34f9bb;
+constexpr uintptr_t kCarSeatRva = 0x374eed;
+constexpr uintptr_t kCarSeatReturnRva = 0x374efb;
+constexpr std::array<uint8_t, 14> kRearSeatOriginal = {
+    0x45, 0x89, 0x2e,              // mov [r14],r13d
+    0x41, 0x8d, 0x45, 0x01,        // lea eax,[r13+1]
+    0x48, 0x63, 0xd0,              // movsxd rdx,eax
+    0x45, 0x89, 0x2c, 0x96,        // mov [r14+rdx*4],r13d
+};
+constexpr uint32_t kVehicleSeatArrayOffset = 0x418;
+constexpr uint32_t kVehicleSeatStride = 0x340;
+constexpr uint32_t kVehicleSeatOccupantControlOffset = 0x268;
+constexpr size_t kCalibanSeatStubOffset = 0x1480;
+constexpr size_t kCarSeatStubOffset = 0x1580;
+constexpr size_t kRearSeatStubSize = 0x100;
+constexpr size_t kRearSeatPartnerCounterOffset = 0x1430;
+constexpr size_t kRearSeatAnyCounterOffset = 0x1438;
+static_assert(kMissionScriptRecordEmptyCounterOffset + sizeof(uint64_t) <=
+                  kRearSeatPartnerCounterOffset,
+              "rear seat telemetry overlaps script record telemetry");
+static_assert(kMissionScriptRecordStubBOffset +
+                      kMissionScriptRecordStubSize <=
+                  kCalibanSeatStubOffset &&
+                  kCalibanSeatStubOffset + kRearSeatStubSize <=
+                      kCarSeatStubOffset &&
+                  kCarSeatStubOffset + kRearSeatStubSize <=
+                      kMissionRelayPageSize,
+              "rear seat relays overlap or exceed relay page");
+
+// 24 enemy initializers set max/current HP (+0x1F8/+0x1FC) to base x
+// difficulty multiplier x table[count - 1], a four-entry per-player-count
+// array of the difficulty config (Inferno 1.2/1.1/1.15/1.2; with the online
+// multiplier 2.2 this gives the documented 2.64/2.42/2.53/2.64). With more
+// than four players the scaling relays above select the four-player entry.
+// ExtendedEnemyHealthScaling continues the table's last step instead:
+// factor(n) = t3 + (n - 4) * (t3 - t2), never below t3, for n = 5..8
+// (Inferno 1.25/1.30/1.35/1.40), unless EnemyHealth<n>Players sets a fixed
+// multiple m of the four-player health (factor = m * t3). Each site is the
+// mulss right after its participant-count read; every count read comes from
+// [0x125AB30].
+struct HealthScalingPatchSite {
+    uintptr_t rva;
+    std::array<uint8_t, 7> original;
+    size_t instruction_size;
+};
+
+constexpr std::array<HealthScalingPatchSite, 24> kHealthScalingSites = {{
+    {0x1cff15, {0xf3, 0x0f, 0x59, 0x44, 0x91, 0x08}, 6},        // 0x1cfeff
+    {0x1ddc40, {0xf3, 0x41, 0x0f, 0x59, 0x44, 0x80, 0x08}, 7},  // 0x1ddbe8
+    {0x1e4266, {0xf3, 0x42, 0x0f, 0x59, 0x44, 0x82, 0x08}, 7},  // 0x1e424d
+    {0x1e64c3, {0xf3, 0x0f, 0x59, 0x5c, 0x91, 0x08}, 6},        // 0x1e6497
+    {0x1ecbc0, {0xf3, 0x0f, 0x59, 0x44, 0x91, 0x08}, 6},        // 0x1ecbaa
+    {0x1f876e, {0xf3, 0x0f, 0x59, 0x44, 0x82, 0x08}, 6},        // 0x1f872c
+    {0x1f89f0, {0xf3, 0x0f, 0x59, 0x4c, 0x91, 0x08}, 6},        // 0x1f89da
+    {0x1ff765, {0xf3, 0x0f, 0x59, 0x44, 0x91, 0x08}, 6},        // 0x1ff74f
+    {0x20aa1c, {0xf3, 0x0f, 0x59, 0x44, 0x91, 0x08}, 6},        // 0x20aa06
+    {0x214f44, {0xf3, 0x0f, 0x59, 0x5c, 0x91, 0x08}, 6},        // 0x214f2e
+    {0x21ec83, {0xf3, 0x0f, 0x59, 0x44, 0x91, 0x08}, 6},        // 0x21ec6d
+    {0x22a994, {0xf3, 0x41, 0x0f, 0x59, 0x44, 0x80, 0x08}, 7},  // 0x22a94a
+    {0x26ec24, {0xf3, 0x0f, 0x59, 0x4c, 0x91, 0x08}, 6},        // 0x26ec0e
+    {0x278732, {0xf3, 0x41, 0x0f, 0x59, 0x44, 0x80, 0x08}, 7},  // 0x2786e0
+    {0x283468, {0xf3, 0x0f, 0x59, 0x44, 0x91, 0x08}, 6},        // 0x28344f
+    {0x28c706, {0xf3, 0x0f, 0x59, 0x44, 0x91, 0x08}, 6},        // 0x28c6f0
+    {0x29495a, {0xf3, 0x0f, 0x59, 0x4c, 0x91, 0x08}, 6},        // 0x294944
+    {0x297f22, {0xf3, 0x0f, 0x59, 0x4c, 0x91, 0x08}, 6},        // 0x297f0c
+    {0x29a9a2, {0xf3, 0x0f, 0x59, 0x4c, 0x91, 0x08}, 6},        // 0x29a98c
+    {0x2a141a, {0xf3, 0x0f, 0x59, 0x44, 0x91, 0x08}, 6},        // 0x2a1402
+    {0x2a7419, {0xf3, 0x41, 0x0f, 0x59, 0x44, 0x80, 0x08}, 7},  // 0x2a73c7
+    {0x2c075c, {0xf3, 0x0f, 0x59, 0x44, 0x91, 0x08}, 6},        // 0x2c0746
+    {0x2cadca, {0xf3, 0x0f, 0x59, 0x44, 0x91, 0x08}, 6},        // 0x2cadb4
+    {0x2d4b7e, {0xf3, 0x41, 0x0f, 0x59, 0x44, 0x80, 0x08}, 7},  // 0x2d4b29
+}};
+// The table index register holds 3 * (count - 1); the scaling relays leave
+// 3 * (4 - 1) for every count above four.
+constexpr uint8_t kHealthScalingFourPlayerIndex = 9;
+constexpr size_t kHealthScalingStubOffset = 0x2000;
+constexpr size_t kHealthScalingStubStride = 0x100;
+constexpr size_t kHealthScalingAppliedCounterOffset = 0x1440;
+constexpr size_t kHealthScalingSiteMaskOffset = 0x1448;
+constexpr size_t kHealthScalingEnabledOffset = 0x1450;
+constexpr size_t kHealthScalingLastFactorOffset = 0x1454;
+constexpr size_t kHealthScalingLastCountOffset = 0x1458;
+// Four floats for 5..8 participants: multiple of the four-player health, or
+// 0 for the continued table step.
+constexpr size_t kHealthScalingCustomOffset = 0x1460;
+constexpr unsigned kHealthScalingCustomCount = 4;
+constexpr int32_t kHealthScalingFirstCustomCount = 5;
+constexpr float kHealthScalingCustomMinimum = 0.1f;
+constexpr float kHealthScalingCustomMaximum = 20.0f;
+static_assert(kRearSeatAnyCounterOffset + sizeof(uint64_t) <=
+                  kHealthScalingAppliedCounterOffset &&
+                  kHealthScalingLastCountOffset + sizeof(int32_t) <=
+                      kHealthScalingCustomOffset &&
+                  kHealthScalingCustomOffset +
+                          kHealthScalingCustomCount * sizeof(float) <=
+                      kCalibanSeatStubOffset,
+              "health scaling telemetry overlaps neighbouring relay data");
+static_assert(kCarSeatStubOffset + kRearSeatStubSize <=
+                  kHealthScalingStubOffset &&
+                  kHealthScalingStubOffset +
+                          kHealthScalingSites.size() *
+                              kHealthScalingStubStride <=
+                      kMissionRelayPageSize,
+              "health scaling relays overlap or exceed relay page");
+static_assert(kHealthScalingSites.size() <= 64,
+              "health scaling site mask holds 64 sites");
+
 constexpr size_t kMissionParticipantCountOffset = 0x245a0;
 constexpr int32_t kNativeParticipantScalingCapacity = 4;
 constexpr size_t kMissionRecordSize = 0x18;
@@ -424,8 +736,36 @@ static_assert(kParticipantScalingStubOffset +
               kParticipantScalingClampHitsOffset,
               "participant scaling relays overlap telemetry");
 static_assert(kParticipantScalingClampMaskOffset + sizeof(uint64_t) <=
+                  kMissionSpawnTransformClampCounterOffset,
+              "participant scaling telemetry overlaps spawn telemetry");
+static_assert(kMissionSpawnTransformClampCounterOffset + sizeof(uint64_t) <=
+                  kMissionLoadoutParserBaseOffset &&
+              kMissionLoadoutParserDiscardCounterOffset + sizeof(uint64_t) <=
+                  kMissionSpawnTransformStubOffset &&
+              kMissionSpawnTransformStubOffset +
+                      kMissionSpawnTransformStubSize <=
+                  kMissionLoadoutParserBlockStubOffset &&
+              kMissionLoadoutParserBlockStubOffset +
+                      kMissionLoadoutParserStubSize <=
+                  kMissionLoadoutParserRecordStubOffset &&
+              kMissionLoadoutParserRecordStubOffset +
+                      kMissionLoadoutParserStubSize <=
                   kMissionRelayPageSize,
-              "participant scaling telemetry exceeds relay page");
+              "spawn/parser relays exceed relay page");
+// The parser sites are written inside the capacity protection window
+// (first scaling site .. end of the roster region) that install and restore
+// already unprotect and flush.
+static_assert(kMissionLoadoutParserBlockOffsetRva >= 0x8adcf &&
+              kMissionLoadoutParserRecordOffsetReturnRva <=
+                  kCapacityRegionRva + kCapacityRegionSize,
+              "parser relays must lie inside the capacity patch window");
+
+// Destination of parser blocks 4..7 plus one discard block for corrupt
+// indices >= 8. Lives in the plugin image, never in EDF5's heap.
+alignas(64) std::array<uint8_t, (kMissionLoadoutParserExtraBlocks + 1) *
+                                    kMissionLoadoutParserBlockStride>
+    g_mission_loadout_parser_blocks{};
+std::atomic<bool> g_mission_loadout_parser_redirect_test{false};
 
 uint8_t* g_mission_relay_page = nullptr;
 unsigned g_mission_relay_capacity = 0;
@@ -437,6 +777,19 @@ std::atomic<uint64_t> g_reported_existing_redirects{0};
 std::atomic<uint64_t> g_reported_append_redirects{0};
 std::atomic<uint64_t> g_reported_participant_scaling_clamp_hits{0};
 std::atomic<uint64_t> g_reported_participant_scaling_clamp_mask{0};
+std::atomic<uint64_t> g_reported_spawn_transform_clamps{0};
+std::atomic<uint64_t> g_reported_script_record_redirects{0};
+std::atomic<uint64_t> g_reported_script_record_empties{0};
+std::atomic<uint64_t> g_reported_rear_seat_partner_choices{0};
+std::atomic<uint64_t> g_reported_rear_seat_any_choices{0};
+std::atomic<uint64_t> g_reported_health_scaling_applied{0};
+std::atomic<uint64_t> g_reported_health_scaling_mask{0};
+std::atomic<bool> g_extended_health_scaling{true};
+// Float bits of EnemyHealth5Players..EnemyHealth8Players; 0 = auto.
+std::array<std::atomic<uint32_t>, kHealthScalingCustomCount>
+    g_enemy_health_multiplier_bits{};
+std::atomic<uint64_t> g_reported_parser_redirects{0};
+std::atomic<uint64_t> g_reported_parser_discards{0};
 
 // EDF5.exe RVA 0x44894b. The two imm32 values are the requested size passed to
 // the internal pointer-table grow/check helpers. Both must change together.
@@ -728,6 +1081,26 @@ void EmitU64(uint8_t*& cursor, uint64_t value) {
     cursor += sizeof(value);
 }
 
+void EmitU32(uint8_t*& cursor, uint32_t value) {
+    std::memcpy(cursor, &value, sizeof(value));
+    cursor += sizeof(value);
+}
+
+// disp32 of a RIP-relative operand; trailing_bytes counts any immediate that
+// follows the displacement inside the same instruction.
+bool EmitRipDisplacement(uint8_t*& cursor, const uint8_t* target,
+                         size_t trailing_bytes) {
+    const int64_t difference =
+        reinterpret_cast<int64_t>(target) -
+        reinterpret_cast<int64_t>(cursor + sizeof(int32_t) + trailing_bytes);
+    if (difference < std::numeric_limits<int32_t>::min() ||
+        difference > std::numeric_limits<int32_t>::max()) {
+        return false;
+    }
+    EmitU32(cursor, static_cast<uint32_t>(static_cast<int32_t>(difference)));
+    return true;
+}
+
 bool EmitRelative32(uint8_t*& cursor, uint8_t opcode,
                     const uint8_t* target) {
     if (!WriteRelative32(cursor, opcode, target)) return false;
@@ -840,6 +1213,479 @@ bool BuildParticipantScalingRelays(uint8_t* page) {
         }
     }
     return true;
+}
+
+// Emits one parser index relay. `index_register` is rcx (block site) or r9
+// (record site); `destination` receives the native product for 0..3 or
+// block - 0xF0 - r14 for the plugin-owned blocks. Flags are dead at both
+// return points (the next flag consumer follows a fresh cmp/add).
+bool EmitMissionLoadoutParserRelay(uint8_t* image, uint8_t* page,
+                                   size_t stub_offset, bool record_site) {
+    uint8_t* cursor = page + stub_offset;
+    uint8_t* const stub = cursor;
+    const uint8_t* const return_target = image +
+        (record_site ? kMissionLoadoutParserRecordOffsetReturnRva
+                     : kMissionLoadoutParserBlockOffsetReturnRva);
+    if (record_site) {
+        EmitBytes(cursor, {0x49, 0x83, 0xf9, 0x04,  // cmp r9,4
+                           0x73, 0x00});            // jae extra
+    } else {
+        EmitBytes(cursor, {0x48, 0x83, 0xf9, 0x04,  // cmp rcx,4
+                           0x73, 0x00});            // jae extra
+    }
+    uint8_t* const extra_branch = cursor - 1;
+    const auto& original = record_site
+        ? kMissionLoadoutParserRecordOffsetOriginal
+        : kMissionLoadoutParserBlockOffsetOriginal;
+    std::memcpy(cursor, original.data(), original.size());
+    cursor += original.size();
+    if (!EmitRelative32(cursor, 0xe9, return_target)) return false;
+
+    uint8_t* const extra = cursor;
+    if (record_site) {
+        EmitBytes(cursor, {0x49, 0x83, 0xf9, 0x08,  // cmp r9,8
+                           0x73, 0x00});            // jae discard
+    } else {
+        EmitBytes(cursor, {0x48, 0x83, 0xf9, 0x08,  // cmp rcx,8
+                           0x73, 0x00});            // jae discard
+    }
+    uint8_t* const discard_branch = cursor - 1;
+    if (record_site) {
+        EmitBytes(cursor, {0x49, 0x83, 0xe9, 0x04});  // sub r9,4
+    } else {
+        EmitBytes(cursor, {0x4c, 0x8d, 0x51, 0xfc});  // lea r10,[rcx-4]
+        if (!EmitLockIncrement(
+                cursor, page + kMissionLoadoutParserRedirectCounterOffset)) {
+            return false;
+        }
+    }
+    EmitBytes(cursor, {0xeb, 0x00});  // jmp compute
+    uint8_t* const compute_branch = cursor - 1;
+
+    uint8_t* const discard = cursor;
+    if (record_site) {
+        EmitBytes(cursor, {0x41, 0xb9, 0x04, 0x00, 0x00, 0x00});  // mov r9d,4
+    } else {
+        EmitBytes(cursor, {0x41, 0xba, 0x04, 0x00, 0x00, 0x00});  // mov r10d,4
+        if (!EmitLockIncrement(
+                cursor, page + kMissionLoadoutParserDiscardCounterOffset)) {
+            return false;
+        }
+    }
+
+    uint8_t* const compute = cursor;
+    if (record_site) {
+        EmitBytes(cursor, {0x4d, 0x69, 0xc9, 0x90, 0x3e, 0x00, 0x00,  // imul r9,r9
+                           0x4c, 0x03, 0x0d});                        // add r9,[rip]
+    } else {
+        EmitBytes(cursor, {0x4d, 0x69, 0xd2, 0x90, 0x3e, 0x00, 0x00,  // imul r10,r10
+                           0x4c, 0x03, 0x15});                        // add r10,[rip]
+    }
+    const int64_t base_difference =
+        reinterpret_cast<int64_t>(page + kMissionLoadoutParserBaseOffset) -
+        reinterpret_cast<int64_t>(cursor + 4);
+    if (base_difference < std::numeric_limits<int32_t>::min() ||
+        base_difference > std::numeric_limits<int32_t>::max()) {
+        return false;
+    }
+    const int32_t base_relative = static_cast<int32_t>(base_difference);
+    std::memcpy(cursor, &base_relative, sizeof(base_relative));
+    cursor += sizeof(base_relative);
+    if (record_site) {
+        EmitBytes(cursor, {0x4d, 0x2b, 0xce});  // sub r9,r14
+    } else {
+        EmitBytes(cursor, {0x4d, 0x2b, 0xd6});  // sub r10,r14
+    }
+    if (!EmitRelative32(cursor, 0xe9, return_target) ||
+        !PatchRelative8(extra_branch, extra) ||
+        !PatchRelative8(discard_branch, discard) ||
+        !PatchRelative8(compute_branch, compute) ||
+        cursor > stub + kMissionLoadoutParserStubSize) {
+        return false;
+    }
+    return true;
+}
+
+bool BuildMissionLoadoutParserRelays(uint8_t* image, uint8_t* page) {
+    const uint64_t base =
+        reinterpret_cast<uint64_t>(g_mission_loadout_parser_blocks.data()) -
+        kMissionLoadoutParserBlockDisplacement;
+    std::memcpy(page + kMissionLoadoutParserBaseOffset, &base, sizeof(base));
+    std::memset(page + kMissionLoadoutParserRedirectCounterOffset, 0,
+                sizeof(uint64_t));
+    std::memset(page + kMissionLoadoutParserDiscardCounterOffset, 0,
+                sizeof(uint64_t));
+    return EmitMissionLoadoutParserRelay(
+               image, page, kMissionLoadoutParserBlockStubOffset, false) &&
+           EmitMissionLoadoutParserRelay(
+               image, page, kMissionLoadoutParserRecordStubOffset, true);
+}
+
+// rsi = vector size (seat count), r14 = vector, r13d = player index and
+// rbp = vehicle. rax/rcx/rdx/r8 and the flags are dead at both sites; rbx
+// (0), r12 (-1), r13, r14, r15, rsi and rbp stay untouched.
+// The preferred rear seat is the native index + 1 when it exists, otherwise
+// 1 + index % rear_seats. When another player already sits there, every rear
+// seat is allowed, so nobody is locked out while a rear seat is free. With
+// four players no seat is ever taken by someone else, so the native choice
+// stays unchanged.
+bool BuildRearSeatRelay(uint8_t* page, uint8_t* image, size_t stub_offset,
+                        uintptr_t return_rva) {
+    if (!page || !image) return false;
+    uint8_t* stub = page + stub_offset;
+    EmitBytes(stub, {0x48, 0x85, 0xf6,          // test rsi,rsi
+                     0x74, 0x00});              // jz exit
+    uint8_t* empty_branch = stub - 1;
+    EmitBytes(stub, {0x45, 0x89, 0x2e,          // mov [r14],r13d (driver)
+                     0x45, 0x85, 0xed,          // test r13d,r13d
+                     0x78, 0x00});              // js exit
+    uint8_t* negative_branch = stub - 1;
+    EmitBytes(stub, {0x48, 0x8d, 0x4e, 0xff,    // lea rcx,[rsi-1]
+                     0x48, 0x85, 0xc9,          // test rcx,rcx
+                     0x75, 0x05});              // jnz main
+    uint8_t* exit = stub;
+    if (!EmitRelative32(stub, 0xe9, image + return_rva)) return false;
+
+    EmitBytes(stub, {0x45, 0x31, 0xc0,          // main: xor r8d,r8d
+                     0x41, 0x8d, 0x45, 0x01,    // lea eax,[r13+1]
+                     0x48, 0x63, 0xd0,          // movsxd rdx,eax
+                     0x48, 0x39, 0xf2,          // cmp rdx,rsi
+                     0x72, 0x00});              // jb check (native seat)
+    uint8_t* native_branch = stub - 1;
+    EmitBytes(stub, {0x44, 0x89, 0xe8,          // mov eax,r13d
+                     0x31, 0xd2,                // xor edx,edx
+                     0x48, 0xf7, 0xf1,          // div rcx
+                     0x48, 0xff, 0xc2,          // inc rdx (partner seat)
+                     0x41, 0xb0, 0x01});        // mov r8b,1
+    uint8_t* check = stub;
+    EmitBytes(stub, {0x48, 0x69, 0xc2});        // imul rax,rdx,stride
+    EmitU32(stub, kVehicleSeatStride);
+    EmitBytes(stub, {0x48, 0x03, 0x85});        // add rax,[rbp+seats]
+    EmitU32(stub, kVehicleSeatArrayOffset);
+    EmitBytes(stub, {0x48, 0x8b, 0x80});        // mov rax,[rax+occupant]
+    EmitU32(stub, kVehicleSeatOccupantControlOffset);
+    EmitBytes(stub, {0x48, 0x85, 0xc0,          // test rax,rax
+                     0x74, 0x00});              // jz preferred
+    uint8_t* vacant_branch = stub - 1;
+    EmitBytes(stub, {0x83, 0x78, 0x08, 0x00,    // cmp dword [rax+8],0
+                     0x74, 0x00});              // je preferred
+    uint8_t* expired_branch = stub - 1;
+
+    // The preferred seat is taken: allow every rear seat 1..size-1.
+    EmitBytes(stub, {0xb9, 0x01, 0x00, 0x00, 0x00});  // mov ecx,1
+    uint8_t* any_loop = stub;
+    EmitBytes(stub, {0x45, 0x89, 0x2c, 0x8e,    // mov [r14+rcx*4],r13d
+                     0x48, 0xff, 0xc1,          // inc rcx
+                     0x48, 0x39, 0xf1,          // cmp rcx,rsi
+                     0x72, 0x00});              // jb any_loop
+    if (!PatchRelative8(stub - 1, any_loop) ||
+        !EmitLockIncrement(stub, page + kRearSeatAnyCounterOffset)) {
+        return false;
+    }
+    EmitBytes(stub, {0xeb, 0x00});              // jmp done
+    uint8_t* any_done_branch = stub - 1;
+
+    uint8_t* preferred = stub;
+    EmitBytes(stub, {0x45, 0x89, 0x2c, 0x96,    // mov [r14+rdx*4],r13d
+                     0x45, 0x84, 0xc0,          // test r8b,r8b
+                     0x74, 0x00});              // jz done (native seat)
+    uint8_t* native_done_branch = stub - 1;
+    if (!EmitLockIncrement(stub, page + kRearSeatPartnerCounterOffset)) {
+        return false;
+    }
+    uint8_t* done = stub;
+    return EmitRelative32(stub, 0xe9, image + return_rva) &&
+           PatchRelative8(empty_branch, exit) &&
+           PatchRelative8(negative_branch, exit) &&
+           PatchRelative8(native_branch, check) &&
+           PatchRelative8(vacant_branch, preferred) &&
+           PatchRelative8(expired_branch, preferred) &&
+           PatchRelative8(any_done_branch, done) &&
+           PatchRelative8(native_done_branch, done) &&
+           stub <= page + stub_offset + kRearSeatStubSize;
+}
+
+bool BuildRearSeatRelays(uint8_t* page, uint8_t* image) {
+    return BuildRearSeatRelay(page, image, kCalibanSeatStubOffset,
+                              kCalibanSeatReturnRva) &&
+           BuildRearSeatRelay(page, image, kCarSeatStubOffset,
+                              kCarSeatReturnRva);
+}
+
+struct HealthScalingOperands {
+    unsigned destination = 0;  // xmm register of the native mulss
+    unsigned base = 0;
+    unsigned index = 0;
+    uint8_t rex_xb = 0;        // REX.X/REX.B bits of the memory operand
+    uint8_t sib = 0;
+};
+
+// Accept exactly mulss xmmN,[base+index*4+8] (optional REX without W).
+bool DecodeHealthScalingSite(const HealthScalingPatchSite& site,
+                             HealthScalingOperands& operands) {
+    const uint8_t* bytes = site.original.data();
+    size_t at = 1;
+    uint8_t rex = 0;
+    if (site.instruction_size == 7) {
+        rex = bytes[at++];
+        if ((rex & 0xf8) != 0x40) return false;
+    } else if (site.instruction_size != 6) {
+        return false;
+    }
+    const uint8_t modrm = bytes[at + 2];
+    const uint8_t sib = bytes[at + 3];
+    if (bytes[0] != 0xf3 || bytes[at] != 0x0f || bytes[at + 1] != 0x59 ||
+        (modrm & 0xc7) != 0x44 || (sib & 0xc0) != 0x80 ||
+        bytes[at + 4] != 0x08) {
+        return false;
+    }
+    operands.destination = ((modrm >> 3) & 7U) | ((rex & 4U) ? 8U : 0U);
+    operands.base = (sib & 7U) | ((rex & 1U) ? 8U : 0U);
+    operands.index = ((sib >> 3) & 7U) | ((rex & 2U) ? 8U : 0U);
+    operands.rex_xb = static_cast<uint8_t>(rex & 3U);
+    operands.sib = sib;
+    // rsp can be neither the index (none) nor the base (the relay pushes);
+    // xmm15 is the relay's scratch register.
+    return operands.index != 4 && operands.base != 4 &&
+           operands.destination != 15;
+}
+
+// The relay's two scratch registers, neither the table base nor its index.
+// Their low three bits are 0..3, so they never need a SIB or RIP form.
+unsigned HealthScalingScratchRegister(const HealthScalingOperands& operands,
+                                      unsigned skip = 16) {
+    for (const unsigned candidate : {0U, 1U, 2U, 11U}) {
+        if (candidate != operands.base && candidate != operands.index &&
+            candidate != skip) {
+            return candidate;
+        }
+    }
+    return 16;
+}
+
+// pushfq; if enabled, real count n in 5..8 and the table index still on the
+// four-player entry: xmmN *= m(n) * t3 when EnemyHealth<n>Players is set,
+// else max(t3, t3 + (n - 4) * (t3 - t2)), with t3/t2 read through the native
+// operand at +8/-4. Otherwise replay the native mulss. Every register, xmm15
+// and the flags are restored.
+bool BuildHealthScalingRelay(uint8_t* page, uint8_t* image,
+                             size_t site_index) {
+    if (!page || !image || site_index >= kHealthScalingSites.size()) {
+        return false;
+    }
+    const auto& site = kHealthScalingSites[site_index];
+    HealthScalingOperands operands;
+    if (!DecodeHealthScalingSite(site, operands)) return false;
+    const unsigned scratch = HealthScalingScratchRegister(operands);
+    const unsigned custom = HealthScalingScratchRegister(operands, scratch);
+    if (scratch > 15 || custom > 15) return false;
+    const auto s = static_cast<uint8_t>(scratch & 7U);
+    const bool high = scratch >= 8;
+    const auto c = static_cast<uint8_t>(custom & 7U);
+    const bool custom_high = custom >= 8;
+    // [custom + scratch*4]
+    const auto custom_sib = static_cast<uint8_t>(0x80 | (s << 3) | c);
+    const auto custom_xb =
+        static_cast<uint8_t>((high ? 2U : 0U) | (custom_high ? 1U : 0U));
+    uint8_t* const stub = page + kHealthScalingStubOffset +
+        site_index * kHealthScalingStubStride;
+    uint8_t* cursor = stub;
+    const uint8_t* const return_address =
+        image + site.rva + site.instruction_size;
+    const auto table_rex = static_cast<uint8_t>(0x44 | operands.rex_xb);
+    auto emit_table_operation = [&](uint8_t opcode, uint8_t displacement) {
+        // opcode xmm15,[base+index*4+displacement]
+        EmitBytes(cursor, {0xf3, table_rex, 0x0f, opcode, 0x7c, operands.sib,
+                           displacement});
+    };
+    auto emit_high_prefix = [&](uint8_t prefix) {
+        if (high) EmitBytes(cursor, {prefix});
+    };
+
+    // The native exits come first so that every short branch stays in range.
+    EmitBytes(cursor, {0x9c,                    // pushfq
+                       0x83, 0x3d});            // cmp dword [rip+enabled],0
+    if (!EmitRipDisplacement(cursor, page + kHealthScalingEnabledOffset, 1)) {
+        return false;
+    }
+    EmitBytes(cursor, {0x00,
+                       0x75, 0x00});            // jne extended
+    uint8_t* enabled_branch = cursor - 1;
+    uint8_t* native_flags = cursor;
+    EmitBytes(cursor, {0x9d});                  // popfq
+    std::memcpy(cursor, site.original.data(), site.instruction_size);
+    cursor += site.instruction_size;
+    if (!EmitRelative32(cursor, 0xe9, return_address)) return false;
+    uint8_t* native = cursor;
+    emit_high_prefix(0x41);
+    EmitBytes(cursor, {static_cast<uint8_t>(0x58 + s),  // pop scratch
+                       0xeb, 0x00});                    // jmp native_flags
+    if (!PatchRelative8(cursor - 1, native_flags)) return false;
+
+    uint8_t* extended = cursor;
+    emit_high_prefix(0x41);
+    EmitBytes(cursor, {static_cast<uint8_t>(0x50 + s)});  // push scratch
+    EmitBytes(cursor, {static_cast<uint8_t>(high ? 0x49 : 0x48),
+                       static_cast<uint8_t>(0xb8 + s)});  // mov scratch,imm64
+    EmitU64(cursor, reinterpret_cast<uint64_t>(
+                        image + kMissionStateSlotRva));
+    const auto wide = static_cast<uint8_t>(high ? 0x4d : 0x48);
+    EmitBytes(cursor, {wide, 0x8b, static_cast<uint8_t>((s << 3) | s),
+                                                // mov scratch,[scratch]
+                       wide, 0x85, static_cast<uint8_t>(0xc0 | (s << 3) | s),
+                                                // test scratch,scratch
+                       0x74, 0x00});            // jz native
+    uint8_t* null_branch = cursor - 1;
+    emit_high_prefix(0x45);
+    EmitBytes(cursor, {0x8b, static_cast<uint8_t>(0x80 | (s << 3) | s)});
+    EmitU32(cursor, static_cast<uint32_t>(kMissionParticipantCountOffset));
+                                                // mov scratch32,[scratch+count]
+    emit_high_prefix(0x41);
+    EmitBytes(cursor, {0x83, static_cast<uint8_t>(0xf8 | s), 0x04,
+                       0x7e, 0x00});            // cmp scratch32,4 ; jle native
+    uint8_t* low_branch = cursor - 1;
+    emit_high_prefix(0x41);
+    EmitBytes(cursor, {0x83, static_cast<uint8_t>(0xf8 | s), 0x08,
+                       0x7f, 0x00});            // cmp scratch32,8 ; jg native
+    uint8_t* high_branch = cursor - 1;
+    EmitBytes(cursor, {static_cast<uint8_t>(operands.index >= 8 ? 0x49 : 0x48),
+                       0x83,
+                       static_cast<uint8_t>(0xf8 | (operands.index & 7U)),
+                       kHealthScalingFourPlayerIndex,
+                       0x75, 0x00});            // cmp index,9 ; jne native
+    uint8_t* index_branch = cursor - 1;
+    emit_high_prefix(0x44);
+    EmitBytes(cursor, {0x89, static_cast<uint8_t>(0x05 | (s << 3))});
+    if (!EmitRipDisplacement(cursor, page + kHealthScalingLastCountOffset, 0)) {
+        return false;                           // mov [rip+last_count],scratch32
+    }
+    EmitBytes(cursor, {0x48, 0x83, 0xec, 0x10,  // sub rsp,16
+                       0xf3, 0x44, 0x0f, 0x7f, 0x3c, 0x24});
+                                                // movdqu [rsp],xmm15
+    if (custom_high) EmitBytes(cursor, {0x41});
+    EmitBytes(cursor, {static_cast<uint8_t>(0x50 + c),  // push custom
+                       static_cast<uint8_t>(custom_high ? 0x4c : 0x48), 0x8d,
+                       static_cast<uint8_t>(0x05 | (c << 3))});
+    if (!EmitRipDisplacement(cursor,
+                             page + kHealthScalingCustomOffset -
+                                 static_cast<size_t>(
+                                     kHealthScalingFirstCustomCount) *
+                                     sizeof(float),
+                             0)) {
+        return false;                           // lea custom,[rip+table-20]
+    }
+    if (custom_xb) EmitBytes(cursor, {static_cast<uint8_t>(0x40 | custom_xb)});
+    EmitBytes(cursor, {0x83, 0x3c, custom_sib, 0x00,
+                                                // cmp dword [custom+n*4],0
+                       0x74, 0x00});            // je automatic
+    uint8_t* automatic_branch = cursor - 1;
+    EmitBytes(cursor, {0xf3, static_cast<uint8_t>(0x44 | custom_xb), 0x0f, 0x10,
+                       0x3c, custom_sib});      // movss xmm15,[custom+n*4]
+    emit_table_operation(0x59, 0x08);           // mulss xmm15,t3
+    if (custom_high) EmitBytes(cursor, {0x41});
+    EmitBytes(cursor, {static_cast<uint8_t>(0x58 + c),  // pop custom
+                       0xeb, 0x00});                    // jmp apply
+    uint8_t* custom_done_branch = cursor - 1;
+
+    uint8_t* automatic = cursor;
+    if (custom_high) EmitBytes(cursor, {0x41});
+    EmitBytes(cursor, {static_cast<uint8_t>(0x58 + c)});  // pop custom
+    emit_high_prefix(0x41);
+    EmitBytes(cursor, {0x83, static_cast<uint8_t>(0xe8 | s), 0x04});
+                                                // sub scratch32,4
+    emit_table_operation(0x10, 0x08);           // movss xmm15,t3
+    uint8_t* step = cursor;
+    emit_table_operation(0x58, 0x08);           // addss xmm15,t3
+    emit_table_operation(0x5c, 0xfc);           // subss xmm15,t2
+    emit_high_prefix(0x41);
+    EmitBytes(cursor, {0xff, static_cast<uint8_t>(0xc8 | s),
+                                                // dec scratch32
+                       0x75, 0x00});            // jnz step
+    if (!PatchRelative8(cursor - 1, step)) return false;
+    emit_table_operation(0x5f, 0x08);           // maxss xmm15,t3
+    uint8_t* apply = cursor;
+    if (!PatchRelative8(automatic_branch, automatic) ||
+        !PatchRelative8(custom_done_branch, apply)) {
+        return false;
+    }
+    EmitBytes(cursor, {0xf3,
+                       static_cast<uint8_t>(
+                           0x41 | ((operands.destination & 8U) ? 4U : 0U)),
+                       0x0f, 0x59,
+                       static_cast<uint8_t>(
+                           0xc7 | ((operands.destination & 7U) << 3)),
+                                                // mulss xmmN,xmm15
+                       0xf3, 0x44, 0x0f, 0x11, 0x3d});
+    if (!EmitRipDisplacement(cursor, page + kHealthScalingLastFactorOffset,
+                             0)) {
+        return false;                           // movss [rip+last_factor],xmm15
+    }
+    EmitBytes(cursor, {0xf3, 0x44, 0x0f, 0x6f, 0x3c, 0x24,
+                                                // movdqu xmm15,[rsp]
+                       0x48, 0x83, 0xc4, 0x10});  // add rsp,16
+    if (!EmitLockIncrement(cursor,
+                           page + kHealthScalingAppliedCounterOffset) ||
+        !EmitLockBitSet(cursor, page + kHealthScalingSiteMaskOffset,
+                        static_cast<uint8_t>(site_index))) {
+        return false;
+    }
+    emit_high_prefix(0x41);
+    EmitBytes(cursor, {static_cast<uint8_t>(0x58 + s),  // pop scratch
+                       0x9d});                          // popfq
+    return EmitRelative32(cursor, 0xe9, return_address) &&
+           PatchRelative8(enabled_branch, extended) &&
+           PatchRelative8(null_branch, native) &&
+           PatchRelative8(low_branch, native) &&
+           PatchRelative8(high_branch, native) &&
+           PatchRelative8(index_branch, native) &&
+           cursor <= stub + kHealthScalingStubStride;
+}
+
+bool BuildHealthScalingRelays(uint8_t* page, uint8_t* image) {
+    for (size_t index = 0; index < kHealthScalingSites.size(); ++index) {
+        if (!BuildHealthScalingRelay(page, image, index)) return false;
+    }
+    return true;
+}
+
+// cmp rax,4 / native address | cmp rax,8 / sidecar | empty record.
+bool EmitMissionScriptRecordRelay(uint8_t* image, uint8_t* page,
+                                  size_t stub_offset,
+                                  std::initializer_list<uint8_t> native,
+                                  uintptr_t return_rva) {
+    uint8_t* stub = page + stub_offset;
+    EmitBytes(stub, {0x48, 0x83, 0xf8, 0x04,          // cmp rax,4
+                     0x73, 0x00});                    // jae extra
+    uint8_t* extra_branch = stub - 1;
+    EmitBytes(stub, native);
+    if (!EmitRelative32(stub, 0xe9, image + return_rva)) return false;
+    uint8_t* extra = stub;
+    EmitBytes(stub, {0x48, 0x83, 0xf8, 0x08,          // cmp rax,8
+                     0x73, 0x00});                    // jae empty
+    uint8_t* empty_branch = stub - 1;
+    EmitBytes(stub, {0x48, 0x8d, 0x0c, 0x40,          // lea rcx,[rax+rax*2]
+                     0x48, 0xb8});                    // mov rax,imm64
+    EmitU64(stub, reinterpret_cast<uint64_t>(page + kMissionSidecarOffset) -
+                      4 * kMissionRecordSize + kMissionScriptRecordWeakOffset);
+    EmitBytes(stub, {0x48, 0x8d, 0x0c, 0xc8});        // lea rcx,[rax+rcx*8]
+    if (!EmitLockIncrement(stub,
+                           page + kMissionScriptRecordRedirectCounterOffset) ||
+        !EmitRelative32(stub, 0xe9, image + return_rva)) {
+        return false;
+    }
+    uint8_t* empty = stub;
+    EmitBytes(stub, {0x48, 0xb9});                    // mov rcx,imm64
+    EmitU64(stub, reinterpret_cast<uint64_t>(
+                      page + kMissionScriptEmptyRecordOffset +
+                      kMissionScriptRecordWeakOffset));
+    if (!EmitLockIncrement(stub,
+                           page + kMissionScriptRecordEmptyCounterOffset) ||
+        !EmitRelative32(stub, 0xe9, image + return_rva)) {
+        return false;
+    }
+    return PatchRelative8(extra_branch, extra) &&
+           PatchRelative8(empty_branch, empty) &&
+           stub <= page + stub_offset + kMissionScriptRecordStubSize;
 }
 
 bool BuildMissionRelayPage(uint8_t* image, unsigned max_players) {
@@ -1008,6 +1854,85 @@ bool BuildMissionRelayPage(uint8_t* image, unsigned max_players) {
         return fail();
     }
 
+    if (!BuildMissionLoadoutParserRelays(image, page)) {
+        return fail();
+    }
+
+    // Spawn transform backedge: keep the native exit when edi reaches the
+    // participant count, loop only while edi addresses one of the four native
+    // records, and count every run that had to stop at four. Flags are dead at
+    // the exit, whose first flag consumer follows a fresh cmp.
+    uint8_t* spawn_transform = page + kMissionSpawnTransformStubOffset;
+    EmitBytes(spawn_transform, {0x3b, 0x7c, 0x24, 0x50,  // cmp edi,[rsp+0x50]
+                                0x74, 0x00});            // je exit
+    uint8_t* spawn_transform_exit_branch = spawn_transform - 1;
+    EmitBytes(spawn_transform, {0x83, 0xff, 0x04,        // cmp edi,4
+                                0x73, 0x00});            // jae clamp
+    uint8_t* spawn_transform_clamp_branch = spawn_transform - 1;
+    if (!EmitRelative32(spawn_transform, 0xe9,
+                        image + kMissionSpawnTransformLoopTopRva)) {
+        return fail();
+    }
+    uint8_t* spawn_transform_clamp = spawn_transform;
+    if (!EmitLockIncrement(spawn_transform,
+                           page + kMissionSpawnTransformClampCounterOffset)) {
+        return fail();
+    }
+    uint8_t* spawn_transform_exit = spawn_transform;
+    if (!EmitRelative32(spawn_transform, 0xe9,
+                        image + kMissionSpawnTransformLoopExitRva) ||
+        !PatchRelative8(spawn_transform_exit_branch, spawn_transform_exit) ||
+        !PatchRelative8(spawn_transform_clamp_branch,
+                        spawn_transform_clamp) ||
+        spawn_transform > page + kMissionSpawnTransformStubOffset +
+                              kMissionSpawnTransformStubSize) {
+        return fail();
+    }
+
+    if (!EmitMissionScriptRecordRelay(
+            image, page, kMissionScriptRecordStubAOffset,
+            {0x48, 0x8d, 0x48, 0x14, 0x48, 0x8d, 0x0c, 0x48,
+             0x48, 0x8d, 0x0c, 0xce},
+            kMissionScriptRecordReadAReturnRva) ||
+        !EmitMissionScriptRecordRelay(
+            image, page, kMissionScriptRecordStubBOffset,
+            {0x48, 0x8d, 0x48, 0x14, 0x48, 0x8d, 0x0c, 0x48,
+             0x48, 0x8d, 0x0c, 0xcd, 0x00, 0x00, 0x00, 0x00,
+             0x49, 0x03, 0xcd},
+            kMissionScriptRecordReadBReturnRva)) {
+        return fail();
+    }
+    if (!BuildRearSeatRelays(page, image) ||
+        !BuildHealthScalingRelays(page, image)) {
+        return fail();
+    }
+    std::memset(page + kRearSeatPartnerCounterOffset, 0, sizeof(uint64_t));
+    std::memset(page + kRearSeatAnyCounterOffset, 0, sizeof(uint64_t));
+    std::memset(page + kHealthScalingAppliedCounterOffset, 0,
+                sizeof(uint64_t));
+    std::memset(page + kHealthScalingSiteMaskOffset, 0, sizeof(uint64_t));
+    std::memset(page + kHealthScalingLastFactorOffset, 0, sizeof(float));
+    std::memset(page + kHealthScalingLastCountOffset, 0, sizeof(int32_t));
+    {
+        const int32_t health_scaling_enabled =
+            g_extended_health_scaling.load(std::memory_order_acquire) ? 1 : 0;
+        std::memcpy(page + kHealthScalingEnabledOffset,
+                    &health_scaling_enabled, sizeof(health_scaling_enabled));
+        for (unsigned index = 0; index < kHealthScalingCustomCount; ++index) {
+            const uint32_t bits = g_enemy_health_multiplier_bits[index].load(
+                std::memory_order_acquire);
+            std::memcpy(page + kHealthScalingCustomOffset +
+                            index * sizeof(float),
+                        &bits, sizeof(bits));
+        }
+    }
+    std::memset(page + kMissionScriptEmptyRecordOffset, 0,
+                kMissionRecordSize);
+    std::memset(page + kMissionScriptRecordRedirectCounterOffset, 0,
+                sizeof(uint64_t));
+    std::memset(page + kMissionScriptRecordEmptyCounterOffset, 0,
+                sizeof(uint64_t));
+
     std::memset(page + kMissionSidecarOffset, 0,
                 kMissionRecordSidecarCount * kMissionRecordSize);
     std::memset(page + kMissionPrimaryRedirectCounterOffset, 0,
@@ -1021,6 +1946,8 @@ bool BuildMissionRelayPage(uint8_t* image, unsigned max_players) {
     std::memset(page + kParticipantScalingClampHitsOffset, 0,
                 sizeof(uint64_t));
     std::memset(page + kParticipantScalingClampMaskOffset, 0,
+                sizeof(uint64_t));
+    std::memset(page + kMissionSpawnTransformClampCounterOffset, 0,
                 sizeof(uint64_t));
     FlushInstructionCache(GetCurrentProcess(), page, kMissionRelayPageSize);
     g_mission_relay_page = page;
@@ -1211,6 +2138,24 @@ void WriteMemberButtonLoopSites(uint8_t* image) {
     }
 }
 
+bool GameMessageReserveSitesMatch(const uint8_t* image, bool replacement) {
+    for (const auto& site : kGameMessageReserveSites) {
+        const auto& expected = replacement ? site.replacement : site.original;
+        if (std::memcmp(image + site.rva, expected.data(),
+                        site.instruction_size) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void WriteGameMessageReserveSites(uint8_t* image, bool replacement) {
+    for (const auto& site : kGameMessageReserveSites) {
+        const auto& bytes = replacement ? site.replacement : site.original;
+        std::memcpy(image + site.rva, bytes.data(), site.instruction_size);
+    }
+}
+
 bool MissionParticipantCallSitesMatch(const uint8_t* image,
                                       bool replacement) {
     for (const auto& site : kMissionParticipantCallSites) {
@@ -1282,7 +2227,110 @@ bool WriteParticipantScalingSites(uint8_t* image) {
     return true;
 }
 
+template <size_t N>
+bool RelayJumpSiteMatches(const uint8_t* image, uintptr_t rva,
+                          const std::array<uint8_t, N>& original,
+                          size_t stub_offset, bool replacement) {
+    const uint8_t* site = image + rva;
+    if (!replacement) {
+        return std::memcmp(site, original.data(), original.size()) == 0;
+    }
+    if (!g_mission_relay_page ||
+        Relative32Target(site, 0xe9) != g_mission_relay_page + stub_offset) {
+        return false;
+    }
+    for (size_t index = 5; index < original.size(); ++index) {
+        if (site[index] != 0x90) return false;
+    }
+    return true;
+}
+
+template <size_t N>
+bool WriteRelayJumpSite(uint8_t* image, uintptr_t rva,
+                        const std::array<uint8_t, N>& original,
+                        size_t stub_offset) {
+    if (!g_mission_relay_page ||
+        !WriteRelative32(image + rva, 0xe9,
+                         g_mission_relay_page + stub_offset)) {
+        return false;
+    }
+    std::memset(image + rva + 5, 0x90, original.size() - 5);
+    return true;
+}
+
+bool RearSeatSitesMatch(const uint8_t* image, bool replacement) {
+    return RelayJumpSiteMatches(image, kCalibanSeatRva, kRearSeatOriginal,
+                                kCalibanSeatStubOffset, replacement) &&
+           RelayJumpSiteMatches(image, kCarSeatRva, kRearSeatOriginal,
+                                kCarSeatStubOffset, replacement);
+}
+
+bool WriteRearSeatSites(uint8_t* image) {
+    return WriteRelayJumpSite(image, kCalibanSeatRva, kRearSeatOriginal,
+                              kCalibanSeatStubOffset) &&
+           WriteRelayJumpSite(image, kCarSeatRva, kRearSeatOriginal,
+                              kCarSeatStubOffset);
+}
+
+bool HealthScalingSitesMatch(const uint8_t* image, bool replacement) {
+    for (size_t index = 0; index < kHealthScalingSites.size(); ++index) {
+        const auto& site = kHealthScalingSites[index];
+        const uint8_t* instruction = image + site.rva;
+        if (!replacement) {
+            if (std::memcmp(instruction, site.original.data(),
+                            site.instruction_size) != 0) {
+                return false;
+            }
+            continue;
+        }
+        if (!g_mission_relay_page ||
+            Relative32Target(instruction, 0xe9) !=
+                g_mission_relay_page + kHealthScalingStubOffset +
+                    index * kHealthScalingStubStride) {
+            return false;
+        }
+        for (size_t at = 5; at < site.instruction_size; ++at) {
+            if (instruction[at] != 0x90) return false;
+        }
+    }
+    return true;
+}
+
+bool WriteHealthScalingSites(uint8_t* image) {
+    if (!g_mission_relay_page) return false;
+    for (size_t index = 0; index < kHealthScalingSites.size(); ++index) {
+        const auto& site = kHealthScalingSites[index];
+        if (!WriteRelative32(image + site.rva, 0xe9,
+                             g_mission_relay_page + kHealthScalingStubOffset +
+                                 index * kHealthScalingStubStride)) {
+            return false;
+        }
+        std::memset(image + site.rva + 5, 0x90, site.instruction_size - 5);
+    }
+    return true;
+}
+
+bool MissionScriptRecordContextMatches(const uint8_t* image) {
+    return std::memcmp(image + kMissionScriptRecordReadARva - 3,
+                       kMissionScriptRecordIndexLoad.data(),
+                       kMissionScriptRecordIndexLoad.size()) == 0 &&
+           std::memcmp(image + kMissionScriptRecordReadBRva - 3,
+                       kMissionScriptRecordIndexLoad.data(),
+                       kMissionScriptRecordIndexLoad.size()) == 0 &&
+           std::memcmp(image + kMissionScriptRecordReadAReturnRva,
+                       kMissionScriptRecordReadALock.data(),
+                       kMissionScriptRecordReadALock.size()) == 0 &&
+           std::memcmp(image + kMissionScriptRecordReadBReturnRva,
+                       kMissionScriptRecordReadBLock.data(),
+                       kMissionScriptRecordReadBLock.size()) == 0;
+}
+
 bool MissionSpawnSitesMatch(const uint8_t* image, bool replacement) {
+    if (!MissionScriptRecordContextMatches(image) ||
+        !RearSeatSitesMatch(image, replacement) ||
+        !HealthScalingSitesMatch(image, replacement)) {
+        return false;
+    }
     if (!replacement) {
         return std::memcmp(image + kMissionRecordRedirectRva,
                            kMissionRecordRedirectOriginal.data(),
@@ -1295,7 +2343,48 @@ bool MissionSpawnSitesMatch(const uint8_t* image, bool replacement) {
                            kMissionRecordCopyOriginal.size()) == 0 &&
                std::memcmp(image + kMissionRecordAppendRedirectRva,
                            kMissionRecordAppendRedirectOriginal.data(),
-                           kMissionRecordAppendRedirectOriginal.size()) == 0;
+                           kMissionRecordAppendRedirectOriginal.size()) == 0 &&
+               std::memcmp(image + kMissionSpawnTransformLoopCompareRva,
+                           kMissionSpawnTransformLoopOriginal.data(),
+                           kMissionSpawnTransformLoopOriginal.size()) == 0 &&
+               std::memcmp(image + kMissionScriptRecordReadARva,
+                           kMissionScriptRecordReadAOriginal.data(),
+                           kMissionScriptRecordReadAOriginal.size()) == 0 &&
+               std::memcmp(image + kMissionScriptRecordReadBRva,
+                           kMissionScriptRecordReadBOriginal.data(),
+                           kMissionScriptRecordReadBOriginal.size()) == 0 &&
+               std::memcmp(image + kMissionLoadoutParserBlockOffsetRva,
+                           kMissionLoadoutParserBlockOffsetOriginal.data(),
+                           kMissionLoadoutParserBlockOffsetOriginal.size()) ==
+                   0 &&
+               std::memcmp(image + kMissionLoadoutParserRecordOffsetRva,
+                           kMissionLoadoutParserRecordOffsetOriginal.data(),
+                           kMissionLoadoutParserRecordOffsetOriginal.size()) ==
+                   0 &&
+               std::memcmp(image + kMissionLoadoutParserBulkBoundRva,
+                           kMissionLoadoutParserBulkBoundOriginal.data(),
+                           kMissionLoadoutParserBulkBoundOriginal.size()) ==
+                   0;
+    }
+    if (std::memcmp(image + kMissionLoadoutParserBulkBoundRva,
+                    kMissionLoadoutParserBulkBoundReplacement.data(),
+                    kMissionLoadoutParserBulkBoundReplacement.size()) != 0) {
+        return false;
+    }
+    if (!g_mission_relay_page ||
+        Relative32Target(image + kMissionLoadoutParserBlockOffsetRva, 0xe9) !=
+            g_mission_relay_page + kMissionLoadoutParserBlockStubOffset ||
+        Relative32Target(image + kMissionLoadoutParserRecordOffsetRva,
+                         0xe9) !=
+            g_mission_relay_page + kMissionLoadoutParserRecordStubOffset) {
+        return false;
+    }
+    for (size_t index = 5;
+         index < kMissionLoadoutParserBlockOffsetOriginal.size(); ++index) {
+        if (image[kMissionLoadoutParserBlockOffsetRva + index] != 0x90 ||
+            image[kMissionLoadoutParserRecordOffsetRva + index] != 0x90) {
+            return false;
+        }
     }
     if (!g_mission_relay_page ||
         Relative32Target(image + kMissionRecordRedirectRva, 0xe9) !=
@@ -1303,8 +2392,29 @@ bool MissionSpawnSitesMatch(const uint8_t* image, bool replacement) {
         Relative32Target(image + kMissionRecordExistingRedirectRva, 0xe9) !=
             g_mission_relay_page + kMissionExistingRedirectStubOffset ||
         Relative32Target(image + kMissionRecordAppendRedirectRva, 0xe9) !=
-            g_mission_relay_page + kMissionAppendRedirectStubOffset) {
+            g_mission_relay_page + kMissionAppendRedirectStubOffset ||
+        Relative32Target(image + kMissionSpawnTransformLoopCompareRva,
+                         0xe9) !=
+            g_mission_relay_page + kMissionSpawnTransformStubOffset ||
+        Relative32Target(image + kMissionScriptRecordReadARva, 0xe9) !=
+            g_mission_relay_page + kMissionScriptRecordStubAOffset ||
+        Relative32Target(image + kMissionScriptRecordReadBRva, 0xe9) !=
+            g_mission_relay_page + kMissionScriptRecordStubBOffset) {
         return false;
+    }
+    for (size_t index = 5; index < kMissionScriptRecordReadAOriginal.size();
+         ++index) {
+        if (image[kMissionScriptRecordReadARva + index] != 0x90) return false;
+    }
+    for (size_t index = 5; index < kMissionScriptRecordReadBOriginal.size();
+         ++index) {
+        if (image[kMissionScriptRecordReadBRva + index] != 0x90) return false;
+    }
+    for (size_t index = 5; index < kMissionSpawnTransformLoopOriginal.size();
+         ++index) {
+        if (image[kMissionSpawnTransformLoopCompareRva + index] != 0x90) {
+            return false;
+        }
     }
     for (size_t index = 5; index < kMissionRecordRedirectOriginal.size();
          ++index) {
@@ -1334,9 +2444,40 @@ bool WriteMissionSpawnSites(uint8_t* image) {
                              kMissionExistingRedirectStubOffset) ||
         !WriteRelative32(image + kMissionRecordAppendRedirectRva, 0xe9,
                          g_mission_relay_page +
-                             kMissionAppendRedirectStubOffset)) {
+                             kMissionAppendRedirectStubOffset) ||
+        !WriteRelative32(image + kMissionSpawnTransformLoopCompareRva, 0xe9,
+                         g_mission_relay_page +
+                             kMissionSpawnTransformStubOffset) ||
+        !WriteRelative32(image + kMissionLoadoutParserBlockOffsetRva, 0xe9,
+                         g_mission_relay_page +
+                             kMissionLoadoutParserBlockStubOffset) ||
+        !WriteRelative32(image + kMissionLoadoutParserRecordOffsetRva, 0xe9,
+                         g_mission_relay_page +
+                             kMissionLoadoutParserRecordStubOffset) ||
+        !WriteRelative32(image + kMissionScriptRecordReadARva, 0xe9,
+                         g_mission_relay_page +
+                             kMissionScriptRecordStubAOffset) ||
+        !WriteRelative32(image + kMissionScriptRecordReadBRva, 0xe9,
+                         g_mission_relay_page +
+                             kMissionScriptRecordStubBOffset)) {
         return false;
     }
+    if (!WriteRearSeatSites(image) || !WriteHealthScalingSites(image)) {
+        return false;
+    }
+    std::memset(image + kMissionScriptRecordReadARva + 5, 0x90,
+                kMissionScriptRecordReadAOriginal.size() - 5);
+    std::memset(image + kMissionScriptRecordReadBRva + 5, 0x90,
+                kMissionScriptRecordReadBOriginal.size() - 5);
+    std::memset(image + kMissionLoadoutParserBlockOffsetRva + 5, 0x90,
+                kMissionLoadoutParserBlockOffsetOriginal.size() - 5);
+    std::memset(image + kMissionLoadoutParserRecordOffsetRva + 5, 0x90,
+                kMissionLoadoutParserRecordOffsetOriginal.size() - 5);
+    std::memcpy(image + kMissionLoadoutParserBulkBoundRva,
+                kMissionLoadoutParserBulkBoundReplacement.data(),
+                kMissionLoadoutParserBulkBoundReplacement.size());
+    std::memset(image + kMissionSpawnTransformLoopCompareRva + 5, 0x90,
+                kMissionSpawnTransformLoopOriginal.size() - 5);
     std::memset(image + kMissionRecordRedirectRva + 5, 0x90,
                 kMissionRecordRedirectOriginal.size() - 5);
     std::memset(image + kMissionRecordExistingRedirectRva + 5, 0x90,
@@ -1359,6 +2500,7 @@ bool RosterReplacementSitesMatch(const uint8_t* image, unsigned max_players,
         MissionParticipantCallSitesMatch(image, true) &&
         MissionSpawnSitesMatch(image, true) &&
         ParticipantScalingSitesMatch(image, true) &&
+        GameMessageReserveSitesMatch(image, true) &&
         MemberButtonKeysMatch(image);
 }
 
@@ -1373,6 +2515,7 @@ bool RosterOriginalSitesMatch(const uint8_t* image) {
         MissionParticipantCallSitesMatch(image, false) &&
         MissionSpawnSitesMatch(image, false) &&
         ParticipantScalingSitesMatch(image, false) &&
+        GameMessageReserveSitesMatch(image, false) &&
         MemberButtonKeysMatch(image);
 }
 
@@ -1394,6 +2537,7 @@ void WriteRosterOriginalSites(uint8_t* image) {
         std::memcpy(image + site.rva, site.original.data(),
                     site.instruction_size);
     }
+    WriteGameMessageReserveSites(image, false);
     std::memcpy(image + kMissionRecordRedirectRva,
                 kMissionRecordRedirectOriginal.data(),
                 kMissionRecordRedirectOriginal.size());
@@ -1406,6 +2550,45 @@ void WriteRosterOriginalSites(uint8_t* image) {
     std::memcpy(image + kMissionRecordAppendRedirectRva,
                 kMissionRecordAppendRedirectOriginal.data(),
                 kMissionRecordAppendRedirectOriginal.size());
+    std::memcpy(image + kMissionSpawnTransformLoopCompareRva,
+                kMissionSpawnTransformLoopOriginal.data(),
+                kMissionSpawnTransformLoopOriginal.size());
+    std::memcpy(image + kMissionLoadoutParserBlockOffsetRva,
+                kMissionLoadoutParserBlockOffsetOriginal.data(),
+                kMissionLoadoutParserBlockOffsetOriginal.size());
+    std::memcpy(image + kMissionLoadoutParserRecordOffsetRva,
+                kMissionLoadoutParserRecordOffsetOriginal.data(),
+                kMissionLoadoutParserRecordOffsetOriginal.size());
+    std::memcpy(image + kMissionLoadoutParserBulkBoundRva,
+                kMissionLoadoutParserBulkBoundOriginal.data(),
+                kMissionLoadoutParserBulkBoundOriginal.size());
+    std::memcpy(image + kMissionScriptRecordReadARva,
+                kMissionScriptRecordReadAOriginal.data(),
+                kMissionScriptRecordReadAOriginal.size());
+    std::memcpy(image + kMissionScriptRecordReadBRva,
+                kMissionScriptRecordReadBOriginal.data(),
+                kMissionScriptRecordReadBOriginal.size());
+    std::memcpy(image + kCalibanSeatRva, kRearSeatOriginal.data(),
+                kRearSeatOriginal.size());
+    std::memcpy(image + kCarSeatRva, kRearSeatOriginal.data(),
+                kRearSeatOriginal.size());
+    for (const auto& site : kHealthScalingSites) {
+        std::memcpy(image + site.rva, site.original.data(),
+                    site.instruction_size);
+    }
+    // Unpatched context bytes (identical on the real image).
+    std::memcpy(image + kMissionScriptRecordReadARva - 3,
+                kMissionScriptRecordIndexLoad.data(),
+                kMissionScriptRecordIndexLoad.size());
+    std::memcpy(image + kMissionScriptRecordReadBRva - 3,
+                kMissionScriptRecordIndexLoad.data(),
+                kMissionScriptRecordIndexLoad.size());
+    std::memcpy(image + kMissionScriptRecordReadAReturnRva,
+                kMissionScriptRecordReadALock.data(),
+                kMissionScriptRecordReadALock.size());
+    std::memcpy(image + kMissionScriptRecordReadBReturnRva,
+                kMissionScriptRecordReadBLock.data(),
+                kMissionScriptRecordReadBLock.size());
 }
 
 struct MissionRecordCrashFixture {
@@ -1801,6 +2984,548 @@ constexpr std::array<uint8_t, 0x60> kMissionAppendLoopOriginal = {
     0x4d, 0x3b, 0xf7, 0x75, 0xa0,
 };
 
+struct RearSeatExecutionContext {
+    uint64_t r13 = 0;  // player index
+    uint64_t r14 = 0;  // seat vector
+    uint64_t rsi = 0;  // vector size
+    uint64_t rbp = 0;  // vehicle
+    uint64_t rbx = 0;
+    uint64_t r12 = 0;
+    uint64_t r15 = 0;
+};
+static_assert(sizeof(RearSeatExecutionContext) == 0x38,
+              "rear seat test context layout changed");
+
+using RearSeatExecutionThunk =
+    void(__fastcall*)(RearSeatExecutionContext*, void*);
+
+RearSeatExecutionThunk BuildRearSeatExecutionThunk(uint8_t*& allocation) {
+    // Load the picker's live registers, enter the patched site (relay, then
+    // a ret at the return RVA) and capture every register the relay must keep.
+    constexpr uint8_t code[] = {
+        0x53, 0x55, 0x56, 0x57,
+        0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
+        0x48, 0x83, 0xec, 0x28,
+        0x48, 0x89, 0x4c, 0x24, 0x20,
+        0x48, 0x89, 0xd0,
+        0x4c, 0x8b, 0x29,
+        0x4c, 0x8b, 0x71, 0x08,
+        0x48, 0x8b, 0x71, 0x10,
+        0x48, 0x8b, 0x69, 0x18,
+        0x48, 0x8b, 0x59, 0x20,
+        0x4c, 0x8b, 0x61, 0x28,
+        0x4c, 0x8b, 0x79, 0x30,
+        0xff, 0xd0,
+        0x48, 0x8b, 0x4c, 0x24, 0x20,
+        0x4c, 0x89, 0x29,
+        0x4c, 0x89, 0x71, 0x08,
+        0x48, 0x89, 0x71, 0x10,
+        0x48, 0x89, 0x69, 0x18,
+        0x48, 0x89, 0x59, 0x20,
+        0x4c, 0x89, 0x61, 0x28,
+        0x4c, 0x89, 0x79, 0x30,
+        0x48, 0x83, 0xc4, 0x28,
+        0x41, 0x5f, 0x41, 0x5e, 0x41, 0x5d, 0x41, 0x5c,
+        0x5f, 0x5e, 0x5d, 0x5b,
+        0xc3,
+    };
+    allocation = static_cast<uint8_t*>(VirtualAlloc(
+        nullptr, sizeof(code), MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE));
+    if (!allocation) return nullptr;
+    std::memcpy(allocation, code, sizeof(code));
+    FlushInstructionCache(GetCurrentProcess(), allocation, sizeof(code));
+    return reinterpret_cast<RearSeatExecutionThunk>(allocation);
+}
+
+bool SelfTestRearSeatRelayExecution(std::string& report) {
+    if (g_mission_relay_page) {
+        report = "rear seat microtest refused: relay page already live";
+        return false;
+    }
+    constexpr size_t kFakeImageSize = kMissionStateSlotRva + 0x1000;
+    constexpr size_t kMaxSeats = 9;
+    constexpr size_t kCanaries = 4;
+    constexpr int32_t kCanary = 0x5a5a5a5a;
+    auto* image = static_cast<uint8_t*>(VirtualAlloc(
+        nullptr, kFakeImageSize, MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE));
+    auto* world = static_cast<uint8_t*>(VirtualAlloc(
+        nullptr, 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    uint8_t* thunk_allocation = nullptr;
+    const RearSeatExecutionThunk thunk =
+        image ? BuildRearSeatExecutionThunk(thunk_allocation) : nullptr;
+    auto finish = [&](bool result, const std::string& message) {
+        if (g_mission_relay_page) {
+            VirtualFree(g_mission_relay_page, 0, MEM_RELEASE);
+            g_mission_relay_page = nullptr;
+            g_mission_relay_capacity = 0;
+        }
+        if (thunk_allocation) VirtualFree(thunk_allocation, 0, MEM_RELEASE);
+        if (world) VirtualFree(world, 0, MEM_RELEASE);
+        if (image) VirtualFree(image, 0, MEM_RELEASE);
+        report = message;
+        return result;
+    };
+    if (!image || !world || !thunk) {
+        return finish(false, "could not allocate the rear seat microtest");
+    }
+    for (const uintptr_t site : {kCalibanSeatRva, kCarSeatRva}) {
+        std::memcpy(image + site, kRearSeatOriginal.data(),
+                    kRearSeatOriginal.size());
+        image[site + kRearSeatOriginal.size()] = 0xc3;
+    }
+    if (kCalibanSeatReturnRva != kCalibanSeatRva + kRearSeatOriginal.size() ||
+        kCarSeatReturnRva != kCarSeatRva + kRearSeatOriginal.size() ||
+        !RearSeatSitesMatch(image, false) ||
+        !BuildMissionRelayPage(image, 8) ||
+        !WriteRearSeatSites(image) ||
+        !RearSeatSitesMatch(image, true) ||
+        RearSeatSitesMatch(image, false)) {
+        return finish(false, "rear seat relays were not installed");
+    }
+    FlushInstructionCache(GetCurrentProcess(), image, kFakeImageSize);
+
+    // world: vehicle at +0, seats at +0x1000, control blocks at +0x4000,
+    // seat vector (plus canaries) at +0x5000.
+    uint8_t* vehicle = world;
+    uint8_t* seats = world + 0x1000;
+    uint8_t* live_control = world + 0x4000;
+    uint8_t* expired_control = world + 0x4100;
+    auto* vector = reinterpret_cast<int32_t*>(world + 0x5000);
+    static_assert(kMaxSeats * kVehicleSeatStride <= 0x3000,
+                  "rear seat microtest seats overlap control blocks");
+    const uint64_t seats_address = reinterpret_cast<uint64_t>(seats);
+    std::memcpy(vehicle + kVehicleSeatArrayOffset, &seats_address,
+                sizeof(seats_address));
+    const int32_t live_uses = 1;
+    const int32_t expired_uses = 0;
+    std::memcpy(live_control + 8, &live_uses, sizeof(live_uses));
+    std::memcpy(expired_control + 8, &expired_uses, sizeof(expired_uses));
+
+    struct Scenario {
+        size_t seats;
+        int32_t player;
+        int occupied_seat;      // -1: none
+        bool occupant_expired;
+        int expected_kind;      // 0 native, 1 partner, 2 any, 3 none
+    };
+    constexpr std::array<Scenario, 27> kScenarios = {{
+        {5, 0, -1, false, 0}, {5, 1, -1, false, 0}, {5, 2, -1, false, 0},
+        {5, 3, -1, false, 0}, {5, 4, -1, false, 1}, {5, 5, -1, false, 1},
+        {5, 6, -1, false, 1}, {5, 7, -1, false, 1}, {5, -1, -1, false, 0},
+        {5, -3, -1, false, 3}, {5, 4, 1, false, 2}, {5, 5, 2, false, 2},
+        {5, 4, 1, true, 1}, {5, 6, 2, false, 1}, {9, 4, -1, false, 0},
+        {9, 7, -1, false, 0}, {1, 0, -1, false, 3}, {1, 5, -1, false, 3},
+        {0, 2, -1, false, 3}, {6, 5, -1, false, 1}, {6, 7, 3, false, 2},
+        {2, 3, -1, false, 1}, {5, 1, 2, false, 2}, {5, 1, 2, true, 0},
+        {5, 3, 1, false, 0}, {9, 5, 6, false, 2}, {5, 0, 1, false, 2},
+    }};
+    uint64_t expected_partner = 0;
+    uint64_t expected_any = 0;
+    for (const auto& [site, label] :
+         {std::pair<uintptr_t, const char*>{kCalibanSeatRva, "Caliban"},
+          std::pair<uintptr_t, const char*>{kCarSeatRva, "car"}}) {
+        for (size_t number = 0; number < kScenarios.size(); ++number) {
+            const auto& scenario = kScenarios[number];
+            std::memset(seats, 0, kMaxSeats * kVehicleSeatStride);
+            if (scenario.occupied_seat >= 0) {
+                const uint64_t control = reinterpret_cast<uint64_t>(
+                    scenario.occupant_expired ? expired_control
+                                              : live_control);
+                std::memcpy(seats +
+                                static_cast<size_t>(scenario.occupied_seat) *
+                                    kVehicleSeatStride +
+                                kVehicleSeatOccupantControlOffset,
+                            &control, sizeof(control));
+            }
+            for (size_t slot = 0; slot < kMaxSeats + kCanaries; ++slot) {
+                vector[slot] = slot < scenario.seats ? -1 : kCanary;
+            }
+            RearSeatExecutionContext context{};
+            context.r13 = static_cast<uint32_t>(scenario.player);
+            context.r14 = reinterpret_cast<uint64_t>(vector);
+            context.rsi = scenario.seats;
+            context.rbp = reinterpret_cast<uint64_t>(vehicle);
+            context.rbx = 0;
+            context.r12 = ~0ULL;
+            context.r15 = 0x0123456789abcdefULL;
+            const RearSeatExecutionContext before = context;
+            thunk(&context, image + site);
+
+            std::array<int32_t, kMaxSeats + kCanaries> expected{};
+            for (size_t slot = 0; slot < expected.size(); ++slot) {
+                expected[slot] = slot < scenario.seats ? -1 : kCanary;
+            }
+            if (scenario.seats > 0) expected[0] = scenario.player;
+            const size_t rear = scenario.seats ? scenario.seats - 1 : 0;
+            switch (scenario.expected_kind) {
+                case 0:
+                    if (scenario.player + 1 >= 0) {
+                        expected[static_cast<size_t>(scenario.player + 1)] =
+                            scenario.player;
+                    }
+                    break;
+                case 1:
+                    expected[1 + static_cast<size_t>(scenario.player) % rear] =
+                        scenario.player;
+                    ++expected_partner;
+                    break;
+                case 2:
+                    for (size_t slot = 1; slot < scenario.seats; ++slot) {
+                        expected[slot] = scenario.player;
+                    }
+                    ++expected_any;
+                    break;
+                default:
+                    break;
+            }
+            if (std::memcmp(expected.data(), vector,
+                            expected.size() * sizeof(int32_t)) != 0) {
+                return finish(false, std::string(label) +
+                                         " rear seat relay wrote the wrong seats in scenario " +
+                                         std::to_string(number));
+            }
+            if (context.r13 != before.r13 || context.r14 != before.r14 ||
+                context.rsi != before.rsi || context.rbp != before.rbp ||
+                context.rbx != before.rbx || context.r12 != before.r12 ||
+                context.r15 != before.r15) {
+                return finish(false, std::string(label) +
+                                         " rear seat relay changed a live register in scenario " +
+                                         std::to_string(number));
+            }
+        }
+    }
+    if (ReadMissionRelayCounter(kRearSeatPartnerCounterOffset) !=
+            expected_partner ||
+        ReadMissionRelayCounter(kRearSeatAnyCounterOffset) != expected_any) {
+        return finish(false, "rear seat telemetry count mismatch");
+    }
+
+    WriteRosterOriginalSites(image);
+    if (!RearSeatSitesMatch(image, false)) {
+        return finish(false, "rear seat restore left a relay jump");
+    }
+    return finish(true,
+                  "Caliban/car seat pickers keep free native seats, give players 5-8 a partner seat, open every rear seat when the preferred one is taken and never write past the seat vector");
+}
+
+struct HealthRelayExecutionContext {
+    uint64_t rax = 0;
+    uint64_t rcx = 0;
+    uint64_t rdx = 0;
+    uint64_t r8 = 0;
+    uint64_t r11 = 0;
+    uint64_t flags_in = 0;
+    uint64_t flags_out = 0;
+    float xmm0 = 0.0f;
+    float xmm1 = 0.0f;
+    float xmm3 = 0.0f;
+    float xmm15 = 0.0f;
+};
+static_assert(offsetof(HealthRelayExecutionContext, flags_in) == 0x28 &&
+                  offsetof(HealthRelayExecutionContext, xmm0) == 0x38 &&
+                  offsetof(HealthRelayExecutionContext, xmm15) == 0x44 &&
+                  sizeof(HealthRelayExecutionContext) == 0x48,
+              "health relay test context layout changed");
+
+using HealthRelayExecutionThunk =
+    void(__fastcall*)(HealthRelayExecutionContext*, void*);
+
+HealthRelayExecutionThunk BuildHealthRelayExecutionThunk(
+    uint8_t*& allocation) {
+    // r12 keeps the context and r13 the target. Load every register the 24
+    // sites use as base, index, destination or relay scratch plus the flags,
+    // enter the patched site and capture them again. xmm15 is nonvolatile in
+    // the Win64 ABI and is restored for the caller.
+    constexpr uint8_t code[] = {
+        0x53, 0x41, 0x54, 0x41, 0x55,
+        0x48, 0x83, 0xec, 0x30,
+        0xf3, 0x44, 0x0f, 0x7f, 0x7c, 0x24, 0x20,
+        0x49, 0x89, 0xcc,
+        0x49, 0x89, 0xd5,
+        0x49, 0x8b, 0x04, 0x24,
+        0x49, 0x8b, 0x4c, 0x24, 0x08,
+        0x49, 0x8b, 0x54, 0x24, 0x10,
+        0x4d, 0x8b, 0x44, 0x24, 0x18,
+        0x4d, 0x8b, 0x5c, 0x24, 0x20,
+        0xf3, 0x41, 0x0f, 0x10, 0x44, 0x24, 0x38,
+        0xf3, 0x41, 0x0f, 0x10, 0x4c, 0x24, 0x3c,
+        0xf3, 0x41, 0x0f, 0x10, 0x5c, 0x24, 0x40,
+        0xf3, 0x45, 0x0f, 0x10, 0x7c, 0x24, 0x44,
+        0x41, 0xff, 0x74, 0x24, 0x28,
+        0x9d,
+        0x41, 0xff, 0xd5,
+        0x9c,
+        0x41, 0x8f, 0x44, 0x24, 0x30,
+        0x49, 0x89, 0x04, 0x24,
+        0x49, 0x89, 0x4c, 0x24, 0x08,
+        0x49, 0x89, 0x54, 0x24, 0x10,
+        0x4d, 0x89, 0x44, 0x24, 0x18,
+        0x4d, 0x89, 0x5c, 0x24, 0x20,
+        0xf3, 0x41, 0x0f, 0x11, 0x44, 0x24, 0x38,
+        0xf3, 0x41, 0x0f, 0x11, 0x4c, 0x24, 0x3c,
+        0xf3, 0x41, 0x0f, 0x11, 0x5c, 0x24, 0x40,
+        0xf3, 0x45, 0x0f, 0x11, 0x7c, 0x24, 0x44,
+        0xf3, 0x44, 0x0f, 0x6f, 0x7c, 0x24, 0x20,
+        0x48, 0x83, 0xc4, 0x30,
+        0x41, 0x5d, 0x41, 0x5c, 0x5b,
+        0xc3,
+    };
+    allocation = static_cast<uint8_t*>(VirtualAlloc(
+        nullptr, sizeof(code), MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE));
+    if (!allocation) return nullptr;
+    std::memcpy(allocation, code, sizeof(code));
+    FlushInstructionCache(GetCurrentProcess(), allocation, sizeof(code));
+    return reinterpret_cast<HealthRelayExecutionThunk>(allocation);
+}
+
+bool SetHealthRelayRegister(HealthRelayExecutionContext& context,
+                            unsigned register_number, uint64_t value) {
+    switch (register_number) {
+        case 0: context.rax = value; return true;
+        case 1: context.rcx = value; return true;
+        case 2: context.rdx = value; return true;
+        case 8: context.r8 = value; return true;
+        case 11: context.r11 = value; return true;
+        default: return false;
+    }
+}
+
+bool GetHealthRelayXmm(const HealthRelayExecutionContext& context,
+                       unsigned register_number, float& value) {
+    switch (register_number) {
+        case 0: value = context.xmm0; return true;
+        case 1: value = context.xmm1; return true;
+        case 3: value = context.xmm3; return true;
+        default: return false;
+    }
+}
+
+bool SelfTestHealthScalingRelayExecution(std::string& report) {
+    if (g_mission_relay_page) {
+        report = "health scaling microtest refused: relay page already live";
+        return false;
+    }
+    constexpr size_t kFakeImageSize = kMissionStateSlotRva + 0x1000;
+    auto* image = static_cast<uint8_t*>(VirtualAlloc(
+        nullptr, kFakeImageSize, MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE));
+    auto* mission_state = static_cast<uint8_t*>(VirtualAlloc(
+        nullptr, kMissionParticipantCountOffset + sizeof(int32_t),
+        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    auto* table = static_cast<uint8_t*>(VirtualAlloc(
+        nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    uint8_t* thunk_allocation = nullptr;
+    const HealthRelayExecutionThunk thunk =
+        image ? BuildHealthRelayExecutionThunk(thunk_allocation) : nullptr;
+    const bool previous_enabled =
+        g_extended_health_scaling.load(std::memory_order_acquire);
+    auto finish = [&](bool result, const std::string& message) {
+        if (g_mission_relay_page) {
+            VirtualFree(g_mission_relay_page, 0, MEM_RELEASE);
+            g_mission_relay_page = nullptr;
+            g_mission_relay_capacity = 0;
+        }
+        g_extended_health_scaling.store(previous_enabled,
+                                        std::memory_order_release);
+        if (thunk_allocation) VirtualFree(thunk_allocation, 0, MEM_RELEASE);
+        if (table) VirtualFree(table, 0, MEM_RELEASE);
+        if (mission_state) VirtualFree(mission_state, 0, MEM_RELEASE);
+        if (image) VirtualFree(image, 0, MEM_RELEASE);
+        report = message;
+        return result;
+    };
+    if (!image || !mission_state || !table || !thunk) {
+        return finish(false, "could not allocate the health scaling microtest");
+    }
+    for (const auto& site : kHealthScalingSites) {
+        std::memcpy(image + site.rva, site.original.data(),
+                    site.instruction_size);
+        image[site.rva + site.instruction_size] = 0xc3;
+    }
+    g_extended_health_scaling.store(true, std::memory_order_release);
+    if (!HealthScalingSitesMatch(image, false) ||
+        !BuildMissionRelayPage(image, 8) ||
+        !WriteHealthScalingSites(image) ||
+        !HealthScalingSitesMatch(image, true) ||
+        HealthScalingSitesMatch(image, false)) {
+        return finish(false, "health scaling relays were not installed");
+    }
+    FlushInstructionCache(GetCurrentProcess(), image, kFakeImageSize);
+
+    // Per-player tables as SGO float nodes (value at +8, 12-byte stride):
+    // Inferno, Normal, and a falling last step that must keep t3.
+    constexpr std::array<std::array<float, 4>, 3> kTables = {{
+        {1.2f, 1.1f, 1.15f, 1.2f},
+        {1.2f, 0.8f, 1.0f, 1.2f},
+        {1.0f, 1.0f, 1.5f, 1.25f},
+    }};
+    // EnemyHealth5..8Players: all automatic, then mixed fixed/automatic.
+    constexpr std::array<std::array<float, kHealthScalingCustomCount>, 2>
+        kCustomSets = {{
+            {0.0f, 0.0f, 0.0f, 0.0f},
+            {1.5f, 0.0f, 2.0f, 0.5f},
+        }};
+    constexpr uint64_t kArithmeticFlags =
+        0x001ULL | 0x004ULL | 0x010ULL | 0x040ULL | 0x080ULL | 0x800ULL;
+    constexpr uint64_t kInputFlags = kArithmeticFlags | 0x002ULL;
+    const uint64_t state_address = reinterpret_cast<uint64_t>(mission_state);
+    uint64_t expected_applied = 0;
+    uint64_t expected_mask = 0;
+
+    struct Case {
+        int32_t count;
+        bool enabled;
+        bool null_state;
+        int32_t index_override;  // -1: 3 * (min(count, 4) - 1)
+    };
+    constexpr std::array<Case, 14> kCases = {{
+        {1, true, false, -1}, {2, true, false, -1}, {3, true, false, -1},
+        {4, true, false, -1}, {5, true, false, -1}, {6, true, false, -1},
+        {7, true, false, -1}, {8, true, false, -1}, {9, true, false, -1},
+        {6, false, false, -1}, {8, false, false, -1}, {6, true, true, -1},
+        {6, true, false, 3}, {0, true, false, 0},
+    }};
+    for (size_t site_index = 0; site_index < kHealthScalingSites.size();
+         ++site_index) {
+        const auto& site = kHealthScalingSites[site_index];
+        HealthScalingOperands operands;
+        float probe = 0.0f;
+        if (!DecodeHealthScalingSite(site, operands) ||
+            !GetHealthRelayXmm(HealthRelayExecutionContext{},
+                               operands.destination, probe)) {
+            return finish(false, "health scaling site " +
+                                     std::to_string(site_index) +
+                                     " has an unsupported operand shape");
+        }
+        for (size_t pass = 0; pass < kTables.size() * kCustomSets.size();
+             ++pass) {
+            const auto& values = kTables[pass % kTables.size()];
+            const auto& custom = kCustomSets[pass / kTables.size()];
+            for (size_t entry = 0; entry < values.size(); ++entry) {
+                std::memcpy(table + entry * 12 + 8, &values[entry],
+                            sizeof(float));
+            }
+            std::memcpy(g_mission_relay_page + kHealthScalingCustomOffset,
+                        custom.data(), sizeof(float) * custom.size());
+            for (const auto& test : kCases) {
+                const int32_t enabled = test.enabled ? 1 : 0;
+                std::memcpy(g_mission_relay_page + kHealthScalingEnabledOffset,
+                            &enabled, sizeof(enabled));
+                const uint64_t slot_value = test.null_state ? 0 : state_address;
+                std::memcpy(image + kMissionStateSlotRva, &slot_value,
+                            sizeof(slot_value));
+                std::memcpy(mission_state + kMissionParticipantCountOffset,
+                            &test.count, sizeof(test.count));
+                const int32_t clamped =
+                    test.count < 1 ? 1 : (test.count > 4 ? 4 : test.count);
+                const int32_t index = test.index_override >= 0
+                    ? test.index_override
+                    : 3 * (clamped - 1);
+                const size_t entry = static_cast<size_t>(index / 3);
+
+                HealthRelayExecutionContext context{};
+                context.rax = 0x1111111122222222ULL;
+                context.rcx = 0x3333333344444444ULL;
+                context.rdx = 0x5555555566666666ULL;
+                context.r8 = 0x7777777788888888ULL;
+                context.r11 = 0x99999999aaaaaaaaULL;
+                context.flags_in = kInputFlags;
+                context.xmm0 = 100.0f;
+                context.xmm1 = 200.0f;
+                context.xmm3 = 300.0f;
+                context.xmm15 = 7.5f;
+                if (!SetHealthRelayRegister(
+                        context, operands.base,
+                        reinterpret_cast<uint64_t>(table)) ||
+                    !SetHealthRelayRegister(context, operands.index,
+                                            static_cast<uint64_t>(index))) {
+                    return finish(false, "health scaling site " +
+                                             std::to_string(site_index) +
+                                             " uses an untested register");
+                }
+                const HealthRelayExecutionContext before = context;
+                thunk(&context, image + site.rva);
+
+                float input = 0.0f;
+                float observed = 0.0f;
+                GetHealthRelayXmm(before, operands.destination, input);
+                GetHealthRelayXmm(context, operands.destination, observed);
+                float factor = values[entry];
+                const bool extended = test.enabled && !test.null_state &&
+                    test.count > 4 && test.count <= 8 &&
+                    index == kHealthScalingFourPlayerIndex;
+                if (extended) {
+                    const float fixed =
+                        custom[static_cast<size_t>(test.count - 5)];
+                    if (fixed != 0.0f) {
+                        const volatile float product = fixed * values[3];
+                        factor = product;
+                    } else {
+                        volatile float accumulator = values[3];
+                        for (int32_t step = 4; step < test.count; ++step) {
+                            accumulator = accumulator + values[3];
+                            accumulator = accumulator - values[2];
+                        }
+                        factor = accumulator > values[3] ? accumulator
+                                                         : values[3];
+                    }
+                    ++expected_applied;
+                    expected_mask |= 1ULL << site_index;
+                }
+                const volatile float expected = input * factor;
+                if (observed != expected) {
+                    return finish(false, "health scaling site " +
+                                             std::to_string(site_index) +
+                                             " produced " +
+                                             std::to_string(observed) +
+                                             " instead of " +
+                                             std::to_string(expected) +
+                                             " for count " +
+                                             std::to_string(test.count));
+                }
+                for (const unsigned other : {0U, 1U, 3U}) {
+                    float other_before = 0.0f;
+                    float other_after = 0.0f;
+                    GetHealthRelayXmm(before, other, other_before);
+                    GetHealthRelayXmm(context, other, other_after);
+                    if (other != operands.destination &&
+                        other_after != other_before) {
+                        return finish(false, "health scaling site " +
+                                                 std::to_string(site_index) +
+                                                 " changed another xmm register");
+                    }
+                }
+                if (context.xmm15 != before.xmm15 ||
+                    context.rax != before.rax || context.rcx != before.rcx ||
+                    context.rdx != before.rdx || context.r8 != before.r8 ||
+                    context.r11 != before.r11 ||
+                    (context.flags_out & kArithmeticFlags) !=
+                        (kInputFlags & kArithmeticFlags)) {
+                    return finish(false, "health scaling site " +
+                                             std::to_string(site_index) +
+                                             " did not preserve registers or flags");
+                }
+            }
+        }
+    }
+    if (ReadMissionRelayCounter(kHealthScalingAppliedCounterOffset) !=
+            expected_applied ||
+        ReadMissionRelayCounter(kHealthScalingSiteMaskOffset) !=
+            expected_mask) {
+        return finish(false, "health scaling telemetry count mismatch");
+    }
+
+    WriteRosterOriginalSites(image);
+    if (!HealthScalingSitesMatch(image, false)) {
+        return finish(false, "health scaling restore left a relay jump");
+    }
+    return finish(true,
+                  "24 enemy HP multiplies keep counts 1-4 native and continue the last per-player step for 5-8 (Inferno 1.25/1.3/1.35/1.4)");
+}
+
 }  // namespace
 
 bool InstallRosterCapacity(unsigned max_players,
@@ -1860,10 +3585,12 @@ bool InstallRosterCapacity(unsigned max_players,
     const bool mission_spawns_ready = MissionSpawnSitesMatch(image, true);
     const bool participant_scaling_ready =
         ParticipantScalingSitesMatch(image, true);
+    const bool message_reserves_ready =
+        GameMessageReserveSitesMatch(image, true);
     if (primary_ready && secondary_ready && tertiary_ready && room_panels_ready &&
         mission_result_participants_ready &&
         member_buttons_ready && mission_participants_ready && mission_spawns_ready &&
-        participant_scaling_ready &&
+        participant_scaling_ready && message_reserves_ready &&
         MemberButtonKeysMatch(image)) {
         g_roster_patch_max_players = max_players;
         g_roster_patch_preallocated_slots = preallocated_roster_slots;
@@ -1943,6 +3670,8 @@ bool InstallRosterCapacity(unsigned max_players,
     const bool mission_spawns_original = MissionSpawnSitesMatch(image, false);
     const bool participant_scaling_original =
         ParticipantScalingSitesMatch(image, false);
+    const bool message_reserves_original =
+        GameMessageReserveSitesMatch(image, false);
     if ((!primary_ready && !primary_original) ||
         (!secondary_ready && !secondary_original) ||
         (!tertiary_ready && !tertiary_original) ||
@@ -1953,6 +3682,7 @@ bool InstallRosterCapacity(unsigned max_players,
         (!mission_participants_ready && !mission_participants_original) ||
         (!mission_spawns_ready && !mission_spawns_original) ||
         (!participant_scaling_ready && !participant_scaling_original) ||
+        (!message_reserves_ready && !message_reserves_original) ||
         !MemberButtonKeysMatch(image)) {
         EDF5_CAPTURE_EVENT("more_players", "roster_capacity_patch_failed",
                        capture::Fields().String("reason", "EDF5 byte signature mismatch")
@@ -1976,6 +3706,10 @@ bool InstallRosterCapacity(unsigned max_players,
                                  participant_scaling_ready)
                            .Bool("participant_scaling_original",
                                  participant_scaling_original)
+                           .Bool("message_reserves_ready",
+                                 message_reserves_ready)
+                           .Bool("message_reserves_original",
+                                 message_reserves_original)
                            .UInt("native_participant_scaling_patch_sites",
                                  kParticipantScalingSites.size())
                            .UInt("patch_region_rva", kCapacityRegionRva)
@@ -2015,7 +3749,8 @@ bool InstallRosterCapacity(unsigned max_players,
     constexpr uintptr_t mission_patch_end =
         kMissionParticipantCallSites.back().rva +
         kMissionParticipantCallSites.back().instruction_size;
-    constexpr uintptr_t spawn_patch_begin = kMissionRecordRedirectRva;
+    constexpr uintptr_t spawn_patch_begin =
+        kMissionSpawnTransformLoopCompareRva;
     constexpr uintptr_t spawn_patch_end =
         kMissionRecordAppendRedirectRva +
         kMissionRecordAppendRedirectOriginal.size();
@@ -2132,6 +3867,7 @@ bool InstallRosterCapacity(unsigned max_players,
     const bool mission_spawn_written = WriteMissionSpawnSites(image);
     const bool participant_scaling_written =
         WriteParticipantScalingSites(image);
+    WriteGameMessageReserveSites(image, true);
     EDF5_DIAGNOSTIC_PHASE(diagnostics_scope, "flush_instruction_cache",
                             capacity_patch_begin, capacity_patch_end);
     FlushInstructionCache(GetCurrentProcess(), image + capacity_patch_begin,
@@ -2654,7 +4390,8 @@ bool RestoreRosterCapacityPatch(uint8_t* image) {
     constexpr uintptr_t mission_patch_end =
         kMissionParticipantCallSites.back().rva +
         kMissionParticipantCallSites.back().instruction_size;
-    constexpr uintptr_t spawn_patch_begin = kMissionRecordRedirectRva;
+    constexpr uintptr_t spawn_patch_begin =
+        kMissionSpawnTransformLoopCompareRva;
     constexpr uintptr_t spawn_patch_end =
         kMissionRecordAppendRedirectRva +
         kMissionRecordAppendRedirectOriginal.size();
@@ -2896,6 +4633,152 @@ void PollMissionRelayTelemetry() {
                            .Bool("sidecar_selected", true));
     }
 
+    const uint64_t parser_redirects =
+        ReadMissionRelayCounter(kMissionLoadoutParserRedirectCounterOffset);
+    const uint64_t parser_discards =
+        ReadMissionRelayCounter(kMissionLoadoutParserDiscardCounterOffset);
+    const uint64_t previous_parser_redirects =
+        g_reported_parser_redirects.exchange(parser_redirects,
+                                             std::memory_order_acq_rel);
+    const uint64_t previous_parser_discards =
+        g_reported_parser_discards.exchange(parser_discards,
+                                            std::memory_order_acq_rel);
+    if (parser_redirects > previous_parser_redirects ||
+        parser_discards > previous_parser_discards) {
+        EDF5_CAPTURE_EVENT(
+            parser_discards > previous_parser_discards
+                ? capture::Level::Warning : capture::Level::Info,
+            "more_players", "mission_loadout_parser_redirect_hit",
+            capture::Fields()
+                .UInt("extra_block_hits_total", parser_redirects)
+                .UInt("discarded_index_hits_total", parser_discards)
+                .UInt("native_block_count",
+                      kMissionLoadoutParserNativeBlocks)
+                .UInt("plugin_block_count",
+                      kMissionLoadoutParserExtraBlocks)
+                .UInt("block_offset_rva",
+                      kMissionLoadoutParserBlockOffsetRva)
+                .UInt("record_offset_rva",
+                      kMissionLoadoutParserRecordOffsetRva)
+                .Bool("mission_state_heap_written", false));
+    }
+
+    const uint64_t script_redirects =
+        ReadMissionRelayCounter(kMissionScriptRecordRedirectCounterOffset);
+    const uint64_t script_empties =
+        ReadMissionRelayCounter(kMissionScriptRecordEmptyCounterOffset);
+    const uint64_t previous_script_redirects =
+        g_reported_script_record_redirects.exchange(
+            script_redirects, std::memory_order_acq_rel);
+    const uint64_t previous_script_empties =
+        g_reported_script_record_empties.exchange(
+            script_empties, std::memory_order_acq_rel);
+    if (script_redirects > previous_script_redirects ||
+        script_empties > previous_script_empties) {
+        EDF5_CAPTURE_EVENT(
+            "more_players", "mission_script_record_redirect_hit",
+            capture::Fields()
+                .UInt("sidecar_reads_delta",
+                      script_redirects - previous_script_redirects)
+                .UInt("sidecar_reads_total", script_redirects)
+                .UInt("empty_reads_total", script_empties)
+                .UInt("helper_a_rva", 0x121be0)
+                .UInt("helper_b_rva", 0x127260)
+                .UInt("native_record_count", 4));
+    }
+
+    const uint64_t seat_partner =
+        ReadMissionRelayCounter(kRearSeatPartnerCounterOffset);
+    const uint64_t seat_any =
+        ReadMissionRelayCounter(kRearSeatAnyCounterOffset);
+    const uint64_t previous_seat_partner =
+        g_reported_rear_seat_partner_choices.exchange(
+            seat_partner, std::memory_order_acq_rel);
+    const uint64_t previous_seat_any =
+        g_reported_rear_seat_any_choices.exchange(seat_any,
+                                                  std::memory_order_acq_rel);
+    if (seat_partner > previous_seat_partner ||
+        seat_any > previous_seat_any) {
+        EDF5_CAPTURE_EVENT(
+            "more_players", "vehicle_rear_seat_offered",
+            capture::Fields()
+                .UInt("partner_seat_delta",
+                      seat_partner - previous_seat_partner)
+                .UInt("partner_seat_total", seat_partner)
+                .UInt("any_rear_seat_delta", seat_any - previous_seat_any)
+                .UInt("any_rear_seat_total", seat_any)
+                .UInt("caliban_picker_rva", 0x34f880)
+                .UInt("car_picker_rva", 0x374db0)
+                .Bool("vector_overflow_prevented", true));
+    }
+
+    const uint64_t health_applied =
+        ReadMissionRelayCounter(kHealthScalingAppliedCounterOffset);
+    const uint64_t health_mask =
+        ReadMissionRelayCounter(kHealthScalingSiteMaskOffset);
+    const uint64_t previous_health_applied =
+        g_reported_health_scaling_applied.exchange(
+            health_applied, std::memory_order_acq_rel);
+    const uint64_t previous_health_mask =
+        g_reported_health_scaling_mask.exchange(health_mask,
+                                                std::memory_order_acq_rel);
+    if (health_mask & ~previous_health_mask) {
+        uint32_t factor_bits = 0;
+        int32_t last_count = 0;
+        if (g_mission_relay_page) {
+            factor_bits = static_cast<uint32_t>(InterlockedCompareExchange(
+                reinterpret_cast<volatile LONG*>(
+                    g_mission_relay_page + kHealthScalingLastFactorOffset),
+                0, 0));
+            last_count = static_cast<int32_t>(InterlockedCompareExchange(
+                reinterpret_cast<volatile LONG*>(
+                    g_mission_relay_page + kHealthScalingLastCountOffset),
+                0, 0));
+        }
+        float last_factor = 0.0f;
+        std::memcpy(&last_factor, &factor_bits, sizeof(last_factor));
+        EDF5_CAPTURE_EVENT(
+            "more_players", "enemy_health_scaling_extended",
+            capture::Fields()
+                .UInt("applied_delta",
+                      health_applied >= previous_health_applied
+                          ? health_applied - previous_health_applied
+                          : health_applied)
+                .UInt("applied_total", health_applied)
+                .UInt("site_mask", health_mask)
+                .UInt("newly_observed_site_mask",
+                      health_mask & ~previous_health_mask)
+                .UInt("last_participant_count",
+                      static_cast<uint64_t>(last_count < 0 ? 0 : last_count))
+                .UInt("last_factor_thousandths",
+                      static_cast<uint64_t>(last_factor > 0.0f
+                          ? last_factor * 1000.0f + 0.5f
+                          : 0.0f))
+                .UInt("patched_sites", kHealthScalingSites.size()));
+    }
+
+    const uint64_t spawn_transform_clamps =
+        ReadMissionRelayCounter(kMissionSpawnTransformClampCounterOffset);
+    const uint64_t previous_spawn_transform_clamps =
+        g_reported_spawn_transform_clamps.exchange(
+            spawn_transform_clamps, std::memory_order_acq_rel);
+    if (spawn_transform_clamps > previous_spawn_transform_clamps) {
+        EDF5_CAPTURE_EVENT(
+            "more_players", "mission_spawn_transform_loop_clamped",
+            capture::Fields()
+                .UInt("hits_delta",
+                      spawn_transform_clamps -
+                          previous_spawn_transform_clamps)
+                .UInt("hits_total", spawn_transform_clamps)
+                .UInt("native_spawn_record_count", kMissionSpawnPointCount)
+                .UInt("configured_capacity", g_mission_relay_capacity)
+                .UInt("loop_backedge_rva",
+                      kMissionSpawnTransformLoopCompareRva)
+                .UInt("stack_cookie_frame_offset", 0x230)
+                .Bool("stack_cookie_protected", true)
+                .Bool("extra_spawns_reuse_modulo_four", true));
+    }
+
     const uint64_t scaling_hits =
         ReadMissionRelayCounter(kParticipantScalingClampHitsOffset);
     const uint64_t previous_scaling_hits =
@@ -2928,6 +4811,90 @@ void PollMissionRelayTelemetry() {
                 .Bool("payload_logged", false)
                 .Bool("pointer_logged", false));
     }
+}
+
+uint8_t* MissionLoadoutParserExtraBlocks() {
+    if (g_mission_loadout_parser_redirect_test.load(
+            std::memory_order_acquire)) {
+        return g_mission_loadout_parser_blocks.data();
+    }
+    if (!g_mission_relay_page) return nullptr;
+    const auto* image =
+        reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
+    if (!image ||
+        Relative32Target(image + kMissionLoadoutParserBlockOffsetRva, 0xe9) !=
+            g_mission_relay_page + kMissionLoadoutParserBlockStubOffset ||
+        Relative32Target(image + kMissionLoadoutParserRecordOffsetRva,
+                         0xe9) !=
+            g_mission_relay_page + kMissionLoadoutParserRecordStubOffset ||
+        std::memcmp(image + kMissionLoadoutParserBulkBoundRva,
+                    kMissionLoadoutParserBulkBoundReplacement.data(),
+                    kMissionLoadoutParserBulkBoundReplacement.size()) != 0) {
+        return nullptr;
+    }
+    return g_mission_loadout_parser_blocks.data();
+}
+
+uint64_t MissionLoadoutParserRedirectHits() {
+    return ReadMissionRelayCounter(kMissionLoadoutParserRedirectCounterOffset);
+}
+
+uint64_t MissionLoadoutParserDiscardHits() {
+    return ReadMissionRelayCounter(kMissionLoadoutParserDiscardCounterOffset);
+}
+
+void SetMissionLoadoutParserRedirectForTest(bool enabled) {
+    g_mission_loadout_parser_redirect_test.store(enabled,
+                                                 std::memory_order_release);
+}
+
+void SetExtendedEnemyHealthScaling(bool enabled) {
+    g_extended_health_scaling.store(enabled, std::memory_order_release);
+    if (g_mission_relay_page) {
+        InterlockedExchange(reinterpret_cast<volatile LONG*>(
+                                g_mission_relay_page +
+                                kHealthScalingEnabledOffset),
+                            enabled ? 1 : 0);
+    }
+}
+
+bool ExtendedEnemyHealthScaling() {
+    return g_extended_health_scaling.load(std::memory_order_acquire);
+}
+
+void SetEnemyHealthMultipliers(const float* multipliers, size_t count) {
+    for (unsigned index = 0; index < kHealthScalingCustomCount; ++index) {
+        float value = multipliers && index < count ? multipliers[index] : 0.0f;
+        if (!(value >= kHealthScalingCustomMinimum &&
+              value <= kHealthScalingCustomMaximum)) {
+            value = 0.0f;
+        }
+        uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        g_enemy_health_multiplier_bits[index].store(bits,
+                                                    std::memory_order_release);
+        if (g_mission_relay_page) {
+            InterlockedExchange(
+                reinterpret_cast<volatile LONG*>(
+                    g_mission_relay_page + kHealthScalingCustomOffset +
+                    index * sizeof(float)),
+                static_cast<LONG>(bits));
+        }
+    }
+}
+
+float EnemyHealthMultiplier(unsigned participants) {
+    if (participants < static_cast<unsigned>(kHealthScalingFirstCustomCount) ||
+        participants >= static_cast<unsigned>(kHealthScalingFirstCustomCount) +
+                            kHealthScalingCustomCount) {
+        return 0.0f;
+    }
+    const uint32_t bits = g_enemy_health_multiplier_bits
+        [participants - static_cast<unsigned>(kHealthScalingFirstCustomCount)]
+            .load(std::memory_order_acquire);
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
 }
 
 uint64_t NativeParticipantScalingClampHits() {
@@ -2971,7 +4938,7 @@ bool RunMissionRecordMicroTest(const wchar_t* fixture_path, bool patched,
         return false;
     }
 
-    constexpr size_t kFakeImageSize = 0x340000;
+    constexpr size_t kFakeImageSize = 0x460000;
     auto* image = static_cast<uint8_t*>(VirtualAlloc(
         nullptr, kFakeImageSize, MEM_COMMIT | MEM_RESERVE,
         PAGE_EXECUTE_READWRITE));
@@ -2996,6 +4963,9 @@ bool RunMissionRecordMicroTest(const wchar_t* fixture_path, bool patched,
             0, std::memory_order_release);
         g_reported_participant_scaling_clamp_mask.store(
             0, std::memory_order_release);
+        g_reported_spawn_transform_clamps.store(0, std::memory_order_release);
+        g_reported_parser_redirects.store(0, std::memory_order_release);
+        g_reported_parser_discards.store(0, std::memory_order_release);
         report = message;
         return success;
     };
@@ -3014,6 +4984,170 @@ bool RunMissionRecordMicroTest(const wchar_t* fixture_path, bool patched,
     image[kMissionRecordAppendLoopBackedgeRva + 2] = 0xc3;
     image[kMissionRecordRedirectReturnRva] = 0xc3;
 
+    // Spawn transform loop slice. The real body is replaced by "inc r15" so
+    // r15 counts iterations; the exact native increment and backedge bytes at
+    // 0x11db1b..0x11db26 are kept. The entry reserves a frame so [rsp+0x50]
+    // holds the participant count exactly as in 0x11d860.
+    constexpr uintptr_t kSpawnTransformEntryRva = 0x11da90;
+    constexpr uint8_t kSpawnTransformEntry[] = {
+        0x48, 0x83, 0xec, 0x58,              // sub rsp,0x58
+        0x44, 0x89, 0x6c, 0x24, 0x50,        // mov [rsp+0x50],r13d
+        0xeb, 0x16,                          // jmp 0x11dab1
+    };
+    static_assert(kSpawnTransformEntryRva + sizeof(kSpawnTransformEntry) +
+                          0x16 ==
+                      kMissionSpawnTransformLoopTopRva,
+                  "spawn transform entry jump must reach the loop top");
+    constexpr uint8_t kSpawnTransformBody[] = {
+        0x49, 0xff, 0xc7,                    // inc r15
+        0xeb, 0x65,                          // jmp 0x11db1b
+    };
+    constexpr uint8_t kSpawnTransformIncrement[] = {
+        0xff, 0xc7,                          // inc edi
+        0x48, 0x83, 0xc3, 0x10,              // add rbx,0x10
+    };
+    constexpr uint8_t kSpawnTransformExit[] = {
+        0x48, 0x83, 0xc4, 0x58,              // add rsp,0x58
+        0xc3,                                // ret
+    };
+    std::memcpy(image + kSpawnTransformEntryRva, kSpawnTransformEntry,
+                sizeof(kSpawnTransformEntry));
+    std::memcpy(image + kMissionSpawnTransformLoopTopRva, kSpawnTransformBody,
+                sizeof(kSpawnTransformBody));
+    std::memcpy(image + kMissionSpawnTransformLoopCompareRva -
+                    sizeof(kSpawnTransformIncrement),
+                kSpawnTransformIncrement, sizeof(kSpawnTransformIncrement));
+    std::memcpy(image + kMissionSpawnTransformLoopCompareRva,
+                kMissionSpawnTransformLoopOriginal.data(),
+                kMissionSpawnTransformLoopOriginal.size());
+    std::memcpy(image + kMissionSpawnTransformLoopExitRva, kSpawnTransformExit,
+                sizeof(kSpawnTransformExit));
+    FlushInstructionCache(GetCurrentProcess(), image, kFakeImageSize);
+    auto run_spawn_transform_loop = [&](unsigned participants,
+                                        RelayExecutionContext& context) {
+        context = {};
+        context.r13 = participants;
+        thunk(&context, image + kSpawnTransformEntryRva);
+    };
+    // Unpatched evidence: the native backedge visits every participant, so
+    // six players reach record 5 (rbp+0x230, the /GS cookie of 0x11d860).
+    RelayExecutionContext native_spawn_context{};
+    run_spawn_transform_loop(6, native_spawn_context);
+    if (native_spawn_context.r15 != 6 || native_spawn_context.rdi != 6 ||
+        native_spawn_context.rbx != 6 * 0x10) {
+        return finish(false,
+                      "native spawn transform slice did not visit six records");
+    }
+
+    // Parser index slices: each entry saves the thunk's context pointer
+    // (r10), loads the index from r13 into the register the native imul
+    // reads, runs the exact imul site and returns the product in r13.
+    constexpr uintptr_t kParserBlockEntryRva = 0x42f7a0;
+    constexpr uintptr_t kParserRecordEntryRva = 0x42f870;
+    constexpr uint8_t kParserBlockEntry[] = {
+        0x41, 0x52,              // push r10
+        0x4c, 0x89, 0xe9,        // mov rcx,r13
+        0xeb, 0x22,              // jmp 0x42f7c9
+    };
+    constexpr uint8_t kParserBlockExit[] = {
+        0x4d, 0x89, 0xd5,        // mov r13,r10
+        0x41, 0x5a,              // pop r10
+        0xc3,
+    };
+    constexpr uint8_t kParserRecordEntry[] = {
+        0x41, 0x52,              // push r10
+        0x4d, 0x89, 0xe9,        // mov r9,r13
+        0xeb, 0x21,              // jmp 0x42f898
+    };
+    constexpr uint8_t kParserRecordExit[] = {
+        0x4d, 0x89, 0xcd,        // mov r13,r9
+        0x41, 0x5a,              // pop r10
+        0xc3,
+    };
+    static_assert(kParserBlockEntryRva + sizeof(kParserBlockEntry) + 0x22 ==
+                          kMissionLoadoutParserBlockOffsetRva &&
+                      kParserRecordEntryRva + sizeof(kParserRecordEntry) +
+                              0x21 ==
+                          kMissionLoadoutParserRecordOffsetRva,
+                  "parser test entries must jump to the imul sites");
+    std::memcpy(image + kParserBlockEntryRva, kParserBlockEntry,
+                sizeof(kParserBlockEntry));
+    std::memcpy(image + kMissionLoadoutParserBlockOffsetRva,
+                kMissionLoadoutParserBlockOffsetOriginal.data(),
+                kMissionLoadoutParserBlockOffsetOriginal.size());
+    std::memcpy(image + kMissionLoadoutParserBlockOffsetReturnRva,
+                kParserBlockExit, sizeof(kParserBlockExit));
+    std::memcpy(image + kParserRecordEntryRva, kParserRecordEntry,
+                sizeof(kParserRecordEntry));
+    std::memcpy(image + kMissionLoadoutParserRecordOffsetRva,
+                kMissionLoadoutParserRecordOffsetOriginal.data(),
+                kMissionLoadoutParserRecordOffsetOriginal.size());
+    std::memcpy(image + kMissionLoadoutParserRecordOffsetReturnRva,
+                kParserRecordExit, sizeof(kParserRecordExit));
+    FlushInstructionCache(GetCurrentProcess(), image, kFakeImageSize);
+    constexpr uint64_t kFakeParserR14 = 0x0000001234560000ULL;
+    auto run_parser_offset = [&](bool record_site, uint64_t index) {
+        RelayExecutionContext context{};
+        context.r13 = index;
+        context.r14 = kFakeParserR14;
+        thunk(&context, image + (record_site ? kParserRecordEntryRva
+                                             : kParserBlockEntryRva));
+        return context.r13;
+    };
+    // Unpatched evidence: the native product for P5 is 5*0x3E90, i.e.
+    // state+0x14B30+5*0x3E90 = state+0x28400, outside the 0x24600 object.
+    if (run_parser_offset(false, 5) != 5 * kMissionLoadoutParserBlockStride ||
+        run_parser_offset(true, 5) != 5 * kMissionLoadoutParserBlockStride) {
+        return finish(false, "native parser slices did not multiply by 0x3e90");
+    }
+
+    // Script record slices: movsxd rax,edi + the exact address arithmetic,
+    // then an exit that returns the record address (rcx) in r14.
+    constexpr uint8_t kScriptRecordExit[] = {
+        0x49, 0x89, 0xce,        // mov r14,rcx
+        0xc3,
+    };
+    std::memcpy(image + kMissionScriptRecordReadARva - 3,
+                kMissionScriptRecordIndexLoad.data(),
+                kMissionScriptRecordIndexLoad.size());
+    std::memcpy(image + kMissionScriptRecordReadARva,
+                kMissionScriptRecordReadAOriginal.data(),
+                kMissionScriptRecordReadAOriginal.size());
+    std::memcpy(image + kMissionScriptRecordReadAReturnRva, kScriptRecordExit,
+                sizeof(kScriptRecordExit));
+    std::memcpy(image + kMissionScriptRecordReadBRva - 3,
+                kMissionScriptRecordIndexLoad.data(),
+                kMissionScriptRecordIndexLoad.size());
+    std::memcpy(image + kMissionScriptRecordReadBRva,
+                kMissionScriptRecordReadBOriginal.data(),
+                kMissionScriptRecordReadBOriginal.size());
+    std::memcpy(image + kMissionScriptRecordReadBReturnRva, kScriptRecordExit,
+                sizeof(kScriptRecordExit));
+    FlushInstructionCache(GetCurrentProcess(), image, kFakeImageSize);
+    constexpr uint64_t kFakeScriptMission = 0x0000004321000000ULL;
+    auto run_script_record = [&](bool second_site, uint64_t index) {
+        RelayExecutionContext context{};
+        context.rdi = index;
+        context.rsi = kFakeScriptMission;
+        context.r13 = kFakeScriptMission;
+        thunk(&context, image + (second_site ? kMissionScriptRecordReadBRva
+                                             : kMissionScriptRecordReadARva) -
+                            3);
+        return context.r14;
+    };
+    const auto native_record = [&](uint64_t index) {
+        return kFakeScriptMission + kMissionRecordObjectBaseOffset +
+               index * kMissionRecordSize + kMissionScriptRecordWeakOffset;
+    };
+    // Unpatched evidence: index 5 addresses mission+0x1B8, past the four
+    // native records (the 0.6.76 stage-trigger crash).
+    if (run_script_record(false, 2) != native_record(2) ||
+        run_script_record(true, 2) != native_record(2) ||
+        run_script_record(false, 5) != native_record(5) ||
+        run_script_record(true, 5) != native_record(5)) {
+        return finish(false, "native script record slices changed");
+    }
+
     if (patched) {
         if (!BuildMissionRelayPage(image, 8) ||
             !WriteMissionSpawnSites(image) ||
@@ -3023,6 +5157,55 @@ bool RunMissionRecordMicroTest(const wchar_t* fixture_path, bool patched,
         }
     }
     FlushInstructionCache(GetCurrentProcess(), image, kFakeImageSize);
+    if (patched) {
+        const uint64_t sidecar = reinterpret_cast<uint64_t>(
+            g_mission_relay_page + kMissionSidecarOffset);
+        const uint64_t empty = reinterpret_cast<uint64_t>(
+            g_mission_relay_page + kMissionScriptEmptyRecordOffset +
+            kMissionScriptRecordWeakOffset);
+        uint64_t redirected_before = 0;
+        uint64_t empty_before = 0;
+        std::memcpy(&redirected_before,
+                    g_mission_relay_page +
+                        kMissionScriptRecordRedirectCounterOffset,
+                    sizeof(redirected_before));
+        std::memcpy(&empty_before,
+                    g_mission_relay_page +
+                        kMissionScriptRecordEmptyCounterOffset,
+                    sizeof(empty_before));
+        bool script_ok = true;
+        for (const bool second_site : {false, true}) {
+            for (uint64_t index = 0; index < 4; ++index) {
+                script_ok = script_ok &&
+                    run_script_record(second_site, index) ==
+                        native_record(index);
+            }
+            for (uint64_t index = 4; index < 8; ++index) {
+                script_ok = script_ok &&
+                    run_script_record(second_site, index) ==
+                        sidecar + (index - 4) * kMissionRecordSize +
+                            kMissionScriptRecordWeakOffset;
+            }
+            script_ok = script_ok &&
+                run_script_record(second_site, 8) == empty &&
+                run_script_record(second_site, 1000) == empty;
+        }
+        uint64_t redirected_after = 0;
+        uint64_t empty_after = 0;
+        std::memcpy(&redirected_after,
+                    g_mission_relay_page +
+                        kMissionScriptRecordRedirectCounterOffset,
+                    sizeof(redirected_after));
+        std::memcpy(&empty_after,
+                    g_mission_relay_page +
+                        kMissionScriptRecordEmptyCounterOffset,
+                    sizeof(empty_after));
+        if (!script_ok || redirected_after - redirected_before != 8 ||
+            empty_after - empty_before != 4) {
+            return finish(false,
+                          "script record relays did not map P4-P7 to sidecars");
+        }
+    }
 
     alignas(16) std::array<uint8_t, 0x400> synthetic_stack{};
     alignas(16) std::array<uint8_t, 0x240> mission_object{};
@@ -3184,11 +5367,82 @@ bool RunMissionRecordMicroTest(const wchar_t* fixture_path, bool patched,
                       "existing-record relay did not map player 8");
     }
 
+    struct SpawnTransformCase {
+        unsigned participants;
+        unsigned expected_iterations;
+        uint64_t expected_clamps;
+    };
+    constexpr SpawnTransformCase kSpawnTransformCases[] = {
+        {1, 1, 0}, {4, 4, 0}, {5, 4, 1}, {6, 4, 2}, {8, 4, 3},
+    };
+    for (const auto& spawn_case : kSpawnTransformCases) {
+        RelayExecutionContext spawn_context{};
+        run_spawn_transform_loop(spawn_case.participants, spawn_context);
+        if (spawn_context.r15 != spawn_case.expected_iterations ||
+            spawn_context.rdi != spawn_case.expected_iterations ||
+            spawn_context.rbx != spawn_case.expected_iterations * 0x10 ||
+            ReadMissionRelayCounter(
+                kMissionSpawnTransformClampCounterOffset) !=
+                spawn_case.expected_clamps) {
+            return finish(false,
+                          "spawn transform relay did not stop at four records");
+        }
+    }
+
+    const uint64_t parser_blocks = reinterpret_cast<uint64_t>(
+        g_mission_loadout_parser_blocks.data());
+    auto expected_parser_offset = [&](uint64_t index) {
+        if (index < kMissionLoadoutParserNativeBlocks) {
+            return index * kMissionLoadoutParserBlockStride;
+        }
+        const uint64_t block = index < kMissionLoadoutParserNativeBlocks +
+                                           kMissionLoadoutParserExtraBlocks
+            ? index - kMissionLoadoutParserNativeBlocks
+            : kMissionLoadoutParserExtraBlocks;
+        return parser_blocks + block * kMissionLoadoutParserBlockStride -
+            kMissionLoadoutParserBlockDisplacement - kFakeParserR14;
+    };
+    constexpr uint64_t kParserIndices[] = {0, 1, 3, 4, 5, 6, 7, 8, 1000};
+    for (const uint64_t index : kParserIndices) {
+        for (const bool record_site : {false, true}) {
+            const uint64_t offset = run_parser_offset(record_site, index);
+            if (offset != expected_parser_offset(index)) {
+                return finish(false,
+                              "parser relay produced a wrong block offset");
+            }
+            // The parser adds r14 and its own displacements; the resulting
+            // block base must be native for 0..3 and plugin-owned otherwise.
+            const uint64_t block_base = offset + kFakeParserR14 +
+                kMissionLoadoutParserBlockDisplacement;
+            if (index >= kMissionLoadoutParserNativeBlocks &&
+                (block_base < parser_blocks ||
+                 block_base + kMissionLoadoutParserBlockStride >
+                     parser_blocks +
+                         g_mission_loadout_parser_blocks.size())) {
+                return finish(false,
+                              "parser relay escaped the plugin-owned blocks");
+            }
+        }
+    }
+    if (ReadMissionRelayCounter(kMissionLoadoutParserRedirectCounterOffset) !=
+            4 ||
+        ReadMissionRelayCounter(kMissionLoadoutParserDiscardCounterOffset) !=
+            2) {
+        return finish(false, "parser relay counters did not match");
+    }
+
     return finish(
         true,
         "ok: exact 0x11e2a0 loop bytes replayed; 1+4 case "
         "redirected, players 5-8 isolated in four sidecars, spawns "
-        "modulo four, native canaries intact and reference counts balanced");
+        "modulo four, native canaries intact and reference counts balanced; "
+        "0x11db21 spawn transform loop visits six native records unpatched "
+        "and stops at four for 5/6/8 participants without changing 1/4; "
+        "0x42f7c9/0x42f898 parser offsets stay native for 0..3, select "
+        "plugin blocks for 4..7 and a discard block above 7; "
+        "0x121c43/0x127393 script record reads leave mission+0x1b8 for "
+        "index 5 unpatched and map 0..3 native, 4..7 to the sidecars and "
+        ">= 8 to an empty record");
 }
 
 bool SelfTest(std::string& report) {
@@ -3402,6 +5656,16 @@ bool SelfTest(std::string& report) {
         report = relay_execution_report;
         return false;
     }
+    std::string rear_seat_report;
+    if (!SelfTestRearSeatRelayExecution(rear_seat_report)) {
+        report = rear_seat_report;
+        return false;
+    }
+    std::string health_scaling_report;
+    if (!SelfTestHealthScalingRelayExecution(health_scaling_report)) {
+        report = health_scaling_report;
+        return false;
+    }
     std::array<uint8_t, 0x30> member_button_loop{};
     const uintptr_t member_button_base = kMemberButtonLoopSites.front().rva;
     for (const auto& site : kMemberButtonLoopSites) {
@@ -3556,6 +5820,28 @@ bool SelfTest(std::string& report) {
         WriteMissionResultParticipantSites(restore_image, 8);
         WriteMemberButtonLoopSites(restore_image);
         WriteExperimentalReserveSites(restore_image, 8);
+        for (const auto& site : kGameMessageReserveSites) {
+            std::memcpy(restore_image + site.rva, site.original.data(),
+                        site.instruction_size);
+        }
+        bool message_reserve_expanded =
+            GameMessageReserveSitesMatch(restore_image, false);
+        WriteGameMessageReserveSites(restore_image, true);
+        for (const auto& site : kGameMessageReserveSites) {
+            uint32_t reserve = 0;
+            std::memcpy(&reserve, restore_image + site.rva + 1,
+                        sizeof(reserve));
+            message_reserve_expanded = message_reserve_expanded &&
+                reserve == kGameMessageExpandedReserve;
+        }
+        message_reserve_expanded = message_reserve_expanded &&
+            GameMessageReserveSitesMatch(restore_image, true) &&
+            !GameMessageReserveSitesMatch(restore_image, false);
+        if (!message_reserve_expanded) {
+            VirtualFree(restore_image, 0, MEM_RELEASE);
+            report = "game message reserve was not expanded to 0x800";
+            return false;
+        }
         WriteRosterOriginalSites(restore_image);
         WriteExperimentalReserveSites(restore_image, kOriginalCapacity);
         restore_bytes_valid = RosterOriginalSitesMatch(restore_image) &&
@@ -3570,7 +5856,8 @@ bool SelfTest(std::string& report) {
         report = "fail-closed restoration did not restore/reject the expected bytes";
         return false;
     }
-    report = "validated: three tables and room boxes preallocated 4->8, 24 experimental reserves/48 operands 4->8, dynamic Master/Member, MissionSync_Res filter following MaxPlayers 5..8, external eight-participant vector, modulo-four spawn, four sidecars across three persistent paths and 56 native relays executed for 3/5/8 with profile clamped to 4 without changing the real count, plus fail-closed signature restoration";
+    report = "validated: 0x1100/0x3300 message reserves 0x2e8->0x800, three tables and room boxes preallocated 4->8, 24 experimental reserves/48 operands 4->8, dynamic Master/Member, MissionSync_Res filter following MaxPlayers 5..8, external eight-participant vector, modulo-four spawn, four sidecars across three persistent paths and 56 native relays executed for 3/5/8 with profile clamped to 4 without changing the real count, plus fail-closed signature restoration; " +
+        rear_seat_report + "; " + health_scaling_report;
     return true;
 }
 

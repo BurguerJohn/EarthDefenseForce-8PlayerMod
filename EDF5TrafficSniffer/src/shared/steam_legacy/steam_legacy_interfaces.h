@@ -17,6 +17,10 @@ void HookFriends(void* interface_pointer);      // SteamFriends015
 void HookUserAuth(void* interface_pointer, const char* interface_version);
 
 bool OpenLobbyInviteDialog(uint64_t lobby);
+// Steam persona (UTF-8) of a user through the original, unhooked
+// GetFriendPersonaName. Returns false when unavailable or empty. The text is
+// for in-game display only and must never be logged.
+bool CopyFriendPersonaName(uint64_t user, std::string& name);
 uint64_t LocalUserSteamId();
 // Bypasses the synthetic-member policy and queries the real Steam lobby. It is
 // used on SteamAPI_RunCallbacks' game thread to enforce EDF 4.1's native-safe

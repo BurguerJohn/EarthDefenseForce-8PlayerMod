@@ -264,12 +264,25 @@ function Sanitize-JsonFile {
 
 function Sanitize-JsonLines {
     param([string]$Source, [string]$Destination)
+    # Large sessions take minutes on slower PCs. Without visible progress
+    # testers closed the window mid-way, leaving truncated .staging folders
+    # and no ZIP (2026-10-03).
+    $totalLines = 0
+    foreach ($ignored in [IO.File]::ReadLines($Source)) { $totalLines++ }
+    $sourceName = [IO.Path]::GetFileName($Source)
+    $nextProgress = 0
     $writer = [IO.StreamWriter]::new(
         $Destination, $false, [Text.UTF8Encoding]::new($false))
     try {
         $lineNumber = 0
         foreach ($line in [IO.File]::ReadLines($Source)) {
             $lineNumber++
+            if ($totalLines -ge 500 -and $lineNumber -ge $nextProgress) {
+                $percent = [int](100 * $lineNumber / $totalLines)
+                Write-Host ("  {0}: {1}% ({2}/{3})" -f
+                    $sourceName, $percent, $lineNumber, $totalLines)
+                $nextProgress = $lineNumber + [Math]::Max(500, [int]($totalLines / 10))
+            }
             if ([string]::IsNullOrWhiteSpace($line)) { continue }
             if ($line -notmatch '(?i)"payload"\s*:') {
                 $fast = Sanitize-JsonLineFast $line
@@ -389,6 +402,9 @@ if (-not $stagingFull.StartsWith($safePrefix, [StringComparison]::OrdinalIgnoreC
     throw "Unsafe staging path: $stagingFull"
 }
 New-Item -ItemType Directory -Path $stagingFull | Out-Null
+Write-Host "Creating sanitized report for session $([IO.Path]::GetFileName($sessionPath))."
+Write-Host 'This can take a few minutes for long sessions. Do not close this window'
+Write-Host 'until it prints "Created sanitized report".'
 
 try {
     foreach ($name in @('session.json', 'status.json', 'health.json')) {

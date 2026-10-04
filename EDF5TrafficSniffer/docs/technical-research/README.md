@@ -8,8 +8,8 @@ cannot yet be changed safely.
 
 ## Pinned scope
 
-- Documented mod: `EDF5_MultiSlotMod 0.6.64`.
-- Build IDs: `edf5mp-0.6.64-diagnostics-win64` and `edf5mp-0.6.64-users-win64`.
+- Documented mod: `EDF5_MultiSlotMod 0.6.66`.
+- Build IDs: `edf5mp-0.6.66-diagnostics-win64` and `edf5mp-0.6.66-users-win64`.
 - Supported executable: x64 `EDF5.exe`.
 - Executable SHA-256: `3512D2A2E61D532C5D12DC0C5FD1AC61F6743E13349AE21301BB8449DD4BAE5F`.
 - Observed Steam API: `steam_api64.dll` version `04.28.51.07`, SHA-256
@@ -36,7 +36,7 @@ ASLR makes absolute virtual addresses unsuitable for reuse across executions.
 - **PENDING:** an open question; numerical resemblance is not grounds for a patch.
 
 When historical notes disagree with current implementation, use `src/`, the
-validators and the 0.6.64 notebook. Old hypotheses explain why approaches were removed.
+validators and the 0.6.66 notebook. Old hypotheses explain why approaches were removed.
 
 ## Index
 

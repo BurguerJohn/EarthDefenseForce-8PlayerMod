@@ -19,6 +19,7 @@ void ObserveLeaveLobby(uint64_t lobby);
 bool RewriteLobbyData(uint64_t lobby, const char* key, const char* value,
                       std::string& rewritten);
 int AdjustMemberCount(uint64_t lobby, int actual_count);
+int AdjustLobbyType(uint64_t lobby, int type);
 void ObserveMemberCount(uint64_t lobby, int actual_count);
 bool TryGetSyntheticMember(uint64_t lobby, int actual_count, int index,
                            uint64_t& user);

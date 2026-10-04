@@ -132,6 +132,8 @@ int wmain(int argc, wchar_t** argv) {
     const auto get_member_limit = Export<GetIntFn>(fake, "FakeSteam_GetLastMemberLimit");
     const auto get_public_slot = Export<GetStringFn>(fake, "FakeSteam_GetPublicSlot");
     const auto get_open_public = Export<GetStringFn>(fake, "FakeSteam_GetOpenPublic");
+    const auto get_private_slot =
+        Export<GetStringFn>(fake, "FakeSteam_GetPrivateSlot");
     const auto get_send_count = Export<GetIntFn>(fake, "FakeSteam_GetOriginalSendCount");
     const auto get_auth_count = Export<GetIntFn>(fake, "FakeSteam_GetOriginalBeginAuthCount");
     const auto get_invite_lobby = Export<GetUInt64Fn>(
@@ -139,6 +141,7 @@ int wmain(int argc, wchar_t** argv) {
     if (!context_init || !run_callbacks || !shutdown || !register_callback ||
         !unregister_callback || !set_actual_members || !get_create_limit ||
         !get_member_limit || !get_public_slot || !get_open_public ||
+        !get_private_slot ||
         !get_send_count || !get_auth_count || !get_invite_lobby) {
         return Fail("fake steam exports");
     }
@@ -224,15 +227,32 @@ int wmain(int argc, wchar_t** argv) {
                      observed_create_limit);
         return Fail("CreateLobby limit hook");
     }
+    // Public room (four native public seats incl. host): the extra seats are
+    // public and free public seats grow to MaxPlayers - members.
     const std::string expected_public_slot =
-        std::to_string(kExpectedMaxPlayers - 3);
+        std::to_string(kExpectedMaxPlayers);
     const std::string expected_open_public =
-        std::to_string(kExpectedMaxPlayers - 4);
-    if (!set_data(matchmaking, lobby, "public_slot", "1") ||
+        std::to_string(kExpectedMaxPlayers - 1);
+    if (!set_data(matchmaking, lobby, "public_slot", "4") ||
         std::strcmp(get_public_slot(), expected_public_slot.c_str()) != 0 ||
-        !set_data(matchmaking, lobby, "open_public", "0") ||
+        !set_data(matchmaking, lobby, "open_public", "3") ||
         std::strcmp(get_open_public(), expected_open_public.c_str()) != 0) {
+        std::fprintf(stderr, "public_slot=%s open_public=%s\n",
+                     get_public_slot(), get_open_public());
         return Fail("lobby metadata rewrite");
+    }
+    // Friends-only room (host-only public seat): never advertises a free
+    // public seat, even when a fifth member underflows the native count,
+    // and the extra seats become friend seats.
+    const std::string expected_private_slot =
+        std::to_string(kExpectedMaxPlayers - 1);
+    if (!set_data(matchmaking, lobby, "public_slot", "1") ||
+        std::strcmp(get_public_slot(), "1") != 0 ||
+        !set_data(matchmaking, lobby, "private_slot", "3") ||
+        std::strcmp(get_private_slot(), expected_private_slot.c_str()) != 0 ||
+        !set_data(matchmaking, lobby, "open_public", "-1") ||
+        std::strcmp(get_open_public(), "0") != 0) {
+        return Fail("friends-only lobby stayed public");
     }
     if (!set_limit(matchmaking, lobby, 4) ||
         get_member_limit() != kExpectedMaxPlayers) {
