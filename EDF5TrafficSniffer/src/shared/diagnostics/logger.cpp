@@ -600,6 +600,15 @@ DWORD WINAPI WriterMain(void*) {
     return 0;
 }
 
+// "auto" or the configured multiple of the four-player enemy health.
+std::string EnemyHealthSetting(float multiplier) {
+    if (!(multiplier > 0.0f)) return "auto";
+    char text[32]{};
+    std::snprintf(text, sizeof(text), "%.3g",
+                  static_cast<double>(multiplier));
+    return text;
+}
+
 const char* ProfileName(DiagnosticProfile profile) {
     switch (profile) {
     case DiagnosticProfile::Essential: return "Essential";
@@ -1120,6 +1129,15 @@ bool Initialize(HMODULE plugin_module) {
              << "  \"experimental_reserve_patches\": "
              << (g_config.experimental_reserve_patches ? "true" : "false")
              << ",\r\n"
+             << "  \"extended_enemy_health_scaling\": "
+             << (g_config.extended_enemy_health_scaling ? "true" : "false")
+             << ",\r\n"
+             << "  \"enemy_health_players_5_to_8\": \""
+             << EnemyHealthSetting(g_config.enemy_health_multipliers[0]) << "/"
+             << EnemyHealthSetting(g_config.enemy_health_multipliers[1]) << "/"
+             << EnemyHealthSetting(g_config.enemy_health_multipliers[2]) << "/"
+             << EnemyHealthSetting(g_config.enemy_health_multipliers[3])
+             << "\",\r\n"
              << "  \"bot_hotkey_vk\": " << g_config.bot_hotkey_vk
              << ",\r\n"
              << "  \"bot_remove_hotkey_vk\": "

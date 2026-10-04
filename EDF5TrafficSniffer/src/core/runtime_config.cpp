@@ -114,6 +114,47 @@ std::wstring IniString(const wchar_t* section, const wchar_t* key,
     return value;
 }
 
+// "auto" (also empty, 0 or anything unparsable) yields 0. Otherwise a
+// decimal such as 1.5 or 1,5 with an optional trailing x, parsed without the
+// process locale and clamped to [minimum, maximum].
+float IniMultiplier(const wchar_t* section, const wchar_t* key,
+                    float minimum, float maximum) {
+    const std::wstring raw = IniString(section, key, L"auto");
+    size_t begin = 0;
+    size_t end = raw.size();
+    while (begin < end && (raw[begin] == L' ' || raw[begin] == L'\t')) {
+        ++begin;
+    }
+    while (end > begin && (raw[end - 1] == L' ' || raw[end - 1] == L'\t')) {
+        --end;
+    }
+    if (end > begin && (raw[end - 1] == L'x' || raw[end - 1] == L'X')) --end;
+    if (begin == end) return 0.0f;
+    double value = 0.0;
+    double scale = 0.0;
+    bool digits = false;
+    for (size_t at = begin; at < end; ++at) {
+        const wchar_t ch = raw[at];
+        if (ch >= L'0' && ch <= L'9') {
+            const double digit = static_cast<double>(ch - L'0');
+            digits = true;
+            if (scale == 0.0) {
+                value = value * 10.0 + digit;
+            } else {
+                value += digit * scale;
+                scale /= 10.0;
+            }
+        } else if ((ch == L'.' || ch == L',') && scale == 0.0) {
+            scale = 0.1;
+        } else {
+            return 0.0f;
+        }
+    }
+    if (!digits || value <= 0.0) return 0.0f;
+    const float result = static_cast<float>(value);
+    return std::max(minimum, std::min(maximum, result));
+}
+
 uint64_t IniUInt64(const wchar_t* section, const wchar_t* key,
                    uint64_t fallback) {
     wchar_t fallback_text[32]{};
@@ -291,6 +332,20 @@ capture::Config Load(HMODULE plugin_module) {
         config.max_players, 8);
     config.experimental_reserve_patches = IniBoolWithLegacy(
         kCoop8, kLegacyCoop8, L"ExperimentalReservePatches", false);
+    config.extended_enemy_health_scaling = IniBoolWithLegacy(
+        kCoop8, kLegacyCoop8, L"ExtendedEnemyHealthScaling", true);
+    constexpr const wchar_t* kEnemyHealthKeys[] = {
+        L"EnemyHealth5Players", L"EnemyHealth6Players",
+        L"EnemyHealth7Players", L"EnemyHealth8Players",
+    };
+    static_assert(std::size(kEnemyHealthKeys) ==
+                      sizeof(capture::Config::enemy_health_multipliers) /
+                          sizeof(float),
+                  "one EnemyHealth key per extra participant count");
+    for (size_t index = 0; index < std::size(kEnemyHealthKeys); ++index) {
+        config.enemy_health_multipliers[index] =
+            IniMultiplier(kCoop8, kEnemyHealthKeys[index], 0.1f, 20.0f);
+    }
     config.bot_hotkey_vk = IniUIntWithLegacy(
         kCoop8, kLegacyCoop8, L"BotHotkeyVK", VK_F8, 1, 255);
     config.bot_remove_hotkey_vk = IniUIntWithLegacy(

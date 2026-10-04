@@ -8,6 +8,8 @@
 #include "steam_interfaces.h"
 #include "winsock_hooks.h"
 
+#include <iterator>
+
 namespace edf5 {
 namespace {
 
@@ -108,6 +110,11 @@ bool Load(HMODULE plugin_module) {
 
     if (!config.sniffer && !config.coop8) return true;
 
+    game_patches::SetExtendedEnemyHealthScaling(
+        config.extended_enemy_health_scaling);
+    game_patches::SetEnemyHealthMultipliers(
+        config.enemy_health_multipliers,
+        std::size(config.enemy_health_multipliers));
     if (config.coop8 &&
         !game_patches::InstallRosterCapacity(
             more_players::MaxPlayers(), config.preallocated_roster_slots)) {

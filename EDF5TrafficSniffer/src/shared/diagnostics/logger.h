@@ -76,6 +76,9 @@ struct Config {
     unsigned enemy_spawn_multiplier = 1;
     unsigned preallocated_roster_slots = 8;
     bool experimental_reserve_patches = false;
+    bool extended_enemy_health_scaling = true;
+    // EnemyHealth5Players..EnemyHealth8Players; 0 = automatic step.
+    float enemy_health_multipliers[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     unsigned bot_hotkey_vk = VK_F8;
     unsigned bot_remove_hotkey_vk = VK_F7;
     unsigned bot_ready_hotkey_vk = VK_F6;

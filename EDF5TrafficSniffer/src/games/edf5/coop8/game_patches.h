@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -47,6 +48,20 @@ uint8_t* LoadoutParserExtraScratch();
 // True while image holds the jump that replaced the native imul at 0x42F7C9.
 // Signature checks of that site must then skip its first seven bytes.
 bool LoadoutParserStrideRelayInstalled(const uint8_t* image);
+
+// With 5-8 participants, continue each enemy HP table's last per-player step
+// (4-player factor + (count - 4) * (4-player - 3-player factor)) instead of
+// staying on the 4-player factor. Takes effect for enemies created afterwards;
+// may be called before or after InstallRosterCapacity. Default: enabled.
+void SetExtendedEnemyHealthScaling(bool enabled);
+bool ExtendedEnemyHealthScaling();
+
+// Optional fixed enemy HP for 5..8 participants as a multiple of the
+// four-player HP (multipliers[0] = 5 players). 0 or a value outside 0.1..20
+// keeps the continued per-player step for that count.
+void SetEnemyHealthMultipliers(const float* multipliers, size_t count);
+// 0 = automatic step, otherwise the multiplier in effect for that count.
+float EnemyHealthMultiplier(unsigned participants);
 
 // Replays the exact v0.4.6 append-loop crash fixture in an isolated helper
 // process. When patched=false the caller intentionally reaches the native
