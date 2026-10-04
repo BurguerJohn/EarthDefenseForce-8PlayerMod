@@ -495,6 +495,28 @@ static_assert(kReplicationMessageReserveStubOffset + 0x80 <=
                   kMissionRelayPageSize,
               "message reserve relays exceed relay page");
 
+// Mission spawn function 0x11D860 transforms its four native 16-byte spawn
+// records at rbp+0x1E0 in a loop bounded by the real participant count. With
+// six participants slot 5 lands on the /GS cookie at rbp+0x230 and every
+// machine fails with 0xC0000409 (live 2026-10-02); slots 6-7 would overwrite
+// saved xmm registers. Extra participants already recycle spawn[index % 4],
+// so cap that loop at the four native records.
+constexpr uintptr_t kSpawnTransformLoopRva = 0x11db21;
+constexpr uintptr_t kSpawnTransformLoopBodyRva = 0x11dab1;
+constexpr uintptr_t kSpawnTransformLoopExitRva = 0x11db27;
+constexpr std::array<uint8_t, 6> kSpawnTransformLoopOriginal = {
+    0x3b, 0x7c, 0x24, 0x50,  // cmp edi,[rsp+0x50]
+    0x75, 0x8a,              // jne 0x11dab1
+};
+constexpr size_t kSpawnTransformLoopStubOffset = 0x1500;
+constexpr size_t kSpawnTransformCappedCounterOffset = 0x1320;
+static_assert(kReplicationMessageReserveGrownCounterOffset +
+                      sizeof(uint64_t) <=
+                  kSpawnTransformCappedCounterOffset,
+              "spawn transform telemetry overlaps message telemetry");
+static_assert(kSpawnTransformLoopStubOffset + 0x40 <= kMissionRelayPageSize,
+              "spawn transform relay exceeds relay page");
+
 uint8_t* g_mission_relay_page = nullptr;
 // Allocated once and never released: the parser hook may still be reading it
 // while a quarantine restores the original instruction.
@@ -504,6 +526,7 @@ std::atomic<uint64_t> g_reported_loadout_parser_extra_redirects{0};
 std::atomic<uint64_t> g_reported_loadout_parser_invalid_redirects{0};
 std::atomic<uint64_t> g_reported_reliable_message_reserves_grown{0};
 std::atomic<uint64_t> g_reported_replication_message_reserves_grown{0};
+std::atomic<uint64_t> g_reported_spawn_transform_caps{0};
 unsigned g_mission_relay_capacity = 0;
 unsigned g_roster_patch_max_players = 0;
 unsigned g_roster_patch_preallocated_slots = 0;
@@ -1026,6 +1049,32 @@ bool BuildMessageReserveRelays(uint8_t* page, uint8_t* image) {
             kReplicationMessageReserveGrownCounterOffset);
 }
 
+// Loop again only while edi != count and edi < 4. The stub is reached by a
+// jump from the same frame, so [rsp+0x50] is still the native count.
+bool BuildSpawnTransformRelay(uint8_t* page, uint8_t* image) {
+    if (!page || !image) return false;
+    uint8_t* stub = page + kSpawnTransformLoopStubOffset;
+    EmitBytes(stub, {0x3b, 0x7c, 0x24, 0x50,
+                     0x74, 0x00});
+    uint8_t* exit_branch = stub - 1;
+    EmitBytes(stub, {0x83, 0xff,
+                     static_cast<uint8_t>(kMissionSpawnPointCount),
+                     0x73, 0x00});
+    uint8_t* capped_branch = stub - 1;
+    if (!EmitRelative32(stub, 0xe9, image + kSpawnTransformLoopBodyRva)) {
+        return false;
+    }
+    uint8_t* capped = stub;
+    if (!EmitLockIncrement(stub, page + kSpawnTransformCappedCounterOffset)) {
+        return false;
+    }
+    uint8_t* loop_exit = stub;
+    return EmitRelative32(stub, 0xe9, image + kSpawnTransformLoopExitRva) &&
+           PatchRelative8(exit_branch, loop_exit) &&
+           PatchRelative8(capped_branch, capped) &&
+           stub <= page + kSpawnTransformLoopStubOffset + 0x40;
+}
+
 bool BuildMissionRelayPage(uint8_t* image, unsigned max_players) {
     if (g_mission_relay_page) {
         return g_mission_relay_capacity == max_players;
@@ -1190,10 +1239,13 @@ bool BuildMissionRelayPage(uint8_t* image, unsigned max_players) {
 
     if (!BuildParticipantScalingRelays(page) ||
         !BuildLoadoutParserRelay(page, image) ||
-        !BuildMessageReserveRelays(page, image)) {
+        !BuildMessageReserveRelays(page, image) ||
+        !BuildSpawnTransformRelay(page, image)) {
         return fail();
     }
 
+    std::memset(page + kSpawnTransformCappedCounterOffset, 0,
+                sizeof(uint64_t));
     std::memset(page + kReliableMessageReserveGrownCounterOffset, 0,
                 sizeof(uint64_t));
     std::memset(page + kReplicationMessageReserveGrownCounterOffset, 0,
@@ -1620,6 +1672,18 @@ bool WriteMessageReserveSites(uint8_t* image) {
                               kReplicationMessageReserveStubOffset);
 }
 
+bool SpawnTransformSiteMatches(const uint8_t* image, bool replacement) {
+    return RelayJumpSiteMatches(image, kSpawnTransformLoopRva,
+                                kSpawnTransformLoopOriginal,
+                                kSpawnTransformLoopStubOffset, replacement);
+}
+
+bool WriteSpawnTransformSite(uint8_t* image) {
+    return WriteRelayJumpSite(image, kSpawnTransformLoopRva,
+                              kSpawnTransformLoopOriginal,
+                              kSpawnTransformLoopStubOffset);
+}
+
 bool RosterReplacementSitesMatch(const uint8_t* image, unsigned max_players,
                                  unsigned preallocated_roster_slots) {
     return image &&
@@ -1635,6 +1699,7 @@ bool RosterReplacementSitesMatch(const uint8_t* image, unsigned max_players,
         ParticipantScalingSitesMatch(image, true) &&
         LoadoutParserSiteMatches(image, true) &&
         MessageReserveSitesMatch(image, true) &&
+        SpawnTransformSiteMatches(image, true) &&
         MemberButtonKeysMatch(image);
 }
 
@@ -1651,6 +1716,7 @@ bool RosterOriginalSitesMatch(const uint8_t* image) {
         ParticipantScalingSitesMatch(image, false) &&
         LoadoutParserSiteMatches(image, false) &&
         MessageReserveSitesMatch(image, false) &&
+        SpawnTransformSiteMatches(image, false) &&
         MemberButtonKeysMatch(image);
 }
 
@@ -1665,6 +1731,9 @@ void WriteRosterOriginalSites(uint8_t* image) {
     std::memcpy(image + kReplicationMessageReserveRva,
                 kReplicationMessageReserveOriginal.data(),
                 kReplicationMessageReserveOriginal.size());
+    std::memcpy(image + kSpawnTransformLoopRva,
+                kSpawnTransformLoopOriginal.data(),
+                kSpawnTransformLoopOriginal.size());
     WriteCapacity(image + kCapacityRegionRva, kOriginalCapacity);
     WriteSecondarySites(image, kOriginalCapacity);
     WriteTertiarySites(image, kOriginalCapacity);
@@ -2341,6 +2410,111 @@ bool SelfTestMessageReserveRelayExecution(std::string& report) {
                   "both message builders reserve max(0x2E8, header+payload) for payloads 0..4000 and restore cleanly");
 }
 
+using SpawnTransformExecutionThunk =
+    int(__fastcall*)(int32_t index, void* target, int32_t count);
+
+SpawnTransformExecutionThunk BuildSpawnTransformExecutionThunk(
+    uint8_t*& allocation) {
+    // edi = index; the count is stored where the patched site reads
+    // [rsp+0x50] after the call pushed its return address. The landing pads
+    // at the loop body and loop exit report 1 or 2 in eax and return here.
+    constexpr uint8_t code[] = {
+        0x57,
+        0x48, 0x83, 0xec, 0x60,
+        0x89, 0xcf,
+        0x44, 0x89, 0x44, 0x24, 0x48,
+        0xff, 0xd2,
+        0x48, 0x83, 0xc4, 0x60,
+        0x5f,
+        0xc3,
+    };
+    allocation = static_cast<uint8_t*>(VirtualAlloc(
+        nullptr, sizeof(code), MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE));
+    if (!allocation) return nullptr;
+    std::memcpy(allocation, code, sizeof(code));
+    FlushInstructionCache(GetCurrentProcess(), allocation, sizeof(code));
+    return reinterpret_cast<SpawnTransformExecutionThunk>(allocation);
+}
+
+bool SelfTestSpawnTransformRelayExecution(std::string& report) {
+    if (g_mission_relay_page) {
+        report = "spawn transform microtest refused: relay page already live";
+        return false;
+    }
+    // WriteRosterOriginalSites below restores every site, the highest being
+    // the room panels near 0x5A72E0.
+    constexpr size_t kFakeImageSize = kLoadoutParserStateSlotRva + 0x1000;
+    auto* image = static_cast<uint8_t*>(VirtualAlloc(
+        nullptr, kFakeImageSize, MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE));
+    uint8_t* thunk_allocation = nullptr;
+    const SpawnTransformExecutionThunk thunk =
+        image ? BuildSpawnTransformExecutionThunk(thunk_allocation) : nullptr;
+    auto finish = [&](bool result, const std::string& message) {
+        if (g_mission_relay_page) {
+            VirtualFree(g_mission_relay_page, 0, MEM_RELEASE);
+            g_mission_relay_page = nullptr;
+            g_mission_relay_capacity = 0;
+        }
+        g_loadout_parser_redirect_active.store(false,
+                                               std::memory_order_release);
+        if (thunk_allocation) VirtualFree(thunk_allocation, 0, MEM_RELEASE);
+        if (image) VirtualFree(image, 0, MEM_RELEASE);
+        report = message;
+        return result;
+    };
+    if (!image || !thunk) {
+        return finish(false, "could not allocate the spawn transform microtest");
+    }
+    std::memcpy(image + kSpawnTransformLoopRva,
+                kSpawnTransformLoopOriginal.data(),
+                kSpawnTransformLoopOriginal.size());
+    constexpr uint8_t kLoopPad[] = {0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3};
+    constexpr uint8_t kExitPad[] = {0xb8, 0x02, 0x00, 0x00, 0x00, 0xc3};
+    std::memcpy(image + kSpawnTransformLoopBodyRva, kLoopPad,
+                sizeof(kLoopPad));
+    std::memcpy(image + kSpawnTransformLoopExitRva, kExitPad,
+                sizeof(kExitPad));
+    if (!SpawnTransformSiteMatches(image, false) ||
+        !BuildMissionRelayPage(image, 8) ||
+        !WriteSpawnTransformSite(image) ||
+        !SpawnTransformSiteMatches(image, true) ||
+        SpawnTransformSiteMatches(image, false)) {
+        return finish(false, "spawn transform relay was not installed");
+    }
+    FlushInstructionCache(GetCurrentProcess(), image, kFakeImageSize);
+
+    uint64_t expected_caps = 0;
+    for (int32_t count = 1; count <= 8; ++count) {
+        // The loop body runs for index 0 before the first compare, so the
+        // compare sees index = completed iterations (1..count).
+        for (int32_t index = 1; index <= count; ++index) {
+            const bool native_loops = index != count;
+            const bool relay_loops = native_loops && index < 4;
+            expected_caps += native_loops && !relay_loops ? 1 : 0;
+            const int result = thunk(index, image + kSpawnTransformLoopRva,
+                                     count);
+            if (result != (relay_loops ? 1 : 2)) {
+                return finish(false, "spawn transform relay mis-bounded index " +
+                                         std::to_string(index) + " of " +
+                                         std::to_string(count));
+            }
+        }
+    }
+    if (ReadMissionRelayCounter(kSpawnTransformCappedCounterOffset) !=
+        expected_caps) {
+        return finish(false, "spawn transform telemetry count mismatch");
+    }
+
+    WriteRosterOriginalSites(image);
+    if (!SpawnTransformSiteMatches(image, false)) {
+        return finish(false, "spawn transform restore left a relay jump");
+    }
+    return finish(true,
+                  "spawn transform loop capped at four native records for 1-8 participants");
+}
+
 struct MissionHarnessRecord {
     uint32_t value = 0;
     uint32_t padding = 0;
@@ -2435,11 +2609,13 @@ bool InstallRosterCapacity(unsigned max_players,
         ParticipantScalingSitesMatch(image, true);
     const bool loadout_parser_ready = LoadoutParserSiteMatches(image, true);
     const bool message_reserve_ready = MessageReserveSitesMatch(image, true);
+    const bool spawn_transform_ready = SpawnTransformSiteMatches(image, true);
     if (primary_ready && secondary_ready && tertiary_ready && room_panels_ready &&
         mission_result_participants_ready &&
         member_buttons_ready && mission_participants_ready && mission_spawns_ready &&
         participant_scaling_ready && loadout_parser_ready &&
-        message_reserve_ready && MemberButtonKeysMatch(image)) {
+        message_reserve_ready && spawn_transform_ready &&
+        MemberButtonKeysMatch(image)) {
         g_roster_patch_max_players = max_players;
         g_roster_patch_preallocated_slots = preallocated_roster_slots;
         g_loadout_parser_redirect_active.store(true,
@@ -2524,6 +2700,8 @@ bool InstallRosterCapacity(unsigned max_players,
         LoadoutParserSiteMatches(image, false);
     const bool message_reserve_original =
         MessageReserveSitesMatch(image, false);
+    const bool spawn_transform_original =
+        SpawnTransformSiteMatches(image, false);
     if ((!primary_ready && !primary_original) ||
         (!secondary_ready && !secondary_original) ||
         (!tertiary_ready && !tertiary_original) ||
@@ -2536,6 +2714,7 @@ bool InstallRosterCapacity(unsigned max_players,
         (!participant_scaling_ready && !participant_scaling_original) ||
         (!loadout_parser_ready && !loadout_parser_original) ||
         (!message_reserve_ready && !message_reserve_original) ||
+        (!spawn_transform_ready && !spawn_transform_original) ||
         !MemberButtonKeysMatch(image)) {
         EDF5_CAPTURE_EVENT("more_players", "roster_capacity_patch_failed",
                        capture::Fields().String("reason", "EDF5 byte signature mismatch")
@@ -2545,6 +2724,8 @@ bool InstallRosterCapacity(unsigned max_players,
                                  loadout_parser_original)
                            .Bool("message_reserve_original",
                                  message_reserve_original)
+                           .Bool("spawn_transform_original",
+                                 spawn_transform_original)
                            .UInt("constructor_rva", kRosterConstructorRva)
                            .UInt("secondary_constructor_rva", kSecondaryConstructorRva)
                            .UInt("secondary_grow_helper_rva", kSecondaryGrowHelperRva)
@@ -2602,6 +2783,11 @@ bool InstallRosterCapacity(unsigned max_players,
                               kReliableMessageReserveOriginal.size() <=
                           capacity_patch_end,
                   "message reserve sites must stay inside the capacity range");
+    static_assert(kSpawnTransformLoopRva >= capacity_patch_begin &&
+                      kSpawnTransformLoopRva +
+                              kSpawnTransformLoopOriginal.size() <=
+                          capacity_patch_end,
+                  "spawn transform site must stay inside the capacity range");
     constexpr uintptr_t button_patch_begin = kMemberButtonLoopSites.front().rva;
     constexpr uintptr_t button_patch_end = 0x565acb;
     constexpr uintptr_t room_panel_patch_begin =
@@ -2731,10 +2917,11 @@ bool InstallRosterCapacity(unsigned max_players,
     const bool mission_spawn_written = WriteMissionSpawnSites(image);
     const bool participant_scaling_written =
         WriteParticipantScalingSites(image);
-    // 0x42F7C9, 0x432D65 and 0x43309E lie inside the capacity range made
-    // writable and flushed above.
+    // 0x11DB21, 0x42F7C9, 0x432D65 and 0x43309E lie inside the capacity range
+    // made writable and flushed above.
     const bool loadout_parser_written = WriteLoadoutParserSite(image);
     const bool message_reserve_written = WriteMessageReserveSites(image);
+    const bool spawn_transform_written = WriteSpawnTransformSite(image);
     EDF5_DIAGNOSTIC_PHASE(diagnostics_scope, "flush_instruction_cache",
                             capacity_patch_begin, capacity_patch_end);
     FlushInstructionCache(GetCurrentProcess(), image + capacity_patch_begin,
@@ -2753,6 +2940,7 @@ bool InstallRosterCapacity(unsigned max_players,
                           participant_scaling_written &&
                           loadout_parser_written &&
                           message_reserve_written &&
+                          spawn_transform_written &&
                           RosterReplacementSitesMatch(
                               image, max_players,
                               preallocated_roster_slots);
@@ -3214,6 +3402,7 @@ bool ReleaseMissionRelayPage() {
         0, std::memory_order_release);
     g_reported_replication_message_reserves_grown.store(
         0, std::memory_order_release);
+    g_reported_spawn_transform_caps.store(0, std::memory_order_release);
     g_reported_primary_redirects.store(0, std::memory_order_release);
     g_reported_existing_redirects.store(0, std::memory_order_release);
     g_reported_append_redirects.store(0, std::memory_order_release);
@@ -3597,6 +3786,22 @@ void PollMissionRelayTelemetry() {
                 .UInt("native_reserve_bytes", kNativeMessageReserve)
                 .Bool("heap_overflow_prevented", true)
                 .Bool("payload_logged", false));
+    }
+
+    const uint64_t spawn_caps =
+        ReadMissionRelayCounter(kSpawnTransformCappedCounterOffset);
+    const uint64_t previous_spawn_caps =
+        g_reported_spawn_transform_caps.exchange(spawn_caps,
+                                                 std::memory_order_acq_rel);
+    if (spawn_caps > previous_spawn_caps) {
+        EDF5_CAPTURE_EVENT(
+            "more_players", "mission_spawn_transform_capped",
+            capture::Fields()
+                .UInt("caps_delta", spawn_caps - previous_spawn_caps)
+                .UInt("caps_total", spawn_caps)
+                .UInt("loop_rva", kSpawnTransformLoopRva)
+                .UInt("native_spawn_records", kMissionSpawnPointCount)
+                .Bool("stack_cookie_overwrite_prevented", true));
     }
 }
 
@@ -4093,6 +4298,11 @@ bool SelfTest(std::string& report) {
         report = message_reserve_report;
         return false;
     }
+    std::string spawn_transform_report;
+    if (!SelfTestSpawnTransformRelayExecution(spawn_transform_report)) {
+        report = spawn_transform_report;
+        return false;
+    }
     std::array<uint8_t, 0x30> member_button_loop{};
     const uintptr_t member_button_base = kMemberButtonLoopSites.front().rva;
     for (const auto& site : kMemberButtonLoopSites) {
@@ -4261,7 +4471,7 @@ bool SelfTest(std::string& report) {
         report = "fail-closed restoration did not restore/reject the expected bytes";
         return false;
     }
-    report = "validated: three tables and room boxes preallocated 4->8, 24 experimental reserves/48 operands 4->8, dynamic Master/Member, MissionSync_Res filter following MaxPlayers 5..8, external eight-participant vector, modulo-four spawn, four sidecars across three persistent paths and 56 native relays executed for 3/5/8 with profile clamped to 4 without changing the real count, loadout parser stride relay executed for indices 0-8/63 keeping P4-P7 inside private blocks, both message builders sized to header+payload beyond 0x2E8, plus fail-closed signature restoration";
+    report = "validated: three tables and room boxes preallocated 4->8, 24 experimental reserves/48 operands 4->8, dynamic Master/Member, MissionSync_Res filter following MaxPlayers 5..8, external eight-participant vector, modulo-four spawn, four sidecars across three persistent paths and 56 native relays executed for 3/5/8 with profile clamped to 4 without changing the real count, loadout parser stride relay executed for indices 0-8/63 keeping P4-P7 inside private blocks, both message builders sized to header+payload beyond 0x2E8, spawn transform loop capped at four records, plus fail-closed signature restoration";
     return true;
 }
 
