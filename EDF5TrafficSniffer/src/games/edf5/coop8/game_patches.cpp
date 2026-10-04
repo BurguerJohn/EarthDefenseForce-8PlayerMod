@@ -17,6 +17,7 @@
 #include <iterator>
 #include <limits>
 #include <string>
+#include <utility>
 
 namespace game_patches {
 namespace {
@@ -551,6 +552,45 @@ static_assert(kSpawnTransformLoopStubOffset + 0x40 <= kRecordLookupAStubOffset &
                   kRecordLookupBStubOffset + 0x80 <= kMissionRelayPageSize,
               "record lookup relays overlap or exceed relay page");
 
+// The online seat pickers of Vehicle507_Rescuetank (Caliban, 0x34F880) and
+// Vehicle_Car (0x374DB0, cars with at least five seats) allow the driver seat
+// plus one dedicated rear seat per player: vec[0] = vec[index + 1] = index in
+// an int vector sized by the seat count [vehicle+0x428]. 0x356060 then takes
+// the first allowed seat that 0x355BE0 accepts (team, class, occupancy,
+// distance). A five-seat Caliban has no rear seat for player indices 4..7
+// (players 5/6 could only drive it, live 2026-10-03) and the native write
+// lands past the vector. Give those players the rear seat of player
+// index % rear_seats, and let anyone whose preferred rear seat is already
+// taken use every rear seat. Boarding sends the chosen seat index, so the
+// other machines follow unchanged.
+constexpr uintptr_t kCalibanSeatRva = 0x34f9ad;
+constexpr uintptr_t kCalibanSeatReturnRva = 0x34f9bb;
+constexpr uintptr_t kCarSeatRva = 0x374eed;
+constexpr uintptr_t kCarSeatReturnRva = 0x374efb;
+constexpr std::array<uint8_t, 14> kRearSeatOriginal = {
+    0x45, 0x89, 0x2e,              // mov [r14],r13d
+    0x41, 0x8d, 0x45, 0x01,        // lea eax,[r13+1]
+    0x48, 0x63, 0xd0,              // movsxd rdx,eax
+    0x45, 0x89, 0x2c, 0x96,        // mov [r14+rdx*4],r13d
+};
+constexpr uint32_t kVehicleSeatArrayOffset = 0x418;
+constexpr uint32_t kVehicleSeatStride = 0x340;
+constexpr uint32_t kVehicleSeatOccupantControlOffset = 0x268;
+constexpr size_t kCalibanSeatStubOffset = 0x1680;
+constexpr size_t kCarSeatStubOffset = 0x1780;
+constexpr size_t kRearSeatStubSize = 0x100;
+constexpr size_t kRearSeatPartnerCounterOffset = 0x1330;
+constexpr size_t kRearSeatAnyCounterOffset = 0x1338;
+static_assert(kRecordLookupRedirectCounterOffset + sizeof(uint64_t) <=
+                  kRearSeatPartnerCounterOffset,
+              "rear seat telemetry overlaps record lookup telemetry");
+static_assert(kRecordLookupBStubOffset + 0x80 <= kCalibanSeatStubOffset &&
+                  kCalibanSeatStubOffset + kRearSeatStubSize <=
+                      kCarSeatStubOffset &&
+                  kCarSeatStubOffset + kRearSeatStubSize <=
+                      kMissionRelayPageSize,
+              "rear seat relays overlap or exceed relay page");
+
 uint8_t* g_mission_relay_page = nullptr;
 // Allocated once and never released: the parser hook may still be reading it
 // while a quarantine restores the original instruction.
@@ -562,6 +602,8 @@ std::atomic<uint64_t> g_reported_reliable_message_reserves_grown{0};
 std::atomic<uint64_t> g_reported_replication_message_reserves_grown{0};
 std::atomic<uint64_t> g_reported_spawn_transform_caps{0};
 std::atomic<uint64_t> g_reported_record_lookup_redirects{0};
+std::atomic<uint64_t> g_reported_rear_seat_partner_choices{0};
+std::atomic<uint64_t> g_reported_rear_seat_any_choices{0};
 unsigned g_mission_relay_capacity = 0;
 unsigned g_roster_patch_max_players = 0;
 unsigned g_roster_patch_preallocated_slots = 0;
@@ -862,6 +904,11 @@ void EmitU64(uint8_t*& cursor, uint64_t value) {
     cursor += sizeof(value);
 }
 
+void EmitU32(uint8_t*& cursor, uint32_t value) {
+    std::memcpy(cursor, &value, sizeof(value));
+    cursor += sizeof(value);
+}
+
 bool EmitRelative32(uint8_t*& cursor, uint8_t opcode,
                     const uint8_t* target) {
     if (!WriteRelative32(cursor, opcode, target)) return false;
@@ -1155,6 +1202,97 @@ bool BuildRecordLookupRelays(uint8_t* page, uint8_t* image) {
             kRecordLookupBReturnRva);
 }
 
+// rsi = vector size (seat count), r14 = vector, r13d = player index and
+// rbp = vehicle. rax/rcx/rdx/r8 and the flags are dead at both sites; rbx
+// (0), r12 (-1), r13, r14, r15, rsi and rbp stay untouched.
+// The preferred rear seat is the native index + 1 when it exists, otherwise
+// 1 + index % rear_seats. When another player already sits there, every rear
+// seat is allowed, so nobody is locked out while a rear seat is free. With
+// four players no seat is ever taken by someone else, so the native choice
+// stays unchanged.
+bool BuildRearSeatRelay(uint8_t* page, uint8_t* image, size_t stub_offset,
+                        uintptr_t return_rva) {
+    if (!page || !image) return false;
+    uint8_t* stub = page + stub_offset;
+    EmitBytes(stub, {0x48, 0x85, 0xf6,          // test rsi,rsi
+                     0x74, 0x00});              // jz exit
+    uint8_t* empty_branch = stub - 1;
+    EmitBytes(stub, {0x45, 0x89, 0x2e,          // mov [r14],r13d (driver)
+                     0x45, 0x85, 0xed,          // test r13d,r13d
+                     0x78, 0x00});              // js exit
+    uint8_t* negative_branch = stub - 1;
+    EmitBytes(stub, {0x48, 0x8d, 0x4e, 0xff,    // lea rcx,[rsi-1]
+                     0x48, 0x85, 0xc9,          // test rcx,rcx
+                     0x75, 0x05});              // jnz main
+    uint8_t* exit = stub;
+    if (!EmitRelative32(stub, 0xe9, image + return_rva)) return false;
+
+    EmitBytes(stub, {0x45, 0x31, 0xc0,          // main: xor r8d,r8d
+                     0x41, 0x8d, 0x45, 0x01,    // lea eax,[r13+1]
+                     0x48, 0x63, 0xd0,          // movsxd rdx,eax
+                     0x48, 0x39, 0xf2,          // cmp rdx,rsi
+                     0x72, 0x00});              // jb check (native seat)
+    uint8_t* native_branch = stub - 1;
+    EmitBytes(stub, {0x44, 0x89, 0xe8,          // mov eax,r13d
+                     0x31, 0xd2,                // xor edx,edx
+                     0x48, 0xf7, 0xf1,          // div rcx
+                     0x48, 0xff, 0xc2,          // inc rdx (partner seat)
+                     0x41, 0xb0, 0x01});        // mov r8b,1
+    uint8_t* check = stub;
+    EmitBytes(stub, {0x48, 0x69, 0xc2});        // imul rax,rdx,stride
+    EmitU32(stub, kVehicleSeatStride);
+    EmitBytes(stub, {0x48, 0x03, 0x85});        // add rax,[rbp+seats]
+    EmitU32(stub, kVehicleSeatArrayOffset);
+    EmitBytes(stub, {0x48, 0x8b, 0x80});        // mov rax,[rax+occupant]
+    EmitU32(stub, kVehicleSeatOccupantControlOffset);
+    EmitBytes(stub, {0x48, 0x85, 0xc0,          // test rax,rax
+                     0x74, 0x00});              // jz preferred
+    uint8_t* vacant_branch = stub - 1;
+    EmitBytes(stub, {0x83, 0x78, 0x08, 0x00,    // cmp dword [rax+8],0
+                     0x74, 0x00});              // je preferred
+    uint8_t* expired_branch = stub - 1;
+
+    // The preferred seat is taken: allow every rear seat 1..size-1.
+    EmitBytes(stub, {0xb9, 0x01, 0x00, 0x00, 0x00});  // mov ecx,1
+    uint8_t* any_loop = stub;
+    EmitBytes(stub, {0x45, 0x89, 0x2c, 0x8e,    // mov [r14+rcx*4],r13d
+                     0x48, 0xff, 0xc1,          // inc rcx
+                     0x48, 0x39, 0xf1,          // cmp rcx,rsi
+                     0x72, 0x00});              // jb any_loop
+    if (!PatchRelative8(stub - 1, any_loop) ||
+        !EmitLockIncrement(stub, page + kRearSeatAnyCounterOffset)) {
+        return false;
+    }
+    EmitBytes(stub, {0xeb, 0x00});              // jmp done
+    uint8_t* any_done_branch = stub - 1;
+
+    uint8_t* preferred = stub;
+    EmitBytes(stub, {0x45, 0x89, 0x2c, 0x96,    // mov [r14+rdx*4],r13d
+                     0x45, 0x84, 0xc0,          // test r8b,r8b
+                     0x74, 0x00});              // jz done (native seat)
+    uint8_t* native_done_branch = stub - 1;
+    if (!EmitLockIncrement(stub, page + kRearSeatPartnerCounterOffset)) {
+        return false;
+    }
+    uint8_t* done = stub;
+    return EmitRelative32(stub, 0xe9, image + return_rva) &&
+           PatchRelative8(empty_branch, exit) &&
+           PatchRelative8(negative_branch, exit) &&
+           PatchRelative8(native_branch, check) &&
+           PatchRelative8(vacant_branch, preferred) &&
+           PatchRelative8(expired_branch, preferred) &&
+           PatchRelative8(any_done_branch, done) &&
+           PatchRelative8(native_done_branch, done) &&
+           stub <= page + stub_offset + kRearSeatStubSize;
+}
+
+bool BuildRearSeatRelays(uint8_t* page, uint8_t* image) {
+    return BuildRearSeatRelay(page, image, kCalibanSeatStubOffset,
+                              kCalibanSeatReturnRva) &&
+           BuildRearSeatRelay(page, image, kCarSeatStubOffset,
+                              kCarSeatReturnRva);
+}
+
 bool BuildMissionRelayPage(uint8_t* image, unsigned max_players) {
     if (g_mission_relay_page) {
         return g_mission_relay_capacity == max_players;
@@ -1321,10 +1459,13 @@ bool BuildMissionRelayPage(uint8_t* image, unsigned max_players) {
         !BuildLoadoutParserRelay(page, image) ||
         !BuildMessageReserveRelays(page, image) ||
         !BuildSpawnTransformRelay(page, image) ||
-        !BuildRecordLookupRelays(page, image)) {
+        !BuildRecordLookupRelays(page, image) ||
+        !BuildRearSeatRelays(page, image)) {
         return fail();
     }
 
+    std::memset(page + kRearSeatPartnerCounterOffset, 0, sizeof(uint64_t));
+    std::memset(page + kRearSeatAnyCounterOffset, 0, sizeof(uint64_t));
     std::memset(page + kRecordLookupRedirectCounterOffset, 0,
                 sizeof(uint64_t));
     std::memset(page + kSpawnTransformCappedCounterOffset, 0,
@@ -1785,6 +1926,20 @@ bool WriteRecordLookupSites(uint8_t* image) {
                               kRecordLookupBStubOffset);
 }
 
+bool RearSeatSitesMatch(const uint8_t* image, bool replacement) {
+    return RelayJumpSiteMatches(image, kCalibanSeatRva, kRearSeatOriginal,
+                                kCalibanSeatStubOffset, replacement) &&
+           RelayJumpSiteMatches(image, kCarSeatRva, kRearSeatOriginal,
+                                kCarSeatStubOffset, replacement);
+}
+
+bool WriteRearSeatSites(uint8_t* image) {
+    return WriteRelayJumpSite(image, kCalibanSeatRva, kRearSeatOriginal,
+                              kCalibanSeatStubOffset) &&
+           WriteRelayJumpSite(image, kCarSeatRva, kRearSeatOriginal,
+                              kCarSeatStubOffset);
+}
+
 bool RosterReplacementSitesMatch(const uint8_t* image, unsigned max_players,
                                  unsigned preallocated_roster_slots) {
     return image &&
@@ -1802,6 +1957,7 @@ bool RosterReplacementSitesMatch(const uint8_t* image, unsigned max_players,
         MessageReserveSitesMatch(image, true) &&
         SpawnTransformSiteMatches(image, true) &&
         RecordLookupSitesMatch(image, true) &&
+        RearSeatSitesMatch(image, true) &&
         MemberButtonKeysMatch(image);
 }
 
@@ -1820,6 +1976,7 @@ bool RosterOriginalSitesMatch(const uint8_t* image) {
         MessageReserveSitesMatch(image, false) &&
         SpawnTransformSiteMatches(image, false) &&
         RecordLookupSitesMatch(image, false) &&
+        RearSeatSitesMatch(image, false) &&
         MemberButtonKeysMatch(image);
 }
 
@@ -1841,6 +1998,10 @@ void WriteRosterOriginalSites(uint8_t* image) {
                 kRecordLookupAOriginal.size());
     std::memcpy(image + kRecordLookupBRva, kRecordLookupBOriginal.data(),
                 kRecordLookupBOriginal.size());
+    std::memcpy(image + kCalibanSeatRva, kRearSeatOriginal.data(),
+                kRearSeatOriginal.size());
+    std::memcpy(image + kCarSeatRva, kRearSeatOriginal.data(),
+                kRearSeatOriginal.size());
     WriteCapacity(image + kCapacityRegionRva, kOriginalCapacity);
     WriteSecondarySites(image, kOriginalCapacity);
     WriteTertiarySites(image, kOriginalCapacity);
@@ -2734,6 +2895,234 @@ bool SelfTestRecordLookupRelayExecution(std::string& report) {
                   "both script record lookups keep records 0-3 native and read 4-7 from sidecars");
 }
 
+struct RearSeatExecutionContext {
+    uint64_t r13 = 0;  // player index
+    uint64_t r14 = 0;  // seat vector
+    uint64_t rsi = 0;  // vector size
+    uint64_t rbp = 0;  // vehicle
+    uint64_t rbx = 0;
+    uint64_t r12 = 0;
+    uint64_t r15 = 0;
+};
+static_assert(sizeof(RearSeatExecutionContext) == 0x38,
+              "rear seat test context layout changed");
+
+using RearSeatExecutionThunk =
+    void(__fastcall*)(RearSeatExecutionContext*, void*);
+
+RearSeatExecutionThunk BuildRearSeatExecutionThunk(uint8_t*& allocation) {
+    // Load the picker's live registers, enter the patched site (relay, then
+    // a ret at the return RVA) and capture every register the relay must keep.
+    constexpr uint8_t code[] = {
+        0x53, 0x55, 0x56, 0x57,
+        0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
+        0x48, 0x83, 0xec, 0x28,
+        0x48, 0x89, 0x4c, 0x24, 0x20,
+        0x48, 0x89, 0xd0,
+        0x4c, 0x8b, 0x29,
+        0x4c, 0x8b, 0x71, 0x08,
+        0x48, 0x8b, 0x71, 0x10,
+        0x48, 0x8b, 0x69, 0x18,
+        0x48, 0x8b, 0x59, 0x20,
+        0x4c, 0x8b, 0x61, 0x28,
+        0x4c, 0x8b, 0x79, 0x30,
+        0xff, 0xd0,
+        0x48, 0x8b, 0x4c, 0x24, 0x20,
+        0x4c, 0x89, 0x29,
+        0x4c, 0x89, 0x71, 0x08,
+        0x48, 0x89, 0x71, 0x10,
+        0x48, 0x89, 0x69, 0x18,
+        0x48, 0x89, 0x59, 0x20,
+        0x4c, 0x89, 0x61, 0x28,
+        0x4c, 0x89, 0x79, 0x30,
+        0x48, 0x83, 0xc4, 0x28,
+        0x41, 0x5f, 0x41, 0x5e, 0x41, 0x5d, 0x41, 0x5c,
+        0x5f, 0x5e, 0x5d, 0x5b,
+        0xc3,
+    };
+    allocation = static_cast<uint8_t*>(VirtualAlloc(
+        nullptr, sizeof(code), MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE));
+    if (!allocation) return nullptr;
+    std::memcpy(allocation, code, sizeof(code));
+    FlushInstructionCache(GetCurrentProcess(), allocation, sizeof(code));
+    return reinterpret_cast<RearSeatExecutionThunk>(allocation);
+}
+
+bool SelfTestRearSeatRelayExecution(std::string& report) {
+    if (g_mission_relay_page) {
+        report = "rear seat microtest refused: relay page already live";
+        return false;
+    }
+    constexpr size_t kFakeImageSize = kLoadoutParserStateSlotRva + 0x1000;
+    constexpr size_t kMaxSeats = 9;
+    constexpr size_t kCanaries = 4;
+    constexpr int32_t kCanary = 0x5a5a5a5a;
+    auto* image = static_cast<uint8_t*>(VirtualAlloc(
+        nullptr, kFakeImageSize, MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE));
+    auto* world = static_cast<uint8_t*>(VirtualAlloc(
+        nullptr, 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    uint8_t* thunk_allocation = nullptr;
+    const RearSeatExecutionThunk thunk =
+        image ? BuildRearSeatExecutionThunk(thunk_allocation) : nullptr;
+    auto finish = [&](bool result, const std::string& message) {
+        if (g_mission_relay_page) {
+            VirtualFree(g_mission_relay_page, 0, MEM_RELEASE);
+            g_mission_relay_page = nullptr;
+            g_mission_relay_capacity = 0;
+        }
+        g_loadout_parser_redirect_active.store(false,
+                                               std::memory_order_release);
+        if (thunk_allocation) VirtualFree(thunk_allocation, 0, MEM_RELEASE);
+        if (world) VirtualFree(world, 0, MEM_RELEASE);
+        if (image) VirtualFree(image, 0, MEM_RELEASE);
+        report = message;
+        return result;
+    };
+    if (!image || !world || !thunk) {
+        return finish(false, "could not allocate the rear seat microtest");
+    }
+    for (const uintptr_t site : {kCalibanSeatRva, kCarSeatRva}) {
+        std::memcpy(image + site, kRearSeatOriginal.data(),
+                    kRearSeatOriginal.size());
+        image[site + kRearSeatOriginal.size()] = 0xc3;
+    }
+    if (kCalibanSeatReturnRva != kCalibanSeatRva + kRearSeatOriginal.size() ||
+        kCarSeatReturnRva != kCarSeatRva + kRearSeatOriginal.size() ||
+        !RearSeatSitesMatch(image, false) ||
+        !BuildMissionRelayPage(image, 8) ||
+        !WriteRearSeatSites(image) ||
+        !RearSeatSitesMatch(image, true) ||
+        RearSeatSitesMatch(image, false)) {
+        return finish(false, "rear seat relays were not installed");
+    }
+    FlushInstructionCache(GetCurrentProcess(), image, kFakeImageSize);
+
+    // world: vehicle at +0, seats at +0x1000, control blocks at +0x4000,
+    // seat vector (plus canaries) at +0x5000.
+    uint8_t* vehicle = world;
+    uint8_t* seats = world + 0x1000;
+    uint8_t* live_control = world + 0x4000;
+    uint8_t* expired_control = world + 0x4100;
+    auto* vector = reinterpret_cast<int32_t*>(world + 0x5000);
+    static_assert(kMaxSeats * kVehicleSeatStride <= 0x3000,
+                  "rear seat microtest seats overlap control blocks");
+    const uint64_t seats_address = reinterpret_cast<uint64_t>(seats);
+    std::memcpy(vehicle + kVehicleSeatArrayOffset, &seats_address,
+                sizeof(seats_address));
+    const int32_t live_uses = 1;
+    const int32_t expired_uses = 0;
+    std::memcpy(live_control + 8, &live_uses, sizeof(live_uses));
+    std::memcpy(expired_control + 8, &expired_uses, sizeof(expired_uses));
+
+    struct Scenario {
+        size_t seats;
+        int32_t player;
+        int occupied_seat;      // -1: none
+        bool occupant_expired;
+        int expected_kind;      // 0 native, 1 partner, 2 any, 3 none
+    };
+    constexpr std::array<Scenario, 27> kScenarios = {{
+        {5, 0, -1, false, 0}, {5, 1, -1, false, 0}, {5, 2, -1, false, 0},
+        {5, 3, -1, false, 0}, {5, 4, -1, false, 1}, {5, 5, -1, false, 1},
+        {5, 6, -1, false, 1}, {5, 7, -1, false, 1}, {5, -1, -1, false, 0},
+        {5, -3, -1, false, 3}, {5, 4, 1, false, 2}, {5, 5, 2, false, 2},
+        {5, 4, 1, true, 1}, {5, 6, 2, false, 1}, {9, 4, -1, false, 0},
+        {9, 7, -1, false, 0}, {1, 0, -1, false, 3}, {1, 5, -1, false, 3},
+        {0, 2, -1, false, 3}, {6, 5, -1, false, 1}, {6, 7, 3, false, 2},
+        {2, 3, -1, false, 1}, {5, 1, 2, false, 2}, {5, 1, 2, true, 0},
+        {5, 3, 1, false, 0}, {9, 5, 6, false, 2}, {5, 0, 1, false, 2},
+    }};
+    uint64_t expected_partner = 0;
+    uint64_t expected_any = 0;
+    for (const auto& [site, label] :
+         {std::pair<uintptr_t, const char*>{kCalibanSeatRva, "Caliban"},
+          std::pair<uintptr_t, const char*>{kCarSeatRva, "car"}}) {
+        for (size_t number = 0; number < kScenarios.size(); ++number) {
+            const auto& scenario = kScenarios[number];
+            std::memset(seats, 0, kMaxSeats * kVehicleSeatStride);
+            if (scenario.occupied_seat >= 0) {
+                const uint64_t control = reinterpret_cast<uint64_t>(
+                    scenario.occupant_expired ? expired_control
+                                              : live_control);
+                std::memcpy(seats +
+                                static_cast<size_t>(scenario.occupied_seat) *
+                                    kVehicleSeatStride +
+                                kVehicleSeatOccupantControlOffset,
+                            &control, sizeof(control));
+            }
+            for (size_t slot = 0; slot < kMaxSeats + kCanaries; ++slot) {
+                vector[slot] = slot < scenario.seats ? -1 : kCanary;
+            }
+            RearSeatExecutionContext context{};
+            context.r13 = static_cast<uint32_t>(scenario.player);
+            context.r14 = reinterpret_cast<uint64_t>(vector);
+            context.rsi = scenario.seats;
+            context.rbp = reinterpret_cast<uint64_t>(vehicle);
+            context.rbx = 0;
+            context.r12 = ~0ULL;
+            context.r15 = 0x0123456789abcdefULL;
+            const RearSeatExecutionContext before = context;
+            thunk(&context, image + site);
+
+            std::array<int32_t, kMaxSeats + kCanaries> expected{};
+            for (size_t slot = 0; slot < expected.size(); ++slot) {
+                expected[slot] = slot < scenario.seats ? -1 : kCanary;
+            }
+            if (scenario.seats > 0) expected[0] = scenario.player;
+            const size_t rear = scenario.seats ? scenario.seats - 1 : 0;
+            switch (scenario.expected_kind) {
+                case 0:
+                    if (scenario.player + 1 >= 0) {
+                        expected[static_cast<size_t>(scenario.player + 1)] =
+                            scenario.player;
+                    }
+                    break;
+                case 1:
+                    expected[1 + static_cast<size_t>(scenario.player) % rear] =
+                        scenario.player;
+                    ++expected_partner;
+                    break;
+                case 2:
+                    for (size_t slot = 1; slot < scenario.seats; ++slot) {
+                        expected[slot] = scenario.player;
+                    }
+                    ++expected_any;
+                    break;
+                default:
+                    break;
+            }
+            if (std::memcmp(expected.data(), vector,
+                            expected.size() * sizeof(int32_t)) != 0) {
+                return finish(false, std::string(label) +
+                                         " rear seat relay wrote the wrong seats in scenario " +
+                                         std::to_string(number));
+            }
+            if (context.r13 != before.r13 || context.r14 != before.r14 ||
+                context.rsi != before.rsi || context.rbp != before.rbp ||
+                context.rbx != before.rbx || context.r12 != before.r12 ||
+                context.r15 != before.r15) {
+                return finish(false, std::string(label) +
+                                         " rear seat relay changed a live register in scenario " +
+                                         std::to_string(number));
+            }
+        }
+    }
+    if (ReadMissionRelayCounter(kRearSeatPartnerCounterOffset) !=
+            expected_partner ||
+        ReadMissionRelayCounter(kRearSeatAnyCounterOffset) != expected_any) {
+        return finish(false, "rear seat telemetry count mismatch");
+    }
+
+    WriteRosterOriginalSites(image);
+    if (!RearSeatSitesMatch(image, false)) {
+        return finish(false, "rear seat restore left a relay jump");
+    }
+    return finish(true,
+                  "Caliban/car seat pickers keep free native seats, give players 5-8 a partner seat, open every rear seat when the preferred one is taken and never write past the seat vector");
+}
+
 struct MissionHarnessRecord {
     uint32_t value = 0;
     uint32_t padding = 0;
@@ -2830,12 +3219,14 @@ bool InstallRosterCapacity(unsigned max_players,
     const bool message_reserve_ready = MessageReserveSitesMatch(image, true);
     const bool spawn_transform_ready = SpawnTransformSiteMatches(image, true);
     const bool record_lookup_ready = RecordLookupSitesMatch(image, true);
+    const bool rear_seat_ready = RearSeatSitesMatch(image, true);
     if (primary_ready && secondary_ready && tertiary_ready && room_panels_ready &&
         mission_result_participants_ready &&
         member_buttons_ready && mission_participants_ready && mission_spawns_ready &&
         participant_scaling_ready && loadout_parser_ready &&
         message_reserve_ready && spawn_transform_ready &&
-        record_lookup_ready && MemberButtonKeysMatch(image)) {
+        record_lookup_ready && rear_seat_ready &&
+        MemberButtonKeysMatch(image)) {
         g_roster_patch_max_players = max_players;
         g_roster_patch_preallocated_slots = preallocated_roster_slots;
         g_loadout_parser_redirect_active.store(true,
@@ -2923,6 +3314,7 @@ bool InstallRosterCapacity(unsigned max_players,
     const bool spawn_transform_original =
         SpawnTransformSiteMatches(image, false);
     const bool record_lookup_original = RecordLookupSitesMatch(image, false);
+    const bool rear_seat_original = RearSeatSitesMatch(image, false);
     if ((!primary_ready && !primary_original) ||
         (!secondary_ready && !secondary_original) ||
         (!tertiary_ready && !tertiary_original) ||
@@ -2937,6 +3329,7 @@ bool InstallRosterCapacity(unsigned max_players,
         (!message_reserve_ready && !message_reserve_original) ||
         (!spawn_transform_ready && !spawn_transform_original) ||
         (!record_lookup_ready && !record_lookup_original) ||
+        (!rear_seat_ready && !rear_seat_original) ||
         !MemberButtonKeysMatch(image)) {
         EDF5_CAPTURE_EVENT("more_players", "roster_capacity_patch_failed",
                        capture::Fields().String("reason", "EDF5 byte signature mismatch")
@@ -2950,6 +3343,7 @@ bool InstallRosterCapacity(unsigned max_players,
                                  spawn_transform_original)
                            .Bool("record_lookup_original",
                                  record_lookup_original)
+                           .Bool("rear_seat_original", rear_seat_original)
                            .UInt("constructor_rva", kRosterConstructorRva)
                            .UInt("secondary_constructor_rva", kSecondaryConstructorRva)
                            .UInt("secondary_grow_helper_rva", kSecondaryGrowHelperRva)
@@ -3016,6 +3410,10 @@ bool InstallRosterCapacity(unsigned max_players,
                       kRecordLookupARva + kRecordLookupAOriginal.size() <=
                           capacity_patch_end,
                   "record lookup sites must stay inside the capacity range");
+    static_assert(kCalibanSeatRva >= capacity_patch_begin &&
+                      kCarSeatRva + kRearSeatOriginal.size() <=
+                          capacity_patch_end,
+                  "rear seat sites must stay inside the capacity range");
     constexpr uintptr_t button_patch_begin = kMemberButtonLoopSites.front().rva;
     constexpr uintptr_t button_patch_end = 0x565acb;
     constexpr uintptr_t room_panel_patch_begin =
@@ -3145,12 +3543,14 @@ bool InstallRosterCapacity(unsigned max_players,
     const bool mission_spawn_written = WriteMissionSpawnSites(image);
     const bool participant_scaling_written =
         WriteParticipantScalingSites(image);
-    // 0x11DB21, 0x121C40, 0x127390, 0x42F7C9, 0x432D65 and 0x43309E lie
-    // inside the capacity range made writable and flushed above.
+    // 0x11DB21, 0x121C40, 0x127390, both seat pickers, 0x42F7C9, 0x432D65
+    // and 0x43309E lie inside the capacity range made writable and flushed
+    // above.
     const bool loadout_parser_written = WriteLoadoutParserSite(image);
     const bool message_reserve_written = WriteMessageReserveSites(image);
     const bool spawn_transform_written = WriteSpawnTransformSite(image);
     const bool record_lookup_written = WriteRecordLookupSites(image);
+    const bool rear_seat_written = WriteRearSeatSites(image);
     EDF5_DIAGNOSTIC_PHASE(diagnostics_scope, "flush_instruction_cache",
                             capacity_patch_begin, capacity_patch_end);
     FlushInstructionCache(GetCurrentProcess(), image + capacity_patch_begin,
@@ -3171,6 +3571,7 @@ bool InstallRosterCapacity(unsigned max_players,
                           message_reserve_written &&
                           spawn_transform_written &&
                           record_lookup_written &&
+                          rear_seat_written &&
                           RosterReplacementSitesMatch(
                               image, max_players,
                               preallocated_roster_slots);
@@ -3328,6 +3729,8 @@ bool InstallRosterCapacity(unsigned max_players,
                        .UInt("tertiary_patch_sites", kTertiaryCapacitySites.size())
                        .UInt("room_panel_patch_sites", kRoomPanelCapacitySites.size())
                        .UInt("member_button_patch_sites", kMemberButtonLoopSites.size())
+                       .UInt("rear_seat_picker_caliban_rva", 0x34f880)
+                       .UInt("rear_seat_picker_car_rva", 0x374db0)
                         .UInt("capacity", max_players)
                         .UInt("preallocated_roster_slots",
                               preallocated_roster_slots)
@@ -3634,6 +4037,8 @@ bool ReleaseMissionRelayPage() {
         0, std::memory_order_release);
     g_reported_spawn_transform_caps.store(0, std::memory_order_release);
     g_reported_record_lookup_redirects.store(0, std::memory_order_release);
+    g_reported_rear_seat_partner_choices.store(0, std::memory_order_release);
+    g_reported_rear_seat_any_choices.store(0, std::memory_order_release);
     g_reported_primary_redirects.store(0, std::memory_order_release);
     g_reported_existing_redirects.store(0, std::memory_order_release);
     g_reported_append_redirects.store(0, std::memory_order_release);
@@ -4051,6 +4456,31 @@ void PollMissionRelayTelemetry() {
                 .UInt("native_record_count", kMissionSpawnPointCount)
                 .Bool("sidecar_selected", true)
                 .Bool("pointer_logged", false));
+    }
+
+    const uint64_t seat_partner =
+        ReadMissionRelayCounter(kRearSeatPartnerCounterOffset);
+    const uint64_t seat_any =
+        ReadMissionRelayCounter(kRearSeatAnyCounterOffset);
+    const uint64_t previous_seat_partner =
+        g_reported_rear_seat_partner_choices.exchange(
+            seat_partner, std::memory_order_acq_rel);
+    const uint64_t previous_seat_any =
+        g_reported_rear_seat_any_choices.exchange(seat_any,
+                                                  std::memory_order_acq_rel);
+    if (seat_partner > previous_seat_partner ||
+        seat_any > previous_seat_any) {
+        EDF5_CAPTURE_EVENT(
+            "more_players", "vehicle_rear_seat_offered",
+            capture::Fields()
+                .UInt("partner_seat_delta",
+                      seat_partner - previous_seat_partner)
+                .UInt("partner_seat_total", seat_partner)
+                .UInt("any_rear_seat_delta", seat_any - previous_seat_any)
+                .UInt("any_rear_seat_total", seat_any)
+                .UInt("caliban_picker_rva", 0x34f880)
+                .UInt("car_picker_rva", 0x374db0)
+                .Bool("vector_overflow_prevented", true));
     }
 }
 
@@ -4557,6 +4987,11 @@ bool SelfTest(std::string& report) {
         report = record_lookup_report;
         return false;
     }
+    std::string rear_seat_report;
+    if (!SelfTestRearSeatRelayExecution(rear_seat_report)) {
+        report = rear_seat_report;
+        return false;
+    }
     std::array<uint8_t, 0x30> member_button_loop{};
     const uintptr_t member_button_base = kMemberButtonLoopSites.front().rva;
     for (const auto& site : kMemberButtonLoopSites) {
@@ -4725,7 +5160,7 @@ bool SelfTest(std::string& report) {
         report = "fail-closed restoration did not restore/reject the expected bytes";
         return false;
     }
-    report = "validated: three tables and room boxes preallocated 4->8, 24 experimental reserves/48 operands 4->8, dynamic Master/Member, MissionSync_Res filter following MaxPlayers 5..8, external eight-participant vector, modulo-four spawn, four sidecars across three persistent paths and 56 native relays executed for 3/5/8 with profile clamped to 4 without changing the real count, loadout parser stride relay executed for indices 0-8/63 keeping P4-P7 inside private blocks, both message builders sized to header+payload beyond 0x2E8, spawn transform loop capped at four records, script record lookups 4-7 read from sidecars, plus fail-closed signature restoration";
+    report = "validated: three tables and room boxes preallocated 4->8, 24 experimental reserves/48 operands 4->8, dynamic Master/Member, MissionSync_Res filter following MaxPlayers 5..8, external eight-participant vector, modulo-four spawn, four sidecars across three persistent paths and 56 native relays executed for 3/5/8 with profile clamped to 4 without changing the real count, loadout parser stride relay executed for indices 0-8/63 keeping P4-P7 inside private blocks, both message builders sized to header+payload beyond 0x2E8, spawn transform loop capped at four records, script record lookups 4-7 read from sidecars, Caliban/car rear seats for players 5-8 without seat-vector overflow, plus fail-closed signature restoration";
     return true;
 }
 
