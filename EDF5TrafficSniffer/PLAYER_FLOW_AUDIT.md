@@ -1,215 +1,215 @@
-# Auditoria de indice de jogador e P2P
+# Player index and P2P audit
 
-Atualizado em: 2026-08-28
+Updated: 2026-08-28
 
-Executavel suportado: `EDF5.exe` SHA-256
+Supported executable: `EDF5.exe` SHA-256
 `3512D2A2E61D532C5D12DC0C5FD1AC61F6743E13349AE21301BB8449DD4BAE5F`
 
-Esta auditoria procura limites estruturais no caminho sala -> entrada da
-missao -> gameplay sem substituir cegamente constantes `4`. O scanner e a
-telemetria nunca iniciam o jogo.
+This audit looks for structural limits in the room -> mission entry ->
+gameplay path without blindly replacing `4` constants. The scanner and the
+telemetry never launch the game.
 
-## Resultado estatico v1
+## Static result v1
 
-Comando:
+Command:
 
 ```powershell
 _dev\EDF5TrafficSniffer\build\player_flow_scanner.exe EDF5.exe
 ```
 
-Depois de um teste, os callers P2P observados tambem podem ser fornecidos como
-raizes adicionais (um ou mais RVAs):
+After a test, the observed P2P callers can also be supplied as additional
+roots (one or more RVAs):
 
 ```powershell
 _dev\EDF5TrafficSniffer\build\player_flow_scanner.exe EDF5.exe 0x<caller_rva>
 ```
 
-O scanner percorreu nove raizes comprovadas de fluxo, 3.552.870 instrucoes e
-encontrou:
+The scanner walked nine proven flow roots and 3,552,870 instructions and
+found:
 
-- 28 callers do getter generico de handles indexados em `0x7e240`;
-- tres callers exatos dentro do pipeline da missao;
-- quatro comparacoes imediatas com `4` nas nove funcoes-raiz;
-- nenhuma mascara `& 3`, `& 0x0f`, bit-test ou shift variavel nessas raizes;
-- 74 acessos com indice escalado, dos quais 15 ficam proximos do bound nativo
-  no consumer `0x3123a0`.
+- 28 callers of the generic indexed-handle getter at `0x7e240`;
+- three exact callers inside the mission pipeline;
+- four immediate comparisons with `4` in the nine root functions;
+- no `& 3`, `& 0x0f`, bit-test or variable-shift mask in those roots;
+- 74 scaled-index accesses, 15 of which are close to the native bound in
+  consumer `0x3123a0`.
 
-Resumo esperado:
+Expected summary:
 
 ```text
 summary seed_functions=9 indexed_lookup_callers=28 confirmed_mission_lookup_callers=3 compare_four=4 and_mask_3=0 and_mask_f=0 bit_index=0 variable_shift=0 scaled_index=74 indexed_near_four=15 direct_calls=326
 ```
 
-## Callers de missao classificados
+## Classified mission callers
 
-| Call RVA | Contexto | Tabela | Acao |
+| Call RVA | Context | Table | Action |
 |---:|---|---|---|
-| `0x11CF08` | criacao do jogador | vetor de `net::UserImpl` copiado da sessao | localiza o `UserImpl` esperado pela identidade salva da sessao; caso ele esteja ausente usa `index % 4` como protecao contra crash |
-| `0x11DFCE` | transferencia de registros | vetor local com tamanho dependente do fluxo | preservar indice; auditar antes do getter |
-| `0x11E057` | anexacao de registros | mesmo vetor local dependente do fluxo | preservar indice; auditar antes do getter |
-| `0x126D24` | consumo do vetor temporario de participantes | vetor produzido no proprio fluxo | preservar indice; armazenamento temporario externo comporta oito |
+| `0x11CF08` | player creation | vector of `net::UserImpl` copied from the session | locates the `UserImpl` expected by the session's saved identity; if it is absent, uses `index % 4` as crash protection |
+| `0x11DFCE` | record transfer | local vector whose size depends on the flow | preserve index; audit before the getter |
+| `0x11E057` | record attachment | same flow-dependent local vector | preserve index; audit before the getter |
+| `0x126D24` | consumption of the temporary participant vector | vector produced in the flow itself | preserve index; external temporary storage holds eight |
 
-Os tres primeiros callsites possuem assinaturas exatas verificadas antes da
-instalacao do hook. Os dois vetores locais nao sao reduzidos modulo quatro sem
-evidencia de dump: isso poderia trocar dados reais dos jogadores 5-8 pelos dos
-jogadores 1-4.
+The first three callsites have exact signatures verified before the hook is
+installed. The two local vectors are not reduced modulo four without dump
+evidence: that could swap the real data of players 5-8 with that of players
+1-4.
 
-## Origem da fonte de controle
+## Origin of the control source
 
-O reverse estatico da funcao `0x11D5E0` mostrou duas chamadas virtuais no
-objeto de sessao: o slot `+0x20` produz a colecao primaria e o slot `+0x28`
-produz o subconjunto de controles locais. Ambas sao copiadas por `0x12B200` como
-vetores de handles compartilhados de 16 bytes. Objetos reconhecidos usam a
-vtable `net::UserImpl` em `0xEC2730`. O baseline 0.5.4 com dois jogadores
-mostrou que a primeira colecao possui os dois usuarios e a segunda e um
-subconjunto exato de um objeto. O reverse do loop chama o slot virtual `+0x60`
-somente para objetos desse subconjunto; `objeto+0x190` vale zero em ambos os
-processos. Portanto a 0.5.5 classifica esse campo como indice do controle local,
-nao como posicao global do participante.
+The static reverse of function `0x11D5E0` showed two virtual calls on the
+session object: slot `+0x20` produces the primary collection and slot `+0x28`
+produces the subset of local controls. Both are copied by `0x12B200` as
+vectors of 16-byte shared handles. Recognized objects use the `net::UserImpl`
+vtable at `0xEC2730`. The 0.5.4 two-player baseline showed that the first
+collection holds both users and the second is an exact subset of one object.
+The reverse of the loop calls virtual slot `+0x60` only for objects of that
+subset; `object+0x190` is zero in both processes. Therefore 0.5.5 classifies
+that field as the local control index, not as the participant's global
+position.
 
-O builder em `0x11CE60` recebe a colecao primaria e entrega cada objeto ao
-consumer `0x3123A0`. O dword `UserImpl+0xF8` lido por esse consumer e o seletor
-de classe: o bound `< 4` em `0x312403` corresponde exatamente a Ranger, Wing
-Diver, Air Raider e Fencer. Ele nao e um limite de participantes e deve
-permanecer em quatro. A fonte `UserImpl`, por outro lado, nao e um ponto de
-spawn nem um slot neutro: reciclar o jogador 5 para a entrada 0 pode duplicar
-identidade/controle. A 0.5.5 intercepta somente as duas copias comprovadas,
-compara as colecoes sem registrar ponteiros e usa uma quinta entrada nativa
-automaticamente quando ela chega ao builder. Nao e criada uma entrada
-artificial sem evidencia sobre ownership e lifetime.
+The builder at `0x11CE60` receives the primary collection and hands each
+object to consumer `0x3123A0`. The dword `UserImpl+0xF8` read by that consumer
+is the class selector: the `< 4` bound at `0x312403` corresponds exactly to
+Ranger, Wing Diver, Air Raider and Fencer. It is not a participant limit and
+must stay at four. The `UserImpl` source, on the other hand, is neither a
+spawn point nor a neutral slot: recycling player 5 into entry 0 may duplicate
+identity/control. 0.5.5 intercepts only the two proven copies, compares the
+collections without logging pointers and automatically uses a fifth native
+entry when it reaches the builder. No artificial entry is created without
+evidence about ownership and lifetime.
 
-O mesmo reverse confirmou o contrato de `0x11CE60`: o quarto argumento e o
-indice global do participante e o quinto e o indice do controle local produzido
-por `0x11D5E0`. Em `0x11D277`, valor negativo segue o caminho remoto; valor
-nao-negativo e passado a `0x2DBBC0`, que associa o personagem ao controle local.
-Existem somente dois calls diretos, `0x11DC34` e `0x11ECE9`. A 0.5.6 os valida
-por assinatura e audita esse limite sem mudar nenhum argumento.
+The same reverse confirmed the contract of `0x11CE60`: the fourth argument is
+the participant's global index and the fifth is the local control index
+produced by `0x11D5E0`. At `0x11D277`, a negative value follows the remote
+path; a non-negative value is passed to `0x2DBBC0`, which associates the
+character with the local control. There are only two direct calls, `0x11DC34`
+and `0x11ECE9`. 0.5.6 validates them by signature and audits this limit
+without changing any argument.
 
-Os quatro reports do teste 0.5.6 com cinco jogadores fecharam a falha imediata.
-Servidor e tres clientes sofreram a mesma leitura invalida em `0x6E022`, ainda
-dentro do builder do participante 4. A chamada anterior a `0x3123A0` devolveu
-um personagem nulo; em seguida o codigo nativo formou `rcx=0x10` e tentou ler
-`[rcx+8]`. A entrada final 4 existia, mas o consumer nao conseguiu construir
-um personagem a partir dela. A diferenca entre seu ordinal de registro e o
-indice do participante ainda nao provava troca de identidade: essa conclusao
-dependia de conhecer a ordenacao posterior do produtor.
+The four reports from the 0.5.6 five-player test closed the immediate
+failure. The server and three clients suffered the same invalid read at
+`0x6E022`, still inside the builder for participant 4. The call before
+`0x3123A0` returned a null character; then the native code formed `rcx=0x10`
+and tried to read `[rcx+8]`. Final entry 4 existed, but the consumer could not
+build a character from it. The difference between its registration ordinal
+and the participant index did not yet prove an identity swap: that conclusion
+depended on knowing the producer's later ordering.
 
-O reverse de `0x11D5E0` tambem encontrou o motivo de todos os processos
-classificarem o participante 4 como local. O caller reserva os inteiros de
-controle em `[rbp+0x1D0]`; cinco valores ocupam ate `[rbp+0x1E0]`. Logo depois,
-o proprio caller grava 64 bytes de transforms a partir de `[rbp+0x1E0]`,
-sobrescrevendo exatamente o quinto inteiro com zero antes do loop de criacao.
-Esse zero falso era passado ao binder local em servidor e clientes.
+The reverse of `0x11D5E0` also found the reason every process classified
+participant 4 as local. The caller reserves the control integers at
+`[rbp+0x1D0]`; five values occupy up to `[rbp+0x1E0]`. Right after that, the
+caller itself writes 64 bytes of transforms starting at `[rbp+0x1E0]`,
+overwriting exactly the fifth integer with zero before the creation loop. That
+false zero was passed to the local binder on the server and the clients.
 
-A 0.5.7 tentou corrigir os dois argumentos pela identidade observada nas
-copias. O teste seguinte mostrou por que isso estava errado: em servidor e
-tres clientes, o mod remapeou o participante 3 da fonte final 3 para a fonte
-final 4 e todos falharam novamente em `0x6E022`, antes de chegar ao
-participante 4.
+0.5.7 tried to fix the two arguments using the identity observed in the
+copies. The next test showed why that was wrong: on the server and three
+clients, the mod remapped participant 3 from final source 3 to final source 4
+and all of them failed again at `0x6E022`, before reaching participant 4.
 
-O reverse completo de `0x11D5E0` localizou duas chamadas a `0x131F10`
-imediatamente depois dos hooks de copia (`0x11D6FE` e `0x11D723`). Essa rotina
-ordena os dois vetores. Para cinco entradas ela cai no insertion sort em
-`0x132CC0`; o comparator chama o slot virtual `+0x50`, que em `UserImpl` e
-`0x452E70` e retorna o qword em `UserImpl+0x184` (SteamID). O movimento em
-`0x132DAF` produz ordem decrescente. Somente depois disso `0x11D750` compara a
-colecao completa com o subconjunto local, escreve os controles e `0x11D7D3`
-entrega a tabela final ao builder. Assim, participante N e entrada N da tabela
-final; a ordem das copias pre-sort serve apenas para testes de pertinencia.
-Os logs nunca registram o valor da chave/SteamID.
+The complete reverse of `0x11D5E0` located two calls to `0x131F10`
+immediately after the copy hooks (`0x11D6FE` and `0x11D723`). That routine
+sorts the two vectors. For five entries it falls into the insertion sort at
+`0x132CC0`; the comparator calls virtual slot `+0x50`, which in `UserImpl` is
+`0x452E70` and returns the qword at `UserImpl+0x184` (SteamID). The move at
+`0x132DAF` produces descending order. Only after that does `0x11D750` compare
+the full collection with the local subset, write the controls, and `0x11D7D3`
+hands the final table to the builder. Thus participant N is entry N of the
+final table; the order of the pre-sort copies serves only for membership
+tests. The logs never record the key/SteamID value.
 
-A 0.5.8 preserva integralmente fonte e controle de P0-P3. Para P4-P7, o
-controle local e reconstruido usando a entrada N da tabela final e pertinencia
-por objeto ao subconjunto local; remoto vira `-1`, e local usa
-`UserImpl+0x190`. O segundo caller `0x11ECE9` tambem recebe essa mesma tabela
-final produzida por `0x11D5E0`, portanto usa a mesma regra.
+0.5.8 fully preserves the source and control of P0-P3. For P4-P7, the local
+control is rebuilt using entry N of the final table and per-object membership
+in the local subset; remote becomes `-1`, and local uses `UserImpl+0x190`. The
+second caller `0x11ECE9` also receives that same final table produced by
+`0x11D5E0`, so it uses the same rule.
 
-O reverse completo de `0x3123A0` mapeou ainda a selecao de recurso. A classe em
-`UserImpl+0xF8` escolhe um bloco de `0x3E90` bytes no estado global apontado por
-`EDF5.exe+0x125AB30`. O loadout ativo fica em `+0x14B30`; cada registro mede
-`0x18` bytes e o seletor de recurso fica a partir de `+0x14B38`. Classe fora de
-0..3, recurso negativo ou falha da factory `0x6138E0` levam a retorno nulo.
-Para extras, a 0.5.8 prefere uma das quatro fontes nativas utilizaveis da mesma
-classe, tenta as demais se o consumer ainda falhar e registra todos os
-resultados. Se nenhuma produzir personagem, o hook restrito ao helper
-`0x6E010` reconhece somente `source=0x10` durante `mission_player_create`,
-devolve um handle vazio e permite ao caminho nativo abortar aquele builder sem
-processar a leitura fatal de `0x6E022`.
+The complete reverse of `0x3123A0` also mapped the resource selection. The
+class at `UserImpl+0xF8` chooses a block of `0x3E90` bytes in the global state
+pointed to by `EDF5.exe+0x125AB30`. The active loadout is at `+0x14B30`; each
+record is `0x18` bytes long and the resource selector starts at `+0x14B38`. A
+class outside 0..3, a negative resource or a failure of the `0x6138E0` factory
+leads to a null return. For extras, 0.5.8 prefers one of the four usable
+native sources of the same class, tries the others if the consumer still
+fails, and logs all the results. If none produces a character, the hook
+restricted to helper `0x6E010` recognizes only `source=0x10` during
+`mission_player_create`, returns an empty handle and lets the native path
+abort that builder without processing the fatal read at `0x6E022`.
 
-## Teste de cinco jogadores da 0.5.9
+## Five-player test of 0.5.9
 
-Os quatro reports disponiveis (host, P2, P4 e P3 locais) confirmaram todos os
-cinco `mission_player_create_result`, cinco objetos/controls distintos e
-exatamente um dono local por computador. Isso encerra a falha de associacao de
-controle. Em todos os processos, contudo, P4 tinha `class_selector=4`. Como a
-0.5.8 tratava essa classe como fonte invalida, `MissionSourceLookupHook`
-devolvia a entrada de P0 inteira. O personagem continuava jogavel, mas a
-identidade usada por nome/chat/resultado deixava de ser a de P4.
+The four available reports (the local reports of host, P2, P4 and P3)
+confirmed all five `mission_player_create_result` events, five distinct
+objects/controls and exactly one local owner per computer. This closes the
+control association failure. In all processes, however, P4 had
+`class_selector=4`. Since 0.5.8 treated that class as an invalid source,
+`MissionSourceLookupHook` returned the whole P0 entry. The character remained
+playable, but the identity used for name/chat/result was no longer P4's.
 
-A 0.6.0 conserva a entrada P4 da tabela final e altera somente
-`UserImpl+0xF8` quando ele esta fora de 0..3, copiando uma classe valida da
-fonte nativa modulo quatro. O evento `mission_source_identity_repaired`
-registra classe anterior/nova e o ordinal da fonte da classe, sem gravar
-SteamID ou ponteiro. Se o campo continuar invalido, o fallback integral antigo
-permanece como ultima protecao contra crash.
+0.6.0 keeps the P4 entry of the final table and changes only `UserImpl+0xF8`
+when it is outside 0..3, copying a valid class from the native source modulo
+four. The event `mission_source_identity_repaired` logs the previous/new class
+and the ordinal of the class source, without recording SteamID or pointer. If
+the field remains invalid, the old full fallback stays in place as the last
+crash protection.
 
-O teste tambem venceu a fase, mas o host ficou indefinidamente em
-"Conectando" antes de sair da missao. O fechamento manual ocorreu antes de uma
-transicao mission->result observavel e gerou depois um AV de teardown em
-`EDF5.exe+0x92C643`; esse AV e consequencia do encerramento forcado, nao o ponto
-original do stall. A 0.6.0 instrumenta os dois estagios nativos do resultado:
-setter `0x111080` e apply `0x114BB0`. O clear natural chama o setter em
-`0x3D8153` com resultado 1. O setter grava `manager+0x34`; o apply leva a UI em
-`+0xF8` ao estado 3 e conserva o resultado em `+0xFC`. Checkpoints de
-`mission_result_progress` em 1/5/15/30 s mostram qual desses marcos ocorreu e
-se a transicao continua pendente.
+The test also won the stage, but the host stayed indefinitely on "Connecting"
+before leaving the mission. The manual close happened before an observable
+mission->result transition and later produced a teardown AV at
+`EDF5.exe+0x92C643`; that AV is a consequence of the forced shutdown, not the
+original point of the stall. 0.6.0 instruments the two native result stages:
+setter `0x111080` and apply `0x114BB0`. The natural clear calls the setter at
+`0x3D8153` with result 1. The setter writes `manager+0x34`; the apply takes
+the UI at `+0xF8` to state 3 and keeps the result at `+0xFC`. The
+`mission_result_progress` checkpoints at 1/5/15/30 s show which of these
+milestones occurred and whether the transition is still pending.
 
-## Comparacoes com quatro revisadas
+## Revised comparisons with four
 
-### Revisao posterior ao teste 0.6.0
+### Review after the 0.6.0 test
 
-O campo `UserImpl+0xF8` foi reclassificado como indice do bloco nativo de
-loadout, nao classe. `0x3123A0` limita o indice a quatro, multiplica por
-`0x3E90` e acessa o loadout selecionado em `+0x14B30`. A classe real e
-observada ao converter o `UserImpl` em `PlayerInfo` em `0x422F00`, destino
-`+0x28`. Portanto P4 deve usar temporariamente um bloco nativo compativel para
-construir o personagem e voltar a 4 antes da replicacao normal.
+The field `UserImpl+0xF8` was reclassified as the index of the native loadout
+block, not a class. `0x3123A0` limits the index to four, multiplies it by
+`0x3E90` and accesses the selected loadout at `+0x14B30`. The real class is
+observed when converting the `UserImpl` to `PlayerInfo` at `0x422F00`,
+destination `+0x28`. Therefore P4 must temporarily use a compatible native
+block to build the character and go back to 4 before normal replication.
 
-Os reports mais recentes tambem provaram que os clientes recebiam o fluxo P2P
-volumoso do host; a perda de movimento ocorria depois do transporte. A colisao
-persistente `[0,1,2,3,0]` e a causa concreta que a 0.6.1 remove. Na saida da
-fase, o apply 3/1 sem setter veio do retorno `0x114FEF`; a recuperacao e
-host-only, exige mais de quatro membros e reutiliza o setter `0x111080` no
-thread de `Mission()` apos 250 ms.
+The most recent reports also proved that the clients were receiving the
+host's heavy P2P flow; the loss of movement occurred after the transport. The
+persistent collision `[0,1,2,3,0]` is the concrete cause that 0.6.1 removes.
+On leaving the stage, the 3/1 apply without a setter came from return
+`0x114FEF`; the recovery is host-only, requires more than four members and
+reuses setter `0x111080` on the `Mission()` thread after 250 ms.
 
-### Revisao 0.6.2: conteudo do bloco de loadout
+### Revision 0.6.2: loadout block contents
 
-O stride `0x3E90` nao precisa ser apenas reciclado por classe. O parser em
-`0x42F7C9..0x42F945` e o consumidor em `0x31240C..0x3124D2` provam o mesmo
-layout ativo: seletor de classe no inicio do bloco, registro de seis dwords em
-`+8+classe*0x18` e armadura inteira em `+0xF8`. A conversao
-`UserImpl -> PlayerInfo` fornece exatamente classe, seis equipamentos e
-armadura sem confundir nenhum deles com `UserImpl+0xF8`.
+The `0x3E90` stride does not need to be merely recycled per class. The parser
+at `0x42F7C9..0x42F945` and the consumer at `0x31240C..0x3124D2` prove the
+same active layout: class selector at the start of the block, a six-dword
+record at `+8+class*0x18` and integer armor at `+0xF8`. The
+`UserImpl -> PlayerInfo` conversion provides exactly the class, six equipment
+items and armor without confusing any of them with `UserImpl+0xF8`.
 
-A 0.6.2 faz snapshot/restauracao integral de um bloco nativo durante a criacao
-de P4+, injeta nele esses campos do `PlayerInfo` e restaura depois o indice
-exclusivo 4+. Isso elimina tanto a classe Air Raider herdada do host quanto a
-dependencia provisoria de haver uma fonte 0..3 da mesma classe. Os eventos
-`mission_source_loadout_fallback_installed` e
-`mission_player_create_result` registram se o bloco foi sintetizado e
-restaurado, sem nome, SteamID, payload ou ponteiro.
+0.6.2 takes a full snapshot/restore of a native block during the creation of
+P4+, injects these `PlayerInfo` fields into it and afterwards restores the
+exclusive index 4+. This eliminates both the Air Raider class inherited from
+the host and the provisional dependency on there being a 0..3 source of the
+same class. The events `mission_source_loadout_fallback_installed` and
+`mission_player_create_result` record whether the block was synthesized and
+restored, without name, SteamID, payload or pointer.
 
-| RVA | Classificacao | Decisao |
+| RVA | Classification | Decision |
 |---:|---|---|
-| `0x11DF8F` | construcao/copia da tabela local nativa de quatro registros | manter 4; extras vivem nos sidecars |
-| `0x312403` | limite dos quatro blocos nativos selecionados por `UserImpl+0xF8` | manter 4; sintetizar/restaurar temporariamente o conteudo do bloco para P4+ |
-| `0x561E75` | indice de uma estrutura de sala com stride `0xDD0` | manter; `indice >= 4` ja seleciona fallback em `objeto+0x3748` |
-| `0x561E9E` | segunda leitura da mesma estrutura | manter pelo mesmo fallback seguro |
+| `0x11DF8F` | construction/copy of the native local table of four records | keep 4; extras live in the sidecars |
+| `0x312403` | limit of the four native blocks selected by `UserImpl+0xF8` | keep 4; temporarily synthesize/restore the block contents for P4+ |
+| `0x561E75` | index of a room structure with stride `0xDD0` | keep; `index >= 4` already selects the fallback at `object+0x3748` |
+| `0x561E9E` | second read of the same structure | keep, for the same safe fallback |
 
-## Callers genericos adiados
+## Deferred generic callers
 
-Os 24 callsites abaixo usam o mesmo getter `0x7e240`, mas ainda nao ha
-evidencia de que seus indices representem jogadores. Permanecem inalterados:
+The 24 callsites below use the same getter `0x7e240`, but there is still no
+evidence that their indices represent players. They remain unchanged:
 
 ```text
 0x3EE667
@@ -223,1122 +223,1155 @@ evidencia de que seus indices representem jogadores. Permanecem inalterados:
 0x5A4384
 ```
 
-## Telemetria preparada para o proximo teste
+## Telemetry prepared for the next test
 
-- `mission_source_index_audit`: registra uma unica vez cada indice extra por
-  contexto, seu indice efetivo, presenca/tipo das entradas solicitada e efetiva,
-  ordem no registro de `UserImpl`, classe/loadout/recurso, mascaras de fonte
-  utilizavel e controle local, e se a tabela final esta ordenada corretamente
-  sem registrar a chave SteamID. O breadcrumb e gravado
-  antes do getter, portanto aparece no contexto de crash mesmo se o acesso
-  seguinte falhar.
-- `mission_source_resolution_audit`: depois do getter, confirma se o objeto
-  devolvido e a entrada efetiva, a fonte zero ou outro item registrado, sem
-  serializar ponteiros.
-- `mission_source_collection_audit`: registra separadamente
-  `session_all_users` e `session_local_controls`, incluindo contagem,
-  objetos/controls unicos, indices de controle local e o vetor ordinal
+- `mission_source_index_audit`: logs each extra index only once per context,
+  its effective index, presence/type of the requested and effective entries,
+  order in the `UserImpl` registration, class/loadout/resource, usable-source
+  and local-control masks, and whether the final table is correctly sorted
+  without logging the SteamID key. The breadcrumb is written
+  before the getter, so it appears in the crash context even if the following
+  access fails.
+- `mission_source_resolution_audit`: after the getter, confirms whether the
+  returned object is the effective entry, source zero or another registered
+  item, without serializing pointers.
+- `mission_source_collection_audit`: logs `session_all_users` and
+  `session_local_controls` separately, including count, unique
+  objects/controls, local control indices and the ordinal vector
   `source_to_registered_order`.
-- `mission_source_collection_compare`: mostra o delta, a mascara de entradas
-  locais na colecao completa e mapas ordinais por objeto e por control block
-  entre as colecoes, sem serializar ponteiros.
-- `mission_player_control_assignment`: antes da criacao, registra para cada
-  processo e participante os indices de controle original e efetivo, se houve
-  correcao por identidade e o indice no subconjunto local; `-1` significa
-  remoto e `0+` significa controlado localmente. O breadcrumb precede a funcao
-  original.
-- `mission_player_create_result`: confirma que o builder retornou e que o
-  handle de personagem foi preenchido. A ausencia deste evento depois de uma
-  atribuicao localiza um crash dentro de `0x11CE60`.
-- `mission_source_consumer_result`: registra resultado direto, mascaras de
-  loadout/recurso, fontes nativas tentadas, qual retry construiu o personagem
-  e a etapa exata do nulo (`source`, `class`, `loadout`, `resource` ou factory
-  `0x6138E0`). A classificação da factory é marcada como inferência estática.
-- `mission_null_character_guarded`: prova que todas as fontes falharam e que o
-  retorno nulo foi convertido em handle vazio no helper `0x6E010`; inclui o
-  participante e a fonte efetiva, nunca ponteiros ou SteamIDs.
-- `player_info_class_observed`: associa internamente cada `UserImpl` a classe
-  real do `PlayerInfo`; o evento registra apenas ordinal e seletores.
-- `mission_source_loadout_fallback_installed`: registra indice original,
-  fallback temporario, classe real solicitada/fallback e preservacao do objeto.
-- `mission_player_create_result`: alem do handle, confirma que o indice 4+ foi
-  restaurado depois da construcao do personagem.
-- `mission_result_setter` e `mission_result_apply`: registram resultado,
-  caller RVA, estado antes/depois e contagens; o caller de clear natural e
-  classificado sem expor enderecos absolutos.
-- `mission_result_progress`: aos 1/5/15/30 s resume resultado, estado da UI,
-  contagens setter/apply, `Exec_Begin`, sync e recompensas, idade do ultimo
-  update e fase diagnostica. O evento
-  `mission_result_transition_completed` confirma a saida normal do lobby.
-- `mission_result_exec_begin`: observa a entrada RTTI-confirmada
-  `net::MissionResult::Exec_Begin(int)` em `0x42FD20` e seu retorno booleano.
-- `mission_result_sync_begin`/`mission_result_sync_poll`: classificam somente
-  os quatro callers exatos de `Sync_MissionResult` nos helpers compartilhados
-  `0x41F820/0x41F920`; registram origem script/network e os dois inteiros de
-  estado, sem nome da sync, ponteiro ou payload.
-- `mission_reward_resolve`/`mission_reward_apply`: delimitam os wrappers
-  `ResolveResult()` e `ApplyResult(bool)`, seu retorno e a contagem 1..2 de
-  perfis locais. IDs/conteudo de armas e dados de save nunca sao gravados.
-- `chat_name_association`: fixture historica do analisador. A 0.6.48 nao emite
-  mais esse evento em runtime, pois o argumento antes tratado como nome e o
-  texto da mensagem. `chat_identity_context` o substitui com comparacoes apenas
-  booleanas de sala/remetente, sem SteamID, lobby ID, nick ou texto.
-- `network_summary/p2p_callsite`: agrega direcao, canal, caller RVA, contagem,
-  bytes minimo/maximo e falhas. Nao inclui SteamID, IP, payload ou endereco
-  absoluto.
-- `network_summary/game_packet_route`: agrega a rotina produtora de envio ou o
-  callback consumidor de recepcao, canal, quantidade e tamanhos minimo/maximo.
-  O inventario possui 128 slots fixos, nao aloca no caminho de rede e nao
-  registra destinatario, SteamID, IP nem payload.
-- `network_summary/game_message_route`: agrega mensagens logicas de saida e
-  entrada por
-  codigo/familia/flags, RVA produtor, presenca do handle de contexto, contagem e
-  tamanho. Distingue mismatch inesperado de header de um contêiner multipart
-  `0x1100` conhecido. Le somente o header de quatro bytes e nunca guarda
-  payload ou identidade de endpoint.
-- Os eventos P2P detalhados de perfil `Maximum` tambem recebem `caller_rva`,
-  permitindo ligar um formato de pacote a uma rotina exata do `EDF5.exe`.
+- `mission_source_collection_compare`: shows the delta, the mask of local
+  entries in the full collection and ordinal maps by object and by control
+  block between the collections, without serializing pointers.
+- `mission_player_control_assignment`: before creation, logs for each
+  process and participant the original and effective control indices, whether
+  there was an identity-based correction and the index in the local subset;
+  `-1` means remote and `0+` means locally controlled. The breadcrumb precedes
+  the original function.
+- `mission_player_create_result`: confirms that the builder returned and that
+  the character handle was filled. The absence of this event after an
+  assignment locates a crash inside `0x11CE60`.
+- `mission_source_consumer_result`: logs the direct result, loadout/resource
+  masks, native sources tried, which retry built the character and the exact
+  stage of the null (`source`, `class`, `loadout`, `resource` or factory
+  `0x6138E0`). The factory classification is marked as a static inference.
+- `mission_null_character_guarded`: proves that all sources failed and that the
+  null return was converted into an empty handle in helper `0x6E010`; includes
+  the participant and the effective source, never pointers or SteamIDs.
+- `player_info_class_observed`: internally associates each `UserImpl` with the
+  real class of the `PlayerInfo`; the event logs only the ordinal and
+  selectors.
+- `mission_source_loadout_fallback_installed`: logs the original index,
+  temporary fallback, real requested class/fallback class and object
+  preservation.
+- `mission_player_create_result`: besides the handle, confirms that index 4+
+  was restored after the character was built.
+- `mission_result_setter` and `mission_result_apply`: log the result, caller
+  RVA, before/after state and counts; the natural clear caller is classified
+  without exposing absolute addresses.
+- `mission_result_progress`: at 1/5/15/30 s summarizes the result, UI state,
+  setter/apply counts, `Exec_Begin`, sync and rewards, age of the last update
+  and diagnostic phase. The event `mission_result_transition_completed`
+  confirms the normal exit from the lobby.
+- `mission_result_exec_begin`: observes the RTTI-confirmed entry
+  `net::MissionResult::Exec_Begin(int)` at `0x42FD20` and its boolean return.
+- `mission_result_sync_begin`/`mission_result_sync_poll`: classify only
+  the four exact callers of `Sync_MissionResult` in the shared helpers
+  `0x41F820/0x41F920`; they log the script/network origin and the two state
+  integers, without the sync name, pointer or payload.
+- `mission_reward_resolve`/`mission_reward_apply`: delimit the
+  `ResolveResult()` and `ApplyResult(bool)` wrappers, their return and the 1..2
+  count of local profiles. Weapon IDs/contents and save data are never written.
+- `chat_name_association`: historical analyzer fixture. 0.6.48 no longer emits
+  this event at runtime, since the argument previously treated as a name is the
+  message text. `chat_identity_context` replaces it with boolean-only
+  room/sender comparisons, without SteamID, lobby ID, nick or text.
+- `network_summary/p2p_callsite`: aggregates direction, channel, caller RVA,
+  count, minimum/maximum bytes and failures. It does not include SteamID, IP,
+  payload or absolute address.
+- `network_summary/game_packet_route`: aggregates the sending producer routine
+  or the receiving consumer callback, channel, quantity and minimum/maximum
+  sizes. The inventory has 128 fixed slots, does not allocate on the network
+  path and does not record recipient, SteamID, IP or payload.
+- `network_summary/game_message_route`: aggregates outgoing and incoming
+  logical messages by
+  code/family/flags, producer RVA, presence of the context handle, count and
+  size. Distinguishes an unexpected header mismatch from a known `0x1100`
+  multipart container. Reads only the four-byte header and never stores
+  payload or endpoint identity.
+- The detailed P2P events of the `Maximum` profile also receive `caller_rva`,
+  making it possible to link a packet format to an exact routine of
+  `EDF5.exe`.
 
-## Baseline com dois jogadores reais
+## Baseline with two real players
 
-Os reports de host e cliente com uma fase completa confirmaram o caminho de
-transporte normal sem falha:
+The host and client reports with one complete stage confirmed the normal
+transport path without failure:
 
-| RVA observado | Direcao/canal | Classificacao |
+| Observed RVA | Direction/channel | Classification |
 |---:|---|---|
-| `0x41AC53` | envio / canal 0 | retorno do `SendP2PPacket` normal |
-| `0x41AE85` | envio / canal 2 | ticket de autenticacao Steam; nao e gameplay |
-| `0x41A460` | recepcao / canais 0-2 | retorno do leitor P2P central |
+| `0x41AC53` | send / channel 0 | return of the normal `SendP2PPacket` |
+| `0x41AE85` | send / channel 2 | Steam authentication ticket; not gameplay |
+| `0x41A460` | receive / channels 0-2 | return of the central P2P reader |
 
-O produtor logico acima do Steam fica em `0x453890`; seu unico transporte
-direto chama `0x41ABE0` em `0x4538EF`. O distribuidor central de recepcao fica
-em `0x41A770`, chamado por `0x41A5DB`; ele percorre a lista protegida em
-`objeto+0x88` e invoca o segundo metodo de cada callback. A 0.5.3 valida os
-prologos, o corpo do loop e os dois alvos de call antes de instalar esses hooks.
+The logical producer above Steam is at `0x453890`; its only direct transport
+calls `0x41ABE0` at `0x4538EF`. The central receive distributor is at
+`0x41A770`, called by `0x41A5DB`; it walks the protected list at
+`object+0x88` and invokes the second method of each callback. 0.5.3 validates
+the prologues, the loop body and the two call targets before installing these
+hooks.
 
-O cliente desse teste encerrou com `0xC0000005` em `EDF5.exe+0x991C08` logo
-depois de `end_auth_session` e `leave_lobby`, quando as interfaces Steam ja
-tinham sido zeradas. Isso aponta para teardown/stale pointer, nao para o caminho
-de capacidade da missao, mas ainda e uma inferencia: faltavam registradores e
-return address porque o filtro final de crash nao foi chamado. A 0.5.3 grava
-`crashes/first-chance-emergency.json` diretamente no VEH para preservar esse
-contexto mesmo quando outro componente substitui o filtro top-level.
+The client in this test ended with `0xC0000005` at `EDF5.exe+0x991C08` right
+after `end_auth_session` and `leave_lobby`, when the Steam interfaces had
+already been zeroed. This points to teardown/stale pointer, not to the mission
+capacity path, but it is still an inference: registers and return address were
+missing because the final crash filter was not called. 0.5.3 writes
+`crashes/first-chance-emergency.json` directly in the VEH to preserve that
+context even when another component replaces the top-level filter.
 
-O reverse do produtor `0x432D20` e de seu unico chamador direto `0x45EAD0`
-tambem classificou as familias frequentes `0x3300` e `0x3400`. O codigo e
-montado como `((objeto+0x40 << 4) | subtipo) << 8` e depois encapsulado no
-header da mensagem; portanto `0x33`/`0x34` sao subtipos dinamicos de uma camada
-de replicacao, nao indices dos jogadores 3 e 4. O produtor final continua sendo
-observado em `0x432EDA`, sem captura de payload ou identidade de endpoint.
+The reverse of the producer `0x432D20` and of its only direct caller
+`0x45EAD0` also classified the frequent families `0x3300` and `0x3400`. The
+code is assembled as `((object+0x40 << 4) | subtype) << 8` and then
+encapsulated in the message header; therefore `0x33`/`0x34` are dynamic
+subtypes of a replication layer, not the indices of players 3 and 4. The final
+producer continues to be observed at `0x432EDA`, with no capture of payload or
+endpoint identity.
 
-A 0.6.4 fecha a associacao por participante que faltava nesse ponto. O
-`SharedProperty` em `0x45EAD0+self+8` fornece o `UserImpl` de origem antes da
-serializacao. No caminho de recepcao, `0x4339DC` e o unico call direto de
-`0x435670` e passa `UserImpl+0x88`; o parser percorre as mensagens e chama os
-handlers sincronicamente. Um escopo thread-local liga por isso o dispatcher
-`MissionScript` ao mesmo `UserImpl` sem ler ou registrar o payload. Contadores
-das familias `0x3300/0x3400` sao emitidos por P0-P7, e qualquer contexto que
-nao estiver no mapa final da missao cai explicitamente no bucket nao resolvido.
+0.6.4 closes the per-participant association that was missing at this point.
+The `SharedProperty` at `0x45EAD0+self+8` provides the source `UserImpl` before
+serialization. On the receive path, `0x4339DC` is the only direct call to
+`0x435670` and passes `UserImpl+0x88`; the parser walks the messages and calls
+the handlers synchronously. A thread-local scope therefore links the
+`MissionScript` dispatcher to the same `UserImpl` without reading or logging
+the payload. Counters for the `0x3300/0x3400` families are emitted per P0-P7,
+and any context that is not in the final mission map explicitly falls into the
+unresolved bucket.
 
-A revisao offline posterior da 0.6.10 percorreu os tres trechos completos:
-produtor `0x45EAD0`, serializador `0x432D20` e parser remoto `0x435670`. Nao ha
-comparacao, mascara ou array de quatro participantes nesses caminhos. O
-imediato `4` em `0x432DC9` e o tamanho do header da mensagem; os `& 0xF` em
-`0x45EB5B/0x45EB77` combinam o subtipo no codigo `0x33xx/0x34xx`. Portanto nao
-foi aplicado nenhum patch especulativo de capacidade na rede.
+The later offline review of 0.6.10 walked the three complete segments:
+producer `0x45EAD0`, serializer `0x432D20` and remote parser `0x435670`. There
+is no comparison, mask or four-participant array in those paths. The immediate
+`4` at `0x432DC9` is the size of the message header; the `& 0xF` at
+`0x45EB5B/0x45EB77` combine the subtype into the `0x33xx/0x34xx` code.
+Therefore no speculative network capacity patch was applied.
 
-O analisador agora oferece `--require-replication-matrix`. Em cada capture ele
-exige saida `0x3300/0x3400` associada ao participante controlado localmente e
-entrada associada a cada participante remoto. Assim um cliente que recebe P2,
-P3 e P4, mas nao recebe o host P0, deixa de passar apenas porque havia "algum"
-trafego de entrada. A fixture negativa reproduz exatamente esse caso e precisa
-ser rejeitada.
+The analyzer now offers `--require-replication-matrix`. In each capture it
+requires `0x3300/0x3400` output associated with the locally controlled
+participant and input associated with each remote participant. Thus a client
+that receives P2, P3 and P4 but does not receive host P0 no longer passes just
+because there was "some" incoming traffic. The negative fixture reproduces
+exactly that case and must be rejected.
 
-O primeiro teste com cinco jogadores reais chegou ao gameplay sem crash, mas
-teve lag/desincronizacao severos e personagens que nao se moviam ou pareciam
-compartilhar controle. Nos quatro reports disponiveis, o jogador de indice 4
-foi reciclado para `source_index=0`. Isso motivou a auditoria das duas colecoes
-e das mensagens na 0.5.4. No proximo teste, os novos eventos devem dizer se o
-quinto `UserImpl` se perde na colecao completa, na resolucao do getter ou na
-associacao local de controle, e se o fluxo de mensagens diverge entre PCs.
+The first test with five real players reached gameplay without a crash, but
+had severe lag/desynchronization and characters that did not move or seemed to
+share control. In the four available reports, the player with index 4
+was recycled to `source_index=0`. This motivated the audit of the two
+collections and of the messages in 0.5.4. In the next test, the new events
+should say whether the fifth `UserImpl` is lost in the full collection, in the
+getter resolution or in the local control association, and whether the message
+flow diverges between PCs.
 
-O teste 0.5.4 posterior com dois jogadores completou a fase nos dois lados e
-confirmou `session_all_users=2`, `session_local_controls=1`, dois objetos
-distintos e transporte P2P sem falhas. A 0.5.5 acrescenta a permutacao ordinal
-e a resolucao final necessarias para decidir se cada PC associa o quinto
-participante ao mesmo `UserImpl`; o fato de o teste anterior com cinco pessoas
-ter criado cinco personagens concentra a investigacao em identidade/controle e
-sincronizacao depois do spawn.
+The later 0.5.4 test with two players completed the stage on both sides and
+confirmed `session_all_users=2`, `session_local_controls=1`, two distinct
+objects and P2P transport without failures. 0.5.5 adds the ordinal permutation
+and the final resolution needed to decide whether each PC associates the fifth
+participant with the same `UserImpl`; the fact that the earlier five-person
+test created five characters focuses the investigation on identity/control and
+synchronization after the spawn.
 
-## Resultado, sync e recompensa na 0.6.5
+## Result, sync and reward in 0.6.5
 
-Os reports de host e tres clientes do teste com cinco pessoas foram gerados
-pela 0.6.0. Eles confirmam cinco personagens e ownership local distinto para
-P0/P2/P3/P4, mas mostram o fallback temporario permanente `P4: 4->0` usando
-P0. Isso explica a classe Air Raider e a repeticao de nick observadas. A 0.6.4
-ja substitui esse caminho por um bloco nativo temporario que recebe classe,
-seis equipamentos e armadura do `PlayerInfo` de P4, e restaura tanto o bloco
-quanto o indice exclusivo 4 antes de retornar ao jogo.
+The reports from the host and three clients of the five-person test were
+generated by 0.6.0. They confirm five characters and distinct local ownership
+for P0/P2/P3/P4, but show the permanent temporary fallback `P4: 4->0` using
+P0. This explains the Air Raider class and the nick repetition observed. 0.6.4
+already replaces that path with a temporary native block that receives the
+class, six equipment items and armor from P4's `PlayerInfo`, and restores both
+the block and the exclusive index 4 before returning to the game.
 
-Na vitoria, todos os quatro reports registraram UI 3/resultado 1 via apply,
-mas nenhum setter nativo. O host so registrou setter de resultado 2 cerca de
-210 segundos depois, no abort manual. A recuperacao host-only da 0.6.4 chama o
-setter de clear uma vez depois de 250 ms quando esse padrao exato ocorre.
+On victory, all four reports registered UI 3/result 1 via apply,
+but no native setter. The host only registered a result 2 setter about
+210 seconds later, at the manual abort. The host-only recovery of 0.6.4 calls
+the clear setter once after 250 ms when that exact pattern occurs.
 
-O reverse adicional mapeou a continuacao do fluxo: RTTI/vtable identifica
-`0x42FD20` como `net::MissionResult::Exec_Begin`; os xrefs da string
-`Sync_MissionResult` chegam a dois pares de calls em `0x3E2DD8/0x3E2DE4` e
-`0x42C134/0x42C13B`; os wrappers registrados de script ficam em `0x3E3150`
-(`ResolveResult`) e `0x3E3160` (`ApplyResult`). O bloco `0x42C0D6` nao e alvo de
-hook: ele compartilha frame/epilogo com uma funcao maior e nao possui entrada
-segura. Os hooks usam somente prologos reais e assinaturas exatas.
+The additional reverse mapped the continuation of the flow: RTTI/vtable
+identifies `0x42FD20` as `net::MissionResult::Exec_Begin`; the xrefs of the
+`Sync_MissionResult` string reach two pairs of calls at `0x3E2DD8/0x3E2DE4` and
+`0x42C134/0x42C13B`; the registered script wrappers are at `0x3E3150`
+(`ResolveResult`) and `0x3E3160` (`ApplyResult`). The block `0x42C0D6` is not a
+hook target: it shares frame/epilogue with a larger function and has no safe
+entry. The hooks use only real prologues and exact signatures.
 
-`ApplyResult` le a contagem em estado global `+0x2459C`, inicia perfis locais
-em `+0x6D4C` e avanca `0x3E60` bytes. O unico setter (`0x55830`) aceita apenas
-1 ou 2; logo esse limite pertence aos saves locais, nao ao roster online, e
-nao deve ser convertido em 5/8/`MaxPlayers`.
+`ApplyResult` reads the count from global state `+0x2459C`, starts local
+profiles at `+0x6D4C` and advances `0x3E60` bytes. The only setter (`0x55830`)
+accepts only 1 or 2; thus this limit belongs to the local saves, not to the
+online roster, and must not be converted to 5/8/`MaxPlayers`.
 
-Os utilitarios `tools/disassemble_rva.py` e `tools/inspect_vtable.py` permitem
-repetir a analise por RVA e RTTI/vtable sem iniciar o jogo.
+The utilities `tools/disassemble_rva.py` and `tools/inspect_vtable.py` make it
+possible to repeat the analysis by RVA and RTTI/vtable without launching the
+game.
 
-## Chat, parser de replicacao e despacho do resultado na 0.6.6
+## Chat, replication parser and result dispatch in 0.6.6
 
-As vtables de `net::Chat_Room` levaram ao publicador `0x3F0B70`. Seus tres
-callers diretos (`0x3F1635`, `0x3F1863`, `0x3F1F81`) convergem duas identidades,
-texto e estado da mensagem nessa unica entrada. A interpretacao da 0.6.6 de
-que o texto era o nome exibido foi invalidada por `Reports\msg_bug.zip`; por
-isso a 0.6.48 nao usa esse argumento para associar nick a participante.
+The vtables of `net::Chat_Room` led to the publisher `0x3F0B70`. Its three
+direct callers (`0x3F1635`, `0x3F1863`, `0x3F1F81`) converge two identities,
+text and message state at this single entry. The 0.6.6 interpretation that the
+text was the displayed name was invalidated by `Reports\msg_bug.zip`; for that
+reason 0.6.48 does not use that argument to associate a nick with a
+participant.
 
-O unico caller do parser de gameplay `0x435670` esta em `0x4339DC` e passa
-`UserImpl+0x88`. O parser itera vetores cujo begin/end sao lidos em runtime e
-chama os handlers no mesmo thread. Nao foi encontrada comparacao, mascara ou
-array de quatro participantes nesse consumer. Isso reforca que uma futura
-divergencia deve ser procurada na associacao `UserImpl -> personagem`, nao em
-um novo patch indiscriminado de capacidade nesse parser.
+The only caller of the gameplay parser `0x435670` is at `0x4339DC` and passes
+`UserImpl+0x88`. The parser iterates over vectors whose begin/end are read at
+runtime and calls the handlers on the same thread. No comparison, mask or
+four-participant array was found in that consumer. This reinforces that any
+future divergence should be sought in the `UserImpl -> character` association,
+not in a new indiscriminate capacity patch in that parser.
 
-O setter de resultado `0x111080` chama a aplicacao de UI e depois constroi um
-evento local de tipo 1/payload 2. Os dois caminhos internos chamam `0x61E950`,
-um fanout sincrono sobre listas dinamicas de listeners. A recuperacao host-only
-nao e cosmetica porque reproduz o setter original completo; contudo, o reverse
-da 0.6.8 prova que esse evento fecha um objeto local de UI e nao inicia por si
-so a etapa de sync/recompensa. As duas cadeias sao auditadas separadamente.
+The result setter `0x111080` calls the UI apply and then builds a local event
+of type 1/payload 2. Both internal paths call `0x61E950`, a synchronous fanout
+over dynamic lists of listeners. The host-only recovery is not cosmetic because
+it reproduces the complete original setter; however, the 0.6.8 reverse proves
+that this event closes a local UI object and does not by itself start the
+sync/reward stage. The two chains are audited separately.
 
-## Restauracao pre-map e evento de resultado na 0.6.7
+## Pre-map restore and result event in 0.6.7
 
-O consumer de personagem `0x3123A0` precisa de um indice nativo 0..3 somente
-durante a construcao. A continuacao de `MissionPlayerCreate`, contudo, volta a
-ler `UserImpl+0xF8` em `0x11D0EC` e `0x11E061`; a segunda leitura alimenta uma
-arvore/mapa de runtime. Deixar P4 com o fallback `0` ate o retorno da funcao
-inteira cria uma colisao concreta com P0. A restauracao agora acontece no
-retorno imediato do consumer e registra fase, indice observado antes/depois e
-se ocorreu antes dos consumers do mapa. O validador rejeita a fixture que
-restaura apenas em `player_create_return_fallback`.
+The character consumer `0x3123A0` needs a native index 0..3 only during
+construction. The continuation of `MissionPlayerCreate`, however, reads
+`UserImpl+0xF8` again at `0x11D0EC` and `0x11E061`; the second read feeds a
+runtime tree/map. Leaving P4 with the `0` fallback until the whole function
+returns creates a concrete collision with P0. The restore now happens on the
+immediate return of the consumer and logs the phase, the index observed
+before/after and whether it occurred before the map consumers. The validator
+rejects the fixture that restores only at `player_create_return_fallback`.
 
-O publicador tipado `0x61E950` foi instrumentado com escopo thread-local apenas
-durante `MissionResultSetterHook`. Assim, o report distingue: UI de vitoria,
-setter, publicacao esperada `tipo=1/payload=2`, `Exec_Begin`, sync, resolve e
-apply. Fora do setter, o hook e um pass-through sem telemetria por evento. O
-argumento de `Exec_Begin` foi renomeado para valor opaco; os dois callers
-comprovados passam respectivamente `-20000` e um parametro recebido, portanto
-ele nao representa diretamente o resultado clear `1`.
+The typed publisher `0x61E950` was instrumented with a thread-local scope only
+during `MissionResultSetterHook`. Thus the report distinguishes: victory UI,
+setter, expected publication `type=1/payload=2`, `Exec_Begin`, sync, resolve
+and apply. Outside the setter, the hook is a pass-through without per-event
+telemetry. The `Exec_Begin` argument was renamed to opaque value; the two
+proven callers pass `-20000` and a received parameter respectively, therefore
+it does not directly represent the clear result `1`.
 
-## Alvo UI do evento e separacao da sync na 0.6.8
+## UI target of the event and sync separation in 0.6.8
 
-O global usado pelo setter aponta para a interface secundaria de
-`xgs::ui::System`; subtrair `0x88` recupera o barramento dono das listas em
-`+0x18` e `+0x28`. O fanout `0x61E950` chama o callback virtual `+0x18` de cada
-listener. O callback generico de `xgs::ui::Object` fica em `0x4A1B70`: evento
-tipo `1` compara o payload com `Object+0x78`, e o match `2 == 2` marca o bit 0
-em `Object+0x18` antes de invocar a transicao virtual de fechamento.
+The global used by the setter points to the secondary interface of
+`xgs::ui::System`; subtracting `0x88` recovers the bus that owns the lists at
+`+0x18` and `+0x28`. The fanout `0x61E950` calls the virtual callback `+0x18`
+of each listener. The generic callback of `xgs::ui::Object` is at `0x4A1B70`:
+event type `1` compares the payload with `Object+0x78`, and the `2 == 2` match
+sets bit 0 in `Object+0x18` before invoking the virtual close transition.
 
-Esse callback nao chama `0x42FD20`, `0x41F820` nem `0x41F920`. Portanto o
-report agora registra `mission_result_ui_close_dispatch` separadamente de
-`mission_result_exec_begin`, `mission_result_sync_begin/poll` e rewards. O
-evento contem apenas inteiros/booleans: ID do listener, match do alvo, flag de
-fechamento antes/depois e retorno; nenhum endereco absoluto ou payload e
-persistido. Uma fixture positiva exige o fechamento do objeto 2 e uma negativa
-com listener 5 prova que o analisador detecta o alvo ausente.
+That callback does not call `0x42FD20`, `0x41F820` or `0x41F920`. Therefore the
+report now logs `mission_result_ui_close_dispatch` separately from
+`mission_result_exec_begin`, `mission_result_sync_begin/poll` and rewards. The
+event contains only integers/booleans: listener ID, target match, close flag
+before/after and return; no absolute address or payload is persisted. A
+positive fixture requires the closing of object 2 and a negative one with
+listener 5 proves that the analyzer detects the missing target.
 
-## Filtro de participantes do MissionSync_Res na 0.6.9
+## MissionSync_Res participant filter in 0.6.9
 
-A vtable RTTI de `MissionSync_Res` aponta a entrada principal `0x42D8A0`. Ela
-percorre a colecao viva de `UserImpl`, valida `+0xC1/+0xC0` e, em `0x42DB3E`,
-le o indice exclusivo `UserImpl+0xF8`. O teste `cmp eax,4` em `0x42DB4C`
-eliminava P4-P7 antes de anexar seu shared handle. Isso e um limite de
-participantes online, nao de classes.
+The RTTI vtable of `MissionSync_Res` points to the main entry `0x42D8A0`. It
+walks the live collection of `UserImpl`, validates `+0xC1/+0xC0` and, at
+`0x42DB3E`, reads the exclusive index `UserImpl+0xF8`. The `cmp eax,4` test at
+`0x42DB4C` eliminated P4-P7 before attaching their shared handle. This is a
+limit on online participants, not on classes.
 
-O destino comecava com `reserve(4)`, mas o caminho `0x42DBDC` dobra a
-capacidade e cada handle ocupa 16 bytes. O consumer de `0x42DE34` itera pela
-quantidade dinamica e grava o agregado em `state+0x245A0`; ele nao usa o indice
-do jogador para enderecar uma tabela de quatro posicoes. Por isso a 0.6.9 liga
-somente o operando de `0x42DB4C` a `MaxPlayers` e mantem todos os loops de
-quatro classes e o count 1..2 de perfis locais de `ApplyResult` inalterados.
+The destination started with `reserve(4)`, but the path `0x42DBDC` doubles the
+capacity and each handle takes 16 bytes. The consumer at `0x42DE34` iterates
+over the dynamic quantity and writes the aggregate to `state+0x245A0`; it does
+not use the player index to address a four-position table. For that reason
+0.6.9 binds only the operand of `0x42DB4C` to `MaxPlayers` and keeps all the
+four-class loops and the 1..2 count of local profiles in `ApplyResult`
+unchanged.
 
-Assinaturas exatas cobrem o filtro, o grow dinamico, o loop por size e o commit.
-O patch integra a mesma transacao de protecao, escrita e verificacao do roster;
-qualquer divergencia de bytes deixa o plugin em quarentena antes dos hooks.
+Exact signatures cover the filter, the dynamic grow, the loop by size and the
+commit. The patch is part of the same protection, write and verification
+transaction as the roster; any byte divergence leaves the plugin in quarantine
+before the hooks.
 
-## Rollback do parser de loadout e retorno efetivo na 0.6.10
+## Loadout parser rollback and effective return in 0.6.10
 
-O reverse do parser completo em `0x42F480` revelou uma sobreposicao que nao
-aparece no consumer isolado de criacao. O parser conserva o indice logico real
-do participante e calcula `state+0x14B30+indice*0x3E90`. Portanto o bloco de P4
-comeca em `state+0x24570`; dentro desse mesmo quinto bloco ficam o contador de
-perfis locais de recompensa em `+0x2459C` e o agregado de participantes do
-resultado em `+0x245A0`. O parser escreve seletor, equipamentos, armadura e
-outras regioes do bloco, de modo que apenas corrigir a classe nao impediria a
-corrupcao do fechamento da fase.
+The reverse of the full parser at `0x42F480` revealed an overlap that does not
+appear in the isolated creation consumer. The parser keeps the participant's
+real logical index and computes `state+0x14B30+index*0x3E90`. Therefore P4's
+block starts at `state+0x24570`; inside that same fifth block lie the local
+reward profile counter at `+0x2459C` and the result participant aggregate at
+`+0x245A0`. The parser writes the selector, equipment, armor and other regions
+of the block, so merely fixing the class would not prevent the corruption of
+the stage completion.
 
-A 0.6.10 envolve o parser inteiro: faz snapshot dos quatro blocos extras
-P4-P7 (`4 * 0x3E90`), chama o original com os registros e indices verdadeiros,
-restaura byte a byte a regiao fora dos quatro blocos nativos e, somente quando
-o parse termina com sucesso, preserva o contador final legitimo em
-`+0x245A0`. O contador local em `+0x2459C` e todo o restante voltam aos valores
-anteriores. Nenhum indice sintetico e serializado, portanto nome, chat,
-replicacao e ownership continuam associados ao `UserImpl` real.
+0.6.10 wraps the whole parser: it snapshots the four extra blocks P4-P7
+(`4 * 0x3E90`), calls the original with the true registers and indices,
+restores byte by byte the region outside the four native blocks and, only when
+the parse finishes successfully, preserves the legitimate final counter at
+`+0x245A0`. The local counter at `+0x2459C` and everything else go back to the
+previous values. No synthetic index is serialized, so name, chat, replication
+and ownership remain associated with the real `UserImpl`.
 
-Outro consumer em `0x4B6710` tambem multiplicava `UserImpl+0xF8` por `0x3E90`
-sem limite. O hook sidecar da 0.6.10 deixa o indice logico 4+ intacto, mas
-substitui a classe de saida pela classe observada no `PlayerInfo` daquele mesmo
-participante. Isso cobre os callers de criacao que nao passam por `0x3123A0`.
+Another consumer at `0x4B6710` also multiplied `UserImpl+0xF8` by `0x3E90`
+with no bound. The sidecar hook of 0.6.10 leaves the logical index 4+ intact,
+but replaces the output class with the class observed in the `PlayerInfo` of
+that same participant. This covers the creation callers that do not go through
+`0x3123A0`.
 
-Por fim, `MissionUpdateHook` agora devolve `clear=1` quando a recuperacao
-host-only do setter ocorreu no mesmo tick e o retorno nativo capturado antes
-dela ainda era zero. Antes, o setter podia publicar o resultado, mas o script
-recebia o zero obsoleto e deixava de iniciar sync/recompensa. As assinaturas do
-prologo do parser, do resolver de classe e os offsets sobrepostos fazem parte
-do fail-closed; o self-test sobrescreve toda a faixa extra e prova a restauracao
-exata, com excecao intencional do contador de participantes.
+Finally, `MissionUpdateHook` now returns `clear=1` when the host-only setter
+recovery occurred on the same tick and the native return captured before it
+was still zero. Previously, the setter could publish the result, but the
+script received the stale zero and failed to start sync/reward. The signatures
+of the parser prologue, of the class resolver and the overlapping offsets are
+part of the fail-closed; the self-test overwrites the whole extra range and
+proves the exact restoration, with the intentional exception of the
+participant counter.
 
-## Callback e vetor dinamico de recepcao na 0.6.12
+## Receive callback and dynamic vector in 0.6.12
 
-O unico caller direto de `0x435670` continua em `0x4339DC`, mas agora o nivel
-anterior tambem foi revertido. A entrada `0x4336F0` e alcancada por um callback
-virtual cujo thunk em `0x451B90` recupera o owner em `callback+0x18`. O pump
-le a quantidade qword em `owner+0xE0`, a base em `owner+0xD0` e calcula cada
-shared handle com `indice << 4`. O backedge `0x433B6C` compara o indice com a
-quantidade lida em runtime; nao ha `cmp 4`, mascara de dois bits ou tabela
-local de quatro entradas nesse caminho.
+The only direct caller of `0x435670` is still at `0x4339DC`, but now the
+previous level has also been reversed. Entry `0x4336F0` is reached through a
+virtual callback whose thunk at `0x451B90` recovers the owner at
+`callback+0x18`. The pump reads the qword count at `owner+0xE0`, the base at
+`owner+0xD0` and computes each shared handle with `index << 4`. The backedge
+`0x433B6C` compares the index with the count read at runtime; there is no
+`cmp 4`, two-bit mask or local four-entry table on this path.
 
-Cada shared handle contem um `UserImpl`, e o pump passa `UserImpl+0x88` ao
-parser. O hook observacional da 0.6.12 usa a mesma trava em `owner+0x80`, sem
-esperar caso esteja ocupada, e compara a tabela com o mapa privado de
-participantes. O evento resultante informa somente contagem, mascaras P0-P7,
-legibilidade e completude. Fixtures isoladas provam tres casos: cinco rotas
-unicas completas, P0 ausente e P0/P4 duplicado.
+Each shared handle holds a `UserImpl`, and the pump passes `UserImpl+0x88` to
+the parser. The observational hook of 0.6.12 uses the same lock at
+`owner+0x80`, without waiting if it is busy, and compares the table with the
+private participant map. The resulting event reports only count, P0-P7 masks,
+readability and completeness. Isolated fixtures prove three cases: five
+complete unique routes, missing P0, and duplicated P0/P4.
 
-## NetGameStatus e acumuladores do resultado na 0.6.13
+## NetGameStatus and result accumulators in 0.6.13
 
-O decoder compartilhado `0x430C20..0x4312FE` recebe uma funcao com assinatura
-`void(int, NetGameStatus::Item const&)`. A quantidade de Items vem de um inteiro
-de tamanho variavel e o loop de parse percorre todos os registros recebidos.
-Entretanto, `0x430F23` comparava o indice logico com quatro e pulava o callback
-para P4-P7. Isso deixou `MissionSync_Res` com cinco handles desde a 0.6.9, mas
-o estado de resultado ainda com dados de apenas quatro participantes.
+The shared decoder `0x430C20..0x4312FE` receives a function with signature
+`void(int, NetGameStatus::Item const&)`. The number of Items comes from a
+variable-size integer and the parse loop walks all the received records.
+However, `0x430F23` compared the logical index with four and skipped the
+callback for P4-P7. This left `MissionSync_Res` with five handles since 0.6.9,
+but the result state still had data from only four participants.
 
-O thunk exato da funcao fica em `0x132BB0`: ele carrega o indice e grava o qword
-em `state+0x2457C+indice*8`. A inicializacao em `0x430EF6` limpa quatro qwords e
-deve permanecer assim, pois o quarto termina exatamente antes do contador de
-perfis locais em `+0x2459C`. Nao existe espaco contiguo para transformar essa
-tabela em oito entradas.
+The function's exact thunk is at `0x132BB0`: it loads the index and writes the
+qword to `state+0x2457C+index*8`. The initialization at `0x430EF6` clears four
+qwords and must stay that way, since the fourth ends exactly before the local
+profile counter at `+0x2459C`. There is no contiguous space to turn that table
+into eight entries.
 
-A 0.6.13 liga apenas o filtro de aplicacao `0x430F23` a `MaxPlayers` e intercepta
-o thunk. Indices 0..3 seguem inalterados; cada Item extra e somado nos dois
-dwords do slot `indice % 4`. Os consumers nativos `0x12AA30`, `0x60E80`,
-`0x60F40` e `0x1991D0` reduzem os quatro slots, portanto preservam o total de
-cinco a oito participantes sem indexacao fora do bloco. Assinaturas exatas,
-self-test isolado e fixture do analisador cobrem o filtro, o thunk, a soma P4 e
-a ausencia intencional de conteudo de reward/payload nos logs.
+0.6.13 binds only the application filter `0x430F23` to `MaxPlayers` and
+intercepts the thunk. Indices 0..3 remain unchanged; each extra Item is summed
+into the two dwords of slot `index % 4`. The native consumers `0x12AA30`,
+`0x60E80`, `0x60F40` and `0x1991D0` reduce the four slots, so they preserve the
+total of five to eight participants without indexing outside the block. Exact
+signatures, an isolated self-test and an analyzer fixture cover the filter, the
+thunk, the P4 sum and the intentional absence of reward/payload content in the
+logs.
 
-## Origem do nickname e consumers de reward na 0.6.14
+## Nickname origin and reward consumers in 0.6.14
 
-O construtor exato `PlayerInfoFromUser` em `0x422F00` recebe o destino em RCX e
-o `SharedProperty` fonte em RDX. Depois de conservar o `UserImpl` fonte, ele
-chama o getter virtual `+0x10` ou `+0x08` do mesmo objeto e copia a string
-resultante para `PlayerInfo+0x08`. Nao existe uma tabela paralela de quatro
-nomes nesse trecho. Portanto uma troca P0/P4 nasce antes, pela colisao do
-`UserImpl`/indice, ou depois, quando o chat associa remetente e nome; ela nao
-deve ser corrigida substituindo texto cegamente.
+The exact constructor `PlayerInfoFromUser` at `0x422F00` receives the
+destination in RCX and the source `SharedProperty` in RDX. After keeping the
+source `UserImpl`, it calls the virtual getter `+0x10` or `+0x08` of the same
+object and copies the resulting string to `PlayerInfo+0x08`. There is no
+parallel table of four names in that stretch. Therefore a P0/P4 swap is born
+earlier, from the `UserImpl`/index collision, or later, when the chat
+associates sender and name; it must not be fixed by blindly replacing text.
 
-A 0.6.14 registra, sem texto ou identidade externa, o indice logico do
-`UserImpl` que originou cada `PlayerInfo`, quantos objetos compartilham o token
-privado do nome e se o indice ainda coincide com o participante durante a
-criacao do personagem. A associacao adicional pelo publicador comum do chat
-foi tentada nessa versao, mas desativada na 0.6.48 depois que o quarto argumento
-foi reclassificado como mensagem. A origem dos nomes continua auditada no
-proprio caminho `PlayerInfo`, sem persistir nickname, SteamID, ponteiro,
-mensagem ou endpoint.
+0.6.14 logs, without text or external identity, the logical index of the
+`UserImpl` that originated each `PlayerInfo`, how many objects share the
+private name token and whether the index still matches the participant during
+character creation. The additional association through the common chat
+publisher was tried in that version, but disabled in 0.6.48 after the fourth
+argument was reclassified as a message. The origin of the names continues to be
+audited in the `PlayerInfo` path itself, without persisting nickname, SteamID,
+pointer, message or endpoint.
 
-O reverse tambem percorreu os consumers finais. `0x12AABE..0x12AAFB` e
-`ResolveResult 0x199275..0x1992A9` reduzem exatamente os quatro Items contiguos
-em `+0x2457C`; eles produzem totais e nao indexam jogadores. Em seguida,
-`0x199492` distribui esses totais pela contagem dinamica de perfis locais em
-`+0x2459C`, com stride `0x3E60`. O `ApplyResult` real em
-`0x199D50..0x199EC7` percorre um vetor dinamico de registros de 20 bytes e
-itera separadamente os perfis locais. Nao existe outro limite online de quatro
-nessas funcoes.
+The reverse also walked the final consumers. `0x12AABE..0x12AAFB` and
+`ResolveResult 0x199275..0x1992A9` reduce exactly the four contiguous Items at
+`+0x2457C`; they produce totals and do not index players. Next, `0x199492`
+distributes these totals over the dynamic count of local profiles at
+`+0x2459C`, with stride `0x3E60`. The real `ApplyResult` at
+`0x199D50..0x199EC7` walks a dynamic vector of 20-byte records and iterates the
+local profiles separately. There is no other online limit of four in these
+functions.
 
-Esses corpos agora possuem assinaturas exatas no validador. Antes de
-`ResolveResult` e depois de `ApplyResult`, a telemetria compara a contagem de
-participantes com a mascara de Items extras ja agregados. Ela informa apenas
-contagem, mascara e completude; nenhum valor de arma/recompensa ou payload e
-gravado. A 0.6.14 nao inventa rewards nem altera o algoritmo nativo: ela torna
-conclusivo se P4-P7 chegaram ao ponto em que os rewards sao resolvidos.
+These bodies now have exact signatures in the validator. Before
+`ResolveResult` and after `ApplyResult`, the telemetry compares the participant
+count with the mask of extra Items already aggregated. It reports only count,
+mask and completeness; no weapon/reward value or payload is written. 0.6.14
+does not invent rewards or change the native algorithm: it makes it conclusive
+whether P4-P7 reached the point where rewards are resolved.
 
-## Rota de transporte independente na 0.6.15
+## Independent transport route in 0.6.15
 
-O indice de participante/loadout em `UserImpl+0xF8` nao seleciona sozinho a
-rota que recebe mensagens. O alocador dinamico em `0x45C8E3` encontra um slot
-no vetor `manager+0xD0`, cuja contagem e lida de `manager+0xE0`. O indice segue
-para o construtor em `0x45C948` e e persistido em `UserImpl+0xC8` por
-`0x4525FB`. O registrador `0x433BD0` le `+0xC8` em `0x433C78`; o destrutor usa
-o mesmo campo em `0x433E3C` para remover a rota.
+The participant/loadout index at `UserImpl+0xF8` does not by itself select the
+route that receives messages. The dynamic allocator at `0x45C8E3` finds a slot
+in the vector `manager+0xD0`, whose count is read from `manager+0xE0`. The
+index goes on to the constructor at `0x45C948` and is persisted in
+`UserImpl+0xC8` by `0x4525FB`. The registrar `0x433BD0` reads `+0xC8` at
+`0x433C78`; the destructor uses the same field at `0x433E3C` to remove the
+route.
 
-Esses loops e vetores sao dinamicos, portanto nao justificam um patch de
-capacidade. O risco relevante e uma colisao ou um indice fora de posicao: por
-exemplo, P0 e P4 com `+0xC8=0` deixam a rota do host ausente ou substituida em
-um cliente. A telemetria agora fornece arrays ordinais de rota, participante e
-indice armazenado, alem de mascaras de ausentes, duplicados e divergencias. O
-analisador cruza esses valores com a criacao de personagem e com as familias
-de replicacao `0x3300/0x3400`. Todos os dados continuam privados e
-sanitizados; nao ha IDs, nomes, endpoints nem payloads.
+These loops and vectors are dynamic, so they do not justify a capacity patch.
+The relevant risk is a collision or an out-of-position index: for example, P0
+and P4 with `+0xC8=0` leave the host route missing or replaced on a client. The
+telemetry now provides ordinal arrays of route, participant and stored index,
+plus masks of missing, duplicated and divergent entries. The analyzer
+cross-checks these values with character creation and with the `0x3300/0x3400`
+replication families. All data remain private and sanitized; there are no IDs,
+names, endpoints or payloads.
 
-## Fan-out por descritor de rota na 0.6.17
+## Fan-out by route descriptor in 0.6.17
 
-O produtor `0x45EAD0` chama `0x432D20` em `0x45EB9B` passando um vetor dinamico
-de descritores de rota. O builder `0x45ED80` percorre uma colecao viva de
-usuarios, copia o qword `UserImpl+0xC4` e o anexa com stride 8. O segundo dword,
-em `descritor+4`, e lido por `0x433F40` e usado como indice da tabela dinamica
-`manager+0xD0`. Isso prova que o elemento nao e um `SharedProperty` de 16 bytes;
-a instrumentacao 0.6.16 com essa hipotese foi substituida antes do teste.
+The producer `0x45EAD0` calls `0x432D20` at `0x45EB9B`, passing a dynamic
+vector of route descriptors. The builder `0x45ED80` walks a live collection of
+users, copies the qword `UserImpl+0xC4` and appends it with stride 8. The
+second dword, at `descriptor+4`, is read by `0x433F40` and used as the index of
+the dynamic table `manager+0xD0`. This proves that the element is not a 16-byte
+`SharedProperty`; the 0.6.16 instrumentation based on that hypothesis was
+replaced before the test.
 
-A auditoria 0.6.17 conserva em TLS apenas o `UserImpl` local durante a chamada
-e mede o vetor imediatamente antes de devolve-lo ao jogo. Para cada familia
-`0x3300/0x3400` e participante local, o primeiro evento informa quantidade de
-rotas validas/unicas, mascara P0-P7 observada, remotos ausentes/inesperados,
-duplicados, nao resolvidos e resultado do serializador.
+The 0.6.17 audit keeps in TLS only the local `UserImpl` during the call and
+measures the vector immediately before handing it back to the game. For each
+`0x3300/0x3400` family and local participant, the first event reports the
+number of valid/unique routes, observed P0-P7 mask, missing/unexpected remotes,
+duplicates, unresolved ones and the serializer result.
 
-Isso permite distinguir um produtor local saudavel com quatro destinos de uma
-falha de publicacao anterior ao P2P. O evento nao serializa os descritores,
-indices/chaves de rota, ponteiros, IDs, nomes, endpoints nem conteudo das
-mensagens. A fixture positiva
-exige um destino remoto unico em uma sessao de dois jogadores; a negativa
-simula zero destinos e deve falhar com `--require-replication-send-fanout`.
+This makes it possible to distinguish a healthy local producer with four
+destinations from a publication failure prior to P2P. The event does not
+serialize descriptors, route indices/keys, pointers, IDs, names, endpoints or
+message contents. The positive fixture
+requires a single unique remote destination in a two-player session; the
+negative one simulates zero destinations and must fail with
+`--require-replication-send-fanout`.
 
-## Matriz completa dos Items de resultado na 0.6.18
+## Complete matrix of result Items in 0.6.18
 
-O sink `0x132BB0` recebe todos os indices que passaram pelo decoder
-`NetGameStatus`, mas a 0.6.17 registrava apenas os indices extras que exigem
-fold. A 0.6.18 marca a presenca legivel de P0-P7 em uma mascara independente
-dos valores e conserva a mascara extra separada para provar a agregacao.
+The sink `0x132BB0` receives all indices that went through the `NetGameStatus`
+decoder, but 0.6.17 logged only the extra indices that require folding. 0.6.18
+marks the readable presence of P0-P7 in a mask independent of the values and
+keeps the extra mask separate to prove the aggregation.
 
-Os checkpoints temporais e os hooks de `ResolveResult`/`ApplyResult` publicam
-contagem de participantes, mascara esperada, mascara observada e completude.
-Isso localiza a espera em um unico report mesmo se rewards nunca forem
-chamados. Nenhum conteudo de Item, arma, reward ou payload e registrado. A
-auditoria completa de `0x45EAD0/0x432D20/0x4336F0/0x435670`,
-`0x42FD20`, `0x41F820/0x41F920`, `0x1991D0` e `0x199D50` nao encontrou outro
-limite online de quatro; os filtros comprovados continuam sendo
-`MissionSync_Res 0x42DB4C` e `NetGameStatus 0x430F23`, ambos ja corrigidos.
+The time checkpoints and the `ResolveResult`/`ApplyResult` hooks publish
+participant count, expected mask, observed mask and completeness. This locates
+the wait in a single report even if rewards are never called. No Item, weapon,
+reward or payload content is logged. The complete audit of
+`0x45EAD0/0x432D20/0x4336F0/0x435670`, `0x42FD20`, `0x41F820/0x41F920`,
+`0x1991D0` and `0x199D50` found no other online limit of four; the proven
+filters remain `MissionSync_Res 0x42DB4C` and `NetGameStatus 0x430F23`, both
+already fixed.
 
-## Recuperacao do contador local de rewards na 0.6.19
+## Recovery of the local reward counter in 0.6.19
 
-O wrapper `ApplyResult` em `0x3E3160` le o dword de perfis locais em
-`state+0x2459C`; zero salta diretamente todo o laco que aplica armas aos saves.
-Esse campo esta dentro da faixa que o quinto bloco de `0x3E90` sobrescrevia.
-O rollback do parser continua sendo a correcao primaria.
+The `ApplyResult` wrapper at `0x3E3160` reads the local profiles dword at
+`state+0x2459C`; zero directly skips the entire loop that applies weapons to
+the saves. That field is inside the range that the fifth `0x3E90` block used to
+overwrite. The parser rollback remains the primary fix.
 
-Como defesa final, a colecao `session_local_controls`, copiada antes da criacao
-dos personagens, fornece uma contagem independente e validada de 1..2 perfis.
-Em vitoria com P4+, `MissionRewardApplyHook` troca um contador nativo invalido
-por essa contagem imediatamente antes do wrapper original. Nenhum valor de
-arma, reward, nome, ID, ponteiro ou payload e lido pelo diagnostico. O
-analisador mostra `profiles=antes->efetivo->depois`, o valor esperado e se a
-restauracao ocorreu.
+As a last defense, the `session_local_controls` collection, copied before the
+characters are created, provides an independent, validated count of 1..2
+profiles. On victory with P4+, `MissionRewardApplyHook` swaps an invalid native
+counter for that count immediately before the original wrapper. No weapon,
+reward, name, ID, pointer or payload value is read by the diagnostic. The
+analyzer shows `profiles=before->effective->after`, the expected value and
+whether the restore occurred.
 
-## Contrato de retorno de PlayerInfo na 0.6.20
+## PlayerInfo return contract in 0.6.20
 
-`Reports\Crash.zip` registrou `c0000005` de escrita em `0x55D64D`, com retorno
-para `0x560537`, durante a primeira atualizacao da sala e sem fillers. O valor
-fonte preservado em R9 era `UserImpl vtable 0xEC2730`; ao copiar o suposto
-objeto, o jogo carregou dessa tabela `0x452F70`, a destrutora de `UserImpl`, e
-tentou incrementar `+4` como se fosse um contador de referencias. Isso prova
-que o vetor recebeu a vtable como ponteiro de `PlayerInfo`, nao que a reserva
-de oito slots tenha falhado.
+`Reports\Crash.zip` recorded a `c0000005` write at `0x55D64D`, returning to
+`0x560537`, during the first room update and without fillers. The source value
+preserved in R9 was `UserImpl vtable 0xEC2730`; when copying the supposed
+object, the game loaded `0x452F70` from that table, the `UserImpl` destructor,
+and tried to increment `+4` as if it were a reference counter. This proves that
+the vector received the vtable as a `PlayerInfo` pointer, not that the
+eight-slot reservation failed.
 
-Os callers `0x422087` e `0x422277` chamam `PlayerInfoFromUser 0x422F00` e passam
-RAX diretamente ao construtor de handle em `0x425760`. O epilogo do conversor
-executa `mov rax,r14` em `0x423962`, onde R14 conserva o destino. O hook de
-auditoria introduzido para nomes/classes tinha retorno `void`, portanto a
-rotina de observacao sobrescrevia esse registrador depois de o original
-retornar. A assinatura agora e `uint8_t*`, o valor original e conservado ate o
-retorno do hook, e `0x42395A..0x423964` faz parte da validacao offline. O evento
-sanitizado `player_info_return_contract` registra apenas match e contagem de
-divergencias; enderecos de destino/retorno nao sao persistidos.
+The callers `0x422087` and `0x422277` call `PlayerInfoFromUser 0x422F00` and
+pass RAX directly to the handle constructor at `0x425760`. The converter's
+epilogue executes `mov rax,r14` at `0x423962`, where R14 holds the destination.
+The audit hook introduced for names/classes returned `void`, so the
+observation routine overwrote that register after the original returned. The
+signature is now `uint8_t*`, the original value is kept until the hook returns,
+and `0x42395A..0x423964` is part of the offline validation. The sanitized event
+`player_info_return_contract` records only match and divergence count;
+destination/return addresses are not persisted.
 
-Quando existirem novos reports, a atribuicao de controle pode ser comparada
-diretamente entre ZIPs sanitizados, sem extrai-los:
+When new reports exist, the control assignment can be compared directly between
+sanitized ZIPs, without extracting them:
 
 ```powershell
 python tools/analyze_player_controls.py Reports\*.zip --expected-players 5 --require-exact-loadout --require-pre-map-loadout-restore --require-loadout-parser-rollback --require-class-sidecar --require-name-identity --require-chat-name-association --require-replication-association --require-replication-matrix --require-replication-send-fanout --require-receive-route-matrix --require-transport-route-identity --require-extra-result-items --require-result-item-matrix --require-result-event-publish --require-effective-result-recovery --require-result-ui-close-dispatch --require-result-reward-chain --require-result-room-return --strict
 ```
 
-Cada processo deve listar todos os participantes, normalmente marcar apenas um
-como local e completar `mission_player_create_result` para todos. Donos locais
-duplicados entre computadores, consumer nulo ou fallback de fonte extra sao
-destacados.
+Each process must list all participants, normally mark only one as local and
+complete `mission_player_create_result` for all. Duplicate local owners across
+computers, a null consumer or an extra-source fallback are highlighted.
 
-## Identificacao local no chat da sala na 0.6.21
+## Local identification in the room chat in 0.6.21
 
-`net::Chat_Room` usa a vtable `0xEBEDA8` e publica as linhas visuais pela rotina
-comum em `0x3F0B70`. O caminho nativo de mensagem local inicializa um estado
-neutro de `0x50` bytes em `0x3F17F7`, grava `-1` no dword `+0x08` e chama esse
-publicador em `0x3F1863` com tipo 2 e subtipo 0. O envio para a Steam ocorre em
-outro trecho da rotina nativa, portanto nao e necessario nem desejavel usa-lo
-para identificar o mod.
+`net::Chat_Room` uses the vtable `0xEBEDA8` and publishes the visual lines
+through the common routine at `0x3F0B70`. The native local-message path
+initializes a neutral `0x50`-byte state at `0x3F17F7`, writes `-1` into dword
+`+0x08` and calls that publisher at `0x3F1863` with type 2 and subtype 0. The
+send to Steam happens in another part of the native routine, so it is neither
+necessary nor desirable to use it to identify the mod.
 
-A 0.6.21 agenda `EDF5_MultiSlotMod v0.6.21` quando uma sala criada localmente e
-confirmada ou quando a contagem positiva confirma a entrada no lobby solicitado.
-O primeiro evento visual valido de `Chat_Room` consome a pendencia e chama
-diretamente o trampoline do publicador comum. Isso evita recursao no hook e nao
-executa `SendLobbyChatMsg`; a linha existe somente na interface local e nao pode
-ser atribuida a outro participante.
+0.6.21 schedules `EDF5_MultiSlotMod v0.6.21` when a locally created room is
+confirmed or when the positive count confirms entry into the requested lobby.
+The first valid visual event of `Chat_Room` consumes the pending item and
+directly calls the common publisher's trampoline. This avoids recursion in the
+hook and does not execute `SendLobbyChatMsg`; the line exists only in the local
+interface and cannot be attributed to another participant.
 
-Ao sair da sala, tanto o alvo de join quanto a pendencia e a identidade do lobby
-sao limpos. O autoteste cobre join assincrono, criacao, estado neutro exato,
-texto/versao exatos, sucesso unico, ausencia de duplicacao e limpeza na saida.
-Os logs guardam apenas nome, versao, caminho de entrada e resultado da tentativa;
-nenhuma mensagem de usuario, nickname, SteamID, endpoint ou payload e persistido.
+When leaving the room, the join target, the pending item and the lobby identity
+are all cleared. The self-test covers asynchronous join, creation, exact
+neutral state, exact text/version, single success, absence of duplication and
+cleanup on exit. The logs keep only name, version, entry path and the result of
+the attempt; no user message, nickname, SteamID, endpoint or payload is
+persisted.
 
-## Instancia direta de Chat_Room na 0.6.22
+## Direct Chat_Room instance in 0.6.22
 
-`Reports\no_name.zip`, gerado pela 0.6.21, terminou limpo e sem qualquer crash.
-Ele registrou `chat_mod_banner_armed` para a sala criada, mas nao registrou
-`chat_mod_banner_publish` nem uma unica passagem pelo hook do publicador. Isso
-prova que esperar uma entrada visual posterior nao e um gatilho valido.
+`Reports\no_name.zip`, generated by 0.6.21, ended cleanly and without any
+crash. It recorded `chat_mod_banner_armed` for the created room, but did not
+record `chat_mod_banner_publish` nor a single pass through the publisher hook.
+This proves that waiting for a later visual entry is not a valid trigger.
 
-O unico caller direto do construtor `Chat_Room 0x3F0680` esta em `0x412AFA`.
-Ele aloca `0xC0` bytes, constroi o objeto e o guarda no shared handle de sala.
-A atribuicao da vtable ocorre em `0x3F06B8` e aponta para `0xEBEDA8`. A 0.6.22
-hooka apenas o construtor, valida essas duas assinaturas e conserva a instancia
-em um atomico sem registrar seu endereco.
+The only direct caller of the `Chat_Room 0x3F0680` constructor is at
+`0x412AFA`. It allocates `0xC0` bytes, builds the object and stores it in the
+room shared handle. The vtable assignment occurs at `0x3F06B8` and points to
+`0xEBEDA8`. 0.6.22 hooks only the constructor, validates these two signatures
+and keeps the instance in an atomic without logging its address.
 
-Durante `HUiRoom::Update`, a publicacao so e tentada quando:
+During `HUiRoom::Update`, publishing is attempted only when:
 
-1. existe banner pendente;
-2. a instancia ainda possui a vtable exata de `Chat_Room`;
-3. `ISteamUser019::GetSteamID` devolve uma identidade local valida;
-4. essa identidade corresponde a um `UserImpl` registrado.
+1. there is a pending banner;
+2. the instance still has the exact `Chat_Room` vtable;
+3. `ISteamUser019::GetSteamID` returns a valid local identity;
+4. that identity matches a registered `UserImpl`.
 
-O retorno `CSteamID` de `GetSteamID` usa o buffer oculto do ABI MSVC, modelado
-explicitamente como nos getters de lobby. Um qword zero e passado como
-destinatario para escolher a linha publica, enquanto remetente e sempre o
-usuario local. A chamada vai direto ao trampoline de `0x3F0B70`, portanto nao
-entra no metodo `0x3F16C0` nem em seu envio Steam `0x44D940`.
+The `CSteamID` return of `GetSteamID` uses the MSVC ABI hidden buffer, modeled
+explicitly as in the lobby getters. A zero qword is passed as the recipient to
+choose the public line, while the sender is always the local user. The call
+goes straight to the trampoline of `0x3F0B70`, so it does not enter method
+`0x3F16C0` or its Steam send `0x44D940`.
 
-O autoteste nao fabrica uma mensagem nativa: ele confirma a espera antes do
-registro local, a publicacao direta unica ao criar e entrar, o estado neutro de
-`0x50` bytes e a ausencia de duplicacao. Se algum pre-requisito faltar em
-runtime, `chat_mod_banner_waiting` registra uma vez apenas o motivo sanitizado.
+The self-test does not fabricate a native message: it confirms the wait before
+the local registration, the single direct publication on create and join, the
+neutral `0x50`-byte state and the absence of duplication. If any prerequisite
+is missing at runtime, `chat_mod_banner_waiting` logs only the sanitized
+reason, once.
 
-## Estado de texto do Chat_Room na 0.6.23
+## Chat_Room text state in 0.6.23
 
-`Reports\no name v2.zip`, produzido pela 0.6.22, registrou a captura valida do
-`Chat_Room` e 755 retornos falsos consecutivos do publicador. Quando o usuario
-enviou sua primeira mensagem, o evento nativo ocorreu e a tentativa 756 foi
-aceita. Nao houve crash, perda de eventos ou erro de escrita.
+`Reports\no name v2.zip`, produced by 0.6.22, recorded the valid capture of the
+`Chat_Room` and 755 consecutive false returns from the publisher. When the user
+sent their first message, the native event occurred and attempt 756 was
+accepted. There was no crash, loss of events or write error.
 
-O guard de `0x3F0B70` em `0x3F0C04` rejeita uma mensagem fora do editor ativo
-quando `state+0x20 == 0`, `state+0x00 == 0` e o ponteiro em `state+0x10` tambem
-e nulo. A mensagem local montada em `0x3F17F7` realmente deixa `+0x10` zerado,
-pois seu caller esta no contexto do editor. Ja o decoder remoto copia o ponteiro
-do texto para esse campo em `0x3F1E72` antes da publicacao em `0x3F1F81`.
+The guard of `0x3F0B70` at `0x3F0C04` rejects a message outside the active
+editor when `state+0x20 == 0`, `state+0x00 == 0` and the pointer at
+`state+0x10` is also null. The local message assembled at `0x3F17F7` does leave
+`+0x10` zeroed, since its caller is in the editor context. The remote decoder,
+on the other hand, copies the text pointer into that field at `0x3F1E72` before
+publishing at `0x3F1F81`.
 
-A 0.6.23 conserva o estado de `0x50` bytes, a selecao `-1`, tipo 2 e subtipo 0,
-mas grava o endereco estatico de `EDF5_MultiSlotMod v0.6.23` em `+0x10`. O
-publicador continua sendo chamado diretamente: nao ha passagem pelo metodo de
-envio `0x3F16C0`, pelo transporte `0x44D940` nem pela Steam. O falso publicador
-do autoteste agora exige essa associacao entre o campo `+0x10` e o argumento de
-texto. Rejeicoes reais sao tentadas no maximo a cada 250 ms; somente a primeira
-falha sanitizada e o eventual sucesso sao gravados.
+0.6.23 keeps the `0x50`-byte state, the `-1` selection, type 2 and subtype 0,
+but writes the static address of `EDF5_MultiSlotMod v0.6.23` to `+0x10`. The
+publisher continues to be called directly: there is no passage through the
+send method `0x3F16C0`, the transport `0x44D940` or Steam. The self-test's fake
+publisher now requires this association between field `+0x10` and the text
+argument. Real rejections are attempted at most every 250 ms; only the first
+sanitized failure and the eventual success are written.
 
-## Tabela visual nativa de quatro jogadores na 0.6.24
+## Native four-player visual table in 0.6.24
 
-Os reports `server.zip`, `client 2.zip` e `client 3.zip` registraram a mesma
-violacao de acesso durante a abertura da missao: `EDF5.exe+0xB1D60` no host e
-cliente 3, e `EDF5.exe+0xB1D6B` no cliente 2. O dump bruto do host preservado
-pelo Windows mostrou a pilha `0xB1D60 <- 0x9DD90 <- 0x4BBC3C`. A rotina
-`0xB1CF0` copia um descritor grafico de `0x30` bytes e tentou incrementar uma
-referencia cujo controle invalido era `0x200000000`.
+The reports `server.zip`, `client 2.zip` and `client 3.zip` recorded the same
+access violation during mission opening: `EDF5.exe+0xB1D60` on the host and
+client 3, and `EDF5.exe+0xB1D6B` on client 2. The raw host dump preserved by
+Windows showed the stack `0xB1D60 <- 0x9DD90 <- 0x4BBC3C`. The routine
+`0xB1CF0` copies a `0x30`-byte graphics descriptor and tried to increment a
+reference whose invalid control block was `0x200000000`.
 
-O chamador `0x4BB010` resolve o `UserImpl`, recebe em sua primeira saida o
-indice logico de `UserImpl+0xF8` e, em `0x4BB5E1`, calcula
-`render_base + indice * 0x40`. A tabela visual possui somente quatro entradas.
-P4 selecionava a quinta entrada nao construida; o crash ocorria depois, ao
-submeter esse descritor em `0x4BBC37`. Isso e um limite de recurso visual, nao
-de identidade, controle, loadout ou transporte.
+The caller `0x4BB010` resolves the `UserImpl`, receives in its first output the
+logical index from `UserImpl+0xF8` and, at `0x4BB5E1`, computes
+`render_base + index * 0x40`. The visual table has only four entries.
+P4 selected the fifth, unbuilt entry; the crash occurred later, when submitting
+that descriptor at `0x4BBC37`. This is a visual resource limit, not one of
+identity, control, loadout or transport.
 
-A 0.6.24 mantem `UserImpl+0xF8=4..7` e altera somente a saida temporaria do
-resolver `0x4B6710` para `indice % 4`. Assim P4-P7 reutilizam os recursos
-visuais 0-3 sem colidir no mapa logico. O evento sanitizado
-`mission_participant_visual_slot_remapped` registra indice logico, slot visual,
-RVA do caller e booleans de preservacao, sem nomes, IDs, ponteiros ou payloads.
-Assinaturas exatas cobrem o calculo `*0x40` e a instrucao de crash.
+0.6.24 keeps `UserImpl+0xF8=4..7` and changes only the temporary output of
+resolver `0x4B6710` to `index % 4`. Thus P4-P7 reuse visual resources 0-3
+without colliding in the logical map. The sanitized event
+`mission_participant_visual_slot_remapped` logs logical index, visual slot,
+caller RVA and preservation booleans, without names, IDs, pointers or payloads.
+Exact signatures cover the `*0x40` computation and the crash instruction.
 
-O emergency logger tambem passou a varrer `0x800` bytes da pilha da thread e
-guardar ate oito candidatos executaveis como pares `stack_offset/module_rva`.
-Esses RVAs continuam no ZIP sanitizado, enquanto enderecos absolutos e dumps
-permanecem removidos. O analisador aceita `--stack-hex` para inspecao local do
-dump e `--require-visual-slot-remap` para o proximo teste coordenado.
+The emergency logger also started scanning `0x800` bytes of the thread stack
+and keeping up to eight executable candidates as `stack_offset/module_rva`
+pairs. These RVAs remain in the sanitized ZIP, while absolute addresses and
+dumps remain removed. The analyzer accepts `--stack-hex` for local inspection
+of the dump and `--require-visual-slot-remap` for the next coordinated test.
 
-## Classe nativa e tabela de texto fixa na 0.6.25
+## Native class and fixed text table in 0.6.25
 
-Os reports `Reports\Server.zip`, `Reports\Client 1.zip`,
-`Reports\Client 2.zip` e `Reports\client 3.zip`, todos da 0.6.24, comprovam que
-`mission_participant_visual_slot_remapped` executou para P4 antes da nova
-falha. Host e cliente 3 terminaram com AV de leitura em `0x5E741C`; cliente 1
-em `0x4BC33A`. O cliente 2 registrou saida limpa depois de perder a sala e ficar
-no loading, coerente com a queda do host.
+The reports `Reports\Server.zip`, `Reports\Client 1.zip`,
+`Reports\Client 2.zip` and `Reports\client 3.zip`, all from 0.6.24, prove that
+`mission_participant_visual_slot_remapped` executed for P4 before the new
+failure. Host and client 3 ended with a read AV at `0x5E741C`; client 1
+at `0x4BC33A`. Client 2 recorded a clean exit after losing the room and staying
+on loading, consistent with the host's drop.
 
-O dump local do host (`pid 21544`, mantido apenas localmente) fixa a pilha
-`0x5E741C <- 0x4BC2CF`. Em `0x5E741C`, `cmp bx,[r8]` recebeu `r8=1`. O caller
-escolhe em `0x4BC266` uma string nativa e a obtem de um registro calculado em
-`0x4BB5CE` como `class * 0x30 + [rdi+0xB8]`. Os eventos anteriores ao crash
-registraram classe nativa 257 no host e 256 no cliente 3.
+The host's local dump (`pid 21544`, kept only locally) fixes the stack
+`0x5E741C <- 0x4BC2CF`. At `0x5E741C`, `cmp bx,[r8]` received `r8=1`. The
+caller chooses a native string at `0x4BC266` and obtains it from a record
+computed at `0x4BB5CE` as `class * 0x30 + [rdi+0xB8]`. The events before the
+crash logged native class 257 on the host and 256 on client 3.
 
-A origem e `0x4B6886..0x4B689A`: o resolver multiplica o indice logico por
-`0x3E90` e le a classe em `state+0x14B30`. P4 portanto consulta o quinto bloco,
-que nao existe e sobrepoe o estado do resultado. O rollback do parser estava
-correto, mas apagava junto os dados uteis que o parser havia acabado de produzir.
+The origin is `0x4B6886..0x4B689A`: the resolver multiplies the logical index
+by `0x3E90` and reads the class at `state+0x14B30`. P4 therefore consults the
+fifth block, which does not exist and overlaps the result state. The parser
+rollback was correct, but it also erased the useful data that the parser had
+just produced.
 
-A 0.6.25 conserva antes do rollback somente os campos comprovados do bloco
-extra: seletor de classe, registro ativo de seis dwords e armadura. O sidecar e
-indexado por P4-P7, protegido por lock e limpo ao criar/entrar/sair da sessao.
-Ele serve tanto para sintetizar o bloco temporario durante a fabrica do
-personagem quanto para corrigir a classe do HUD quando `PlayerInfo` nao foi
-observado. Como ultima barreira, qualquer classe nativa fora de `0..3` e
-substituida pelo slot visual modulo quatro.
+0.6.25 keeps, before the rollback, only the proven fields of the extra block:
+class selector, active six-dword record and armor. The sidecar is indexed by
+P4-P7, protected by a lock and cleared when creating/joining/leaving the
+session. It serves both to synthesize the temporary block during the character
+factory and to correct the HUD class when `PlayerInfo` was not observed. As a
+last barrier, any native class outside `0..3` is replaced by the visual slot
+modulo four.
 
-O autoteste cobre os dois valores dos reports: classe nativa 257 e ausencia de
-`PlayerInfo`, primeiro com sidecar valido e depois sem sidecar, garantindo saida
-0 em ambos. A validacao offline cobre exatamente `0x4B6886`, `0x4BB5CE`,
-`0x4BC266` e `0x5E741C`. Nenhum jogo foi iniciado durante a implementacao.
+The self-test covers the two values from the reports: native class 257 and
+absence of `PlayerInfo`, first with a valid sidecar and then without a sidecar,
+guaranteeing output 0 in both. The offline validation covers exactly
+`0x4B6886`, `0x4BB5CE`, `0x4BC266` and `0x5E741C`. No game was launched during
+implementation.
 
-## Contrato final do parser e sidecar parcial na 0.6.26
+## Final parser contract and partial sidecar in 0.6.26
 
-O fluxo completo de `0x42F480` fixa a ordem das escritas. Para P4+, o parser
-nao executa a copia grande reservada aos indices 0..3, mas ainda grava seletor,
-seis armas, armadura e o final de 0x30 bytes. Depois do loop, `0x42FA69` executa
-`mov [state+0x245A0],r12d` sem consultar o valor booleano de retorno. Isso
-explica a telemetria real `after_parser=5`, `parser_result=false`: era uma
-leitura valida, nao uma falha.
+The complete flow of `0x42F480` fixes the order of the writes. For P4+, the
+parser does not execute the large copy reserved for indices 0..3, but still
+writes the selector, six weapons, armor and the final 0x30 bytes. After the
+loop, `0x42FA69` executes `mov [state+0x245A0],r12d` without consulting the
+boolean return value. This explains the real telemetry `after_parser=5`,
+`parser_result=false`: it was a valid read, not a failure.
 
-Ha somente um `call` direto para o parser, em `0x42ABDE`. O chamador prepara um
-byte de erro em `[rsp+0x38]`, passa seu endereco e o testa em `0x42AC05` para
-decidir se devolve `-1`. `0x42F4D2` apenas zera esse byte e nenhum caminho o
-torna verdadeiro. Separadamente, o retorno em `AL` apenas marca um estado do
-objeto; no caminho de decodificacao, `0x42F73D` zera `r13b` antes das escritas.
-Assim, preservar a contagem apenas quando `AL=true` invertia o contrato real.
+There is only one direct `call` to the parser, at `0x42ABDE`. The caller
+prepares an error byte at `[rsp+0x38]`, passes its address and tests it at
+`0x42AC05` to decide whether to return `-1`. `0x42F4D2` merely zeroes that byte
+and no path makes it true. Separately, the return in `AL` only marks a state of
+the object; in the decoding path, `0x42F73D` zeroes `r13b` before the writes.
+Thus, preserving the count only when `AL=true` inverted the real contract.
 
-P4 com classe 1 possui registro ativo em `0x24590..0x245A7`. A arma 3 sobrepoe
-o contador local em `0x2459C`, mas ainda contem a arma real no instante da
-captura; a arma 4 em `0x245A0` ja foi substituida pela contagem final. A mascara
-de validade resultante e `0x2F`, com fallback nativo somente em `0x10`. Para
-PlayerInfo a mascara permanece `0x3F`. O autoteste reproduz retorno `false`,
-contagem 5, classe 1 e a sobreposicao, exige a preservacao de 5 e verifica que
-o scratch recebe `{1040,1041,1042,1043,nativo,1045}` antes de ser restaurado.
+P4 with class 1 has an active record at `0x24590..0x245A7`. Weapon 3 overlaps
+the local counter at `0x2459C`, but still contains the real weapon at the time
+of capture; weapon 4 at `0x245A0` has already been replaced by the final count.
+The resulting validity mask is `0x2F`, with native fallback only at `0x10`. For
+PlayerInfo the mask remains `0x3F`. The self-test reproduces return `false`,
+count 5, class 1 and the overlap, requires the preservation of 5 and verifies
+that the scratch receives `{1040,1041,1042,1043,native,1045}` before being
+restored.
 
-Os eventos passam a expor apenas mascaras e estado: `complete_sidecar_weapon_mask`,
+The events now expose only masks and state: `complete_sidecar_weapon_mask`,
 `partial_sidecar_weapon_mask`, `participant_count_output_valid`,
-`participant_count_source`, `weapon_valid_mask` e `fallback_weapon_mask`.
-As mascaras nao adicionam conteudo de equipamento ao report; permanece apenas
-o primeiro ID numerico que a telemetria de loadout ja registrava.
+`participant_count_source`, `weapon_valid_mask` and `fallback_weapon_mask`.
+The masks add no equipment content to the report; only the first numeric ID
+that the loadout telemetry already logged remains.
 
-## Censo completo dos consumidores de classe/indice visual
+## Complete census of class/visual index consumers
 
-O reverse offline encontrou exatamente tres chamadas diretas ao resolvedor
-`0x4B6710`: `0x4B8039`, `0x4BB1FB` e `0x4CEEFC`. Nenhuma delas usa a primeira
-saida como identidade persistente. Ela alimenta somente indices visuais
-transitorios:
+The offline reverse found exactly three direct calls to the resolver
+`0x4B6710`: `0x4B8039`, `0x4BB1FB` and `0x4CEEFC`. None of them uses the first
+output as a persistent identity. It feeds only transient visual indices:
 
-- `0x4B855E` calcula `indice*0x30` para uma tabela de descritores de UI;
-- `0x4BB5E1` calcula `indice*0x40` para os quatro descritores do status/HUD,
-  enquanto `0x4BB5CE` calcula `classe*0x30` para os textos das quatro classes;
-- `0x4CF21F` calcula `indice*0x10` sobre um array local que `0x4CEDE5` inicializa
-  com exatamente quatro entradas consecutivas. O mesmo caller seleciona apenas
-  as classes 0..3 em `0x4CEF24`.
+- `0x4B855E` computes `index*0x30` for a table of UI descriptors;
+- `0x4BB5E1` computes `index*0x40` for the four status/HUD descriptors,
+  while `0x4BB5CE` computes `class*0x30` for the texts of the four classes;
+- `0x4CF21F` computes `index*0x10` over a local array that `0x4CEDE5`
+  initializes with exactly four consecutive entries. The same caller selects
+  only classes 0..3 at `0x4CEF24`.
 
-Portanto, dobrar apenas as duas saidas transitorias para 0..3 protege todos os
-consumidores conhecidos sem alterar `UserImpl+0xF8`, que continua unico para
-controle, nomes e replicacao. O validador agora enumera todas as instrucoes
-`E8 rel32` da secao `.text`, exige exatamente esses tres callers e confere os
-tres layouts de consumo. Um caller novo ou uma mudanca de layout faz o build
-falhar em vez de deixar um caminho visual sem auditoria.
+Therefore, folding only the two transient outputs into 0..3 protects all known
+consumers without changing `UserImpl+0xF8`, which remains unique for control,
+names and replication. The validator now enumerates all `E8 rel32`
+instructions in the `.text` section, requires exactly these three callers and
+checks the three consumption layouts. A new caller or a layout change makes the
+build fail instead of leaving a visual path unaudited.
 
-## Concorrencia e ciclo de vida do sidecar
+## Sidecar concurrency and lifecycle
 
-Nos quatro reports da 0.6.24, cada processo usou uma unica thread de fase para
-todas as chamadas do parser e, depois, para a criacao P0-P4 e o
-scratch/restauracao do loadout: host `22360`, clientes `9632`, `7636` e
-`12408`. Nao houve parser concorrente nem troca de thread durante o rollback.
-As chamadas iniciais retornaram `true`, nao alteraram os blocos extras e
-conservaram a contagem 1; somente a ultima chamada retornou `false`, escreveu o
-bloco P4 e produziu `participant_count_after_parser=5`.
+In the four 0.6.24 reports, each process used a single stage thread for all
+parser calls and, afterwards, for the P0-P4 creation and the loadout
+scratch/restore: host `22360`, clients `9632`, `7636` and
+`12408`. There was no concurrent parser nor thread switch during the rollback.
+The initial calls returned `true`, did not change the extra blocks and kept the
+count at 1; only the last call returned `false`, wrote the P4 block and
+produced `participant_count_after_parser=5`.
 
-O painel visual executou mais tarde numa thread de UI distinta e foi essa
-thread que sofreu a excecao: cliente 1 `19340`, cliente 3 `6716` e host `31564`.
-O evento `mission_participant_visual_slot_remapped` aparece na mesma thread da
-respectiva excecao e depois de toda a criacao P0-P4. O scratch nativo ja estava
-restaurado; a classe atravessa da fase para a UI pelo sidecar protegido por
-`SRWLOCK`. Essa separacao confirma o encadeamento parser -> sidecar -> HUD e nao
-uma restauracao concorrente do bloco.
+The visual panel ran later on a distinct UI thread and that thread was the one
+that suffered the exception: client 1 `19340`, client 3 `6716` and host
+`31564`. The event `mission_participant_visual_slot_remapped` appears on the
+same thread as the respective exception and after the entire P0-P4 creation.
+The native scratch was already restored; the class crosses from the stage to
+the UI through the sidecar protected by `SRWLOCK`. This separation confirms the
+parser -> sidecar -> HUD chaining and not a concurrent restoration of the
+block.
 
-Entre a ultima escrita do parser e P4 houve cerca de 32 segundos no host e nos
-clientes; entre P4 e o HUD, apenas 0,17 a 0,90 segundo. Por isso o sidecar nao
-usa um TTL arbitrario: expirar em 30 segundos descartaria dados validos destes
-proprios reports. A validade e delimitada pela sessao e pelo indice logico, e
-uma nova saida do parser substitui atomicamente o slot correspondente.
+Between the parser's last write and P4 there were about 32 seconds on the host
+and clients; between P4 and the HUD, only 0.17 to 0.90 seconds. For that reason
+the sidecar does not use an arbitrary TTL: expiring at 30 seconds would discard
+valid data from these very reports. Validity is bounded by the session and the
+logical index, and a new parser output atomically replaces the corresponding
+slot.
 
-A protecao do parser e o scratch sao `thread_local` para impedir reentrada na
-thread de fase; o sidecar compartilhado usa `SRWLOCK` na publicacao/leitura da
-thread de UI. Ele e limpo ao criar
-ou entrar em uma sala e no desligamento do mod. A classe recuperada permanece
-obrigatoriamente em `0..3`, portanto um sidecar antigo pode no pior caso causar
-um fallback visual/loadout incorreto, mas nao reabrir a indexacao fora das
-quatro classes que causou estes crashes. Nenhuma mudanca adicional de
-sincronizacao foi justificada pelos reports.
+The parser protection and the scratch are `thread_local` to prevent reentry on
+the stage thread; the shared sidecar uses `SRWLOCK` on publication/read from
+the UI thread. It is cleared when creating
+or joining a room and at mod shutdown. The recovered class necessarily stays
+within `0..3`, so an old sidecar can at worst cause an incorrect visual/loadout
+fallback, but cannot reopen the out-of-range indexing across the four classes
+that caused these crashes. No additional synchronization change was justified
+by the reports.
 
 ## Local Mission Harness 0.6.27
 
-O harness reutiliza deliberadamente a rota sintetica do lobby porque ela faz o
-EDF5 construir um `net::UserImpl` independente para cada dummy. Duplicar o
-objeto do host dentro do vetor final foi descartado: isso repetiria identidade,
-controle, nome e estado de replicacao, exatamente a classe de erro que ja foi
-observada no primeiro teste de cinco jogadores.
+The harness deliberately reuses the synthetic lobby route because it makes EDF5
+build an independent `net::UserImpl` for each dummy. Duplicating the host's
+object inside the final vector was discarded: that would repeat identity,
+control, name and replication state, exactly the class of error already
+observed in the first five-player test.
 
-F3 alterna target 3, target 4 e zero. A ativacao exige sala criada pelo processo,
-`actual_members == 1`, roster da sala recente e nenhum filler manual. Cada
-dummy recebe Ready `+0xC0`, `cm=c1`, `ds=ds` e o clone de PlayerInfo do host. A
-reconciliacao `l1/l2` fica pendente desde a ativacao, sem esperar o primeiro
-send do canal 0. Nenhuma resposta de gameplay e colocada na fila, portanto os
-personagens resultantes permanecem remotos e inertes.
+F3 cycles between target 3, target 4 and zero. Activation requires a room
+created by the process, `actual_members == 1`, a recent room roster and no
+manual filler. Each dummy receives Ready `+0xC0`, `cm=c1`, `ds=ds` and the
+host's PlayerInfo clone. The `l1/l2` reconciliation stays pending from
+activation, without waiting for the first channel 0 send. No gameplay response
+is queued, so the resulting characters remain remote and inert.
 
-Na copia das colecoes da missao, o gate espera `target+1` objetos e controles
-unicos na colecao completa e exatamente um na colecao local. Isso prova que
-host+3 percorreu a forma nativa e que host+4 realmente entregou P4 ao builder,
-sem alias com P0. No resultado, a escrita local `{phase=1,result=0}` e limitada
-aos callers comprovados de `Sync_MissionResult` e exige novamente target 3/4,
-um membro real e contagem sintetica exata. Ela nao cria pacote, ack ou peer.
+When copying the mission collections, the gate waits for `target+1` unique
+objects and controls in the full collection and exactly one in the local
+collection. This proves that host+3 went through the native form and that
+host+4 really delivered P4 to the builder, with no alias to P0. On the result,
+the local write `{phase=1,result=0}` is limited to the proven callers of
+`Sync_MissionResult` and again requires target 3/4, one real member and the
+exact synthetic count. It creates no packet, ack or peer.
 
-O autoteste isolado valida as tres bordas do F3, ausencia de repeticao ao manter
-a tecla, Ready de P1-P4, nome `Harness Dummy 4`, armamento antecipado de l1/l2,
-conclusao local do sync e remocao completa ao desligar. O EDF5.exe nao foi
-iniciado.
+The isolated self-test validates the three F3 edges, absence of repetition when
+the key is held, Ready of P1-P4, name `Harness Dummy 4`, early arming of l1/l2,
+local completion of the sync and complete removal on shutdown. EDF5.exe was not
+launched.
 
-## Spawn de inimigos e resultado em cinco jogadores (0.6.32)
+## Enemy spawn and result with five players (0.6.32)
 
-O censo estatico encontrou exatamente 24 chamadas diretas para a rotina comum
-de instanciacao em `0x1C1650`. RTTI associa os owners a AlienTrailer, Deiroi,
-GeneratorPoll, InsectBase, Monster, Nephila, AntHill e UFOs. A rotina limita a
-quantidade viva a 400 e depois aplica `owner+0x290 / owner+0x294`; uma fonte
-nula em `owner+0x2B0` tambem impede a criacao. O construtor de GeneratorPoll em
-`0x1F872C` usa `participant_count-1` para indexar uma tabela nativa de quatro
-entradas, mas o resultado alimenta os timers `+0x1F8/+0x1FC` do owner. Essa
-tabela nao escreve a escala `+0x290/+0x294` do subobjeto de spawn e, portanto,
-nao prova a origem de uma escala zero.
+The static census found exactly 24 direct calls to the common instantiation
+routine at `0x1C1650`. RTTI associates the owners with AlienTrailer, Deiroi,
+GeneratorPoll, InsectBase, Monster, Nephila, AntHill and UFOs. The routine
+limits the live quantity to 400 and then applies `owner+0x290 / owner+0x294`; a
+null source at `owner+0x2B0` also prevents creation. The GeneratorPoll
+constructor at `0x1F872C` uses `participant_count-1` to index a native table of
+four entries, but the result feeds the owner's timers `+0x1F8/+0x1FC`. That
+table does not write the scale `+0x290/+0x294` of the spawn subobject and
+therefore does not prove the origin of a zero scale.
 
-O hook novo e fail-closed: a instalacao exige a assinatura de `0x1C1650` e que
-os 24 `E8 rel32` ainda apontem para ela. O multiplicador e o reparo temporario
-so valem para esses retornos confirmados. O reparo exige 5..MaxPlayers,
-numerador zero, denominador entre 1 e 1.000.000, fonte presente e memoria
-gravavel; a restauracao usa compare/exchange para nao sobrescrever uma mudanca
-concorrente.
+The new hook is fail-closed: installation requires the signature of `0x1C1650`
+and that the 24 `E8 rel32` still point to it. The multiplier and the temporary
+repair are valid only for these confirmed returns. The repair requires
+5..MaxPlayers, zero numerator, denominator between 1 and 1,000,000, source
+present and writable memory; the restore uses compare/exchange so as not to
+overwrite a concurrent change.
 
-Nos reports de cinco jogadores, `Sync_MissionResult` de script iniciou em
-`0/0`, mas `Exec_Begin` nunca ocorreu. O wrapper registrado em `0x42AC40` chama
-`0x42FD20`, e o caller nativo direto em `0x1153EE` fornece o argumento
-comprovado `-20000`. A recuperacao 0.6.32 espera 1000 ms, cancela se o caminho
-nativo aparecer e, se o stall persistir, chama `Exec_Begin` uma unica vez na
-thread `Mission()` em host e clientes reais. O harness F3 e explicitamente
-excluido.
+In the five-player reports, the script's `Sync_MissionResult` started at
+`0/0`, but `Exec_Begin` never occurred. The wrapper registered at `0x42AC40`
+calls `0x42FD20`, and the direct native caller at `0x1153EE` supplies the
+proven argument `-20000`. The 0.6.32 recovery waits 1000 ms, cancels if the
+native path appears and, if the stall persists, calls `Exec_Begin` exactly once
+on the `Mission()` thread on real hosts and clients. The F3 harness is
+explicitly excluded.
 
-### Auditoria de concorrencia 0.6.33
+### Concurrency audit 0.6.33
 
-A fila inicial usava tres atomicos independentes. Embora o fluxo observado
-seja normalmente single-thread, um segundo `Sync_MissionResult` poderia
-sobrescrever tick/geracao antes de falhar o CAS de `pending`, e um
-`Exec_Begin` nativo simultaneo poderia cancelar um conjunto parcialmente
-publicado. A 0.6.33 serializa publicacao, cancelamento e claim com SRW lock e
-incrementa o contador de entrada nativa antes de aguardar esse lock. O caminho
-de recuperacao nunca segura o lock enquanto chama codigo do EDF5.
+The initial queue used three independent atomics. Although the observed flow is
+normally single-threaded, a second `Sync_MissionResult` could overwrite the
+tick/generation before the CAS of `pending` failed, and a simultaneous native
+`Exec_Begin` could cancel a partially published set. 0.6.33 serializes
+publish, cancel and claim with an SRW lock and increments the native-entry
+counter before waiting for that lock. The recovery path never holds the lock
+while calling EDF5 code.
 
-Uma segunda checagem no executavel confirmou os 24 `E8 rel32`, `R8D` como
-quantidade, o clamp `0x190`, a fonte em `+0x2B0`, a divisao
-`(+0x290 * quantidade) / +0x294` e `mov ecx, 0xFFFFB1E0` imediatamente antes
-do call de `MissionResult::Exec_Begin` em `0x1153EE`.
+A second check on the executable confirmed the 24 `E8 rel32`, `R8D` as the
+quantity, the `0x190` clamp, the source at `+0x2B0`, the division
+`(+0x290 * quantity) / +0x294` and `mov ecx, 0xFFFFB1E0` immediately before the
+call to `MissionResult::Exec_Begin` at `0x1153EE`.
 
-### Guarda de layout 0.6.34
+### Layout guard 0.6.34
 
-O startup agora valida tambem os blocos semanticos em `0x1C16C6` e
-`0x1C16EF`, nao apenas o prologo: preservacao do pedido em `R8D`, clamp 400,
-fonte `+0x2B0`, denominador `+0x294`, numerador `+0x290` e as duas divisoes.
-O caller `0x1153E9` precisa continuar sendo exatamente
+Startup now also validates the semantic blocks at `0x1C16C6` and
+`0x1C16EF`, not just the prologue: preservation of the request in `R8D`, clamp
+400, source `+0x2B0`, denominator `+0x294`, numerator `+0x290` and the two
+divisions. The caller `0x1153E9` must remain exactly
 `mov ecx,-20000; call 0x42FD20`.
 
-O verificador offline independente censura qualquer caller extra ou ausente e
-confirma o trecho `0x1F910C`: o GeneratorPoll calcula/soma o pedido e chama a
-rotina comum antes de consultar o timer derivado da tabela de participantes.
-Isso elimina a hipotese de o reparo depender de um ramo posterior que nunca
-alcancaria o hook em P5.
+The independent offline verifier censuses any extra or missing caller and
+confirms the stretch `0x1F910C`: the GeneratorPoll computes/sums the request
+and calls the common routine before consulting the timer derived from the
+participant table. This eliminates the hypothesis that the repair depends on a
+later branch that would never reach the hook at P5.
 
-### Observabilidade de encerramento 0.6.40
+### Closing observability 0.6.40
 
-`EmitEnemySpawnSummary` nao omite mais o evento quando o contador e zero. Um
-`enemy_spawn_summary` com `calls=0`, `common_spawn_reached=false` e
-`confirmed_enemy_path_reached=false` prova que o encerramento foi observado,
-mas nenhum caller chegou ao boundary comum. O fixture
-`player-spawn-zero-calls-v0639` exige que o analisador preserve essa evidencia
-e ainda falhe `--require-enemy-spawn`.
+`EmitEnemySpawnSummary` no longer omits the event when the counter is zero. An
+`enemy_spawn_summary` with `calls=0`, `common_spawn_reached=false` and
+`confirmed_enemy_path_reached=false` proves that the closing was observed,
+but no caller reached the common boundary. The fixture
+`player-spawn-zero-calls-v0639` requires that the analyzer preserve this
+evidence and still fail `--require-enemy-spawn`.
 
-O antigo `mission_result_transition_completed` dependia de sair do lobby
-Steam, o que nao prova o retorno a tela da sala quando o lobby continua vivo.
-A 0.6.40 encerra o checkpoint no primeiro `HUiRoom::Update` observado depois
-que `MissionResultApply` armou o tick de resultado, registra
-`completion_signal=room_ui_update` e muda a fase para `room`. O gate nao exige
-que a fase textual ja seja `result`: os reports reais mostram clientes presos
-em `mission` depois de apply 1 e antes do sync. O caminho nao altera a UI nem
-o estado nativo; apenas consome uma vez o tick de resultado. `leave_lobby`
-permanece como sinal de fallback separado.
+The old `mission_result_transition_completed` depended on leaving the Steam
+lobby, which does not prove the return to the room screen when the lobby stays
+alive. 0.6.40 ends the checkpoint at the first `HUiRoom::Update` observed after
+`MissionResultApply` armed the result tick, logs
+`completion_signal=room_ui_update` and changes the phase to `room`. The gate
+does not require the textual phase to already be `result`: the real reports
+show clients stuck in `mission` after apply 1 and before the sync. The path
+changes neither the UI nor the native state; it only consumes the result tick
+once. `leave_lobby` remains as a separate fallback signal.
 
-O evento de conclusao inclui contagens de Exec_Begin, sync concluido,
-ResolveResult, ApplyResult bem-sucedido e a mascara sanitizada de Items. O
-analisador aceita `--require-result-room-return` somente para resultado clear
-com o sinal explicito da UI e rejeita conclusoes legadas ou apenas
-`leave_lobby`. Se `reward_apply` e `room_return` estiverem presentes, a ordem
-tambem e validada e a sala nao pode preceder a aplicacao das recompensas.
+The completion event includes counts of Exec_Begin, completed sync,
+ResolveResult, successful ApplyResult and the sanitized mask of Items. The
+analyzer accepts `--require-result-room-return` only for a clear result
+with the explicit UI signal and rejects legacy conclusions or ones with only
+`leave_lobby`. If `reward_apply` and `room_return` are present, the order
+is also validated and the room cannot precede the application of the rewards.
 
-### Clamp upstream das tabelas nativas 0.6.41
+### Upstream clamp of the native tables 0.6.41
 
-O censo anterior baseado em `.pdata` encontrou 54 leituras decodificadas de
-`mission_state+0x245A0`. Uma segunda varredura integral de `.text`, sem depender
-de metadados de unwind, encontrou ainda duas funcoes leaf em `0x8ADCF` e
-`0x2D0913`. Ambas executam `mov count; dec; count*3` e usam o resultado para
-selecionar um registro de tres dwords. O inventario de escalonamento passa a 56
-sites. A outra funcao leaf em `0x11E48E` apenas retorna a contagem real e fica
-fora do patch.
+The earlier census based on `.pdata` found 54 decoded reads of
+`mission_state+0x245A0`. A second full sweep of `.text`, without relying on
+unwind metadata, also found two leaf functions at `0x8ADCF` and
+`0x2D0913`. Both execute `mov count; dec; count*3` and use the result to select
+a three-dword record. The scaling inventory goes to 56 sites. The other leaf
+function at `0x11E48E` merely returns the real count and stays outside the
+patch.
 
-O caso `GeneratorPoll` fixa a causa upstream mais direta observada:
+The `GeneratorPoll` case pins down the most direct upstream cause observed:
 
-- `0x1F872C` le a contagem real e seleciona o perfil `count-1`;
-- os multiplicadores calculados gravam `owner+0x1F8/+0x1FC`;
-- `0x2DC7C0` compara esses timers e somente `0x2DC82C` chama o virtual de spawn;
-- `GeneratorPoll::spawn`, em `0x1F90A0`, chama o boundary comum em `0x1F9120`.
+- `0x1F872C` reads the real count and selects the profile `count-1`;
+- the computed multipliers write `owner+0x1F8/+0x1FC`;
+- `0x2DC7C0` compares those timers and only `0x2DC82C` calls the spawn virtual;
+- `GeneratorPoll::spawn`, at `0x1F90A0`, calls the common boundary at `0x1F9120`.
 
-Portanto, lixo/NaN no perfil P5 pode impedir que o hook comum seja alcancado. Os
-56 relays preservam as instrucoes e flags originais, limitam apenas o valor
-carregado a 4 e deixam `state+0x245A0` intacto em 5..8. Um contador agregado e
-uma mascara de 56 bits mostram quais sites foram realmente usados, sem ponteiro,
-payload, identidade ou endpoint. O analisador exige essa prova com
+Therefore, garbage/NaN in the P5 profile can prevent the common hook from being
+reached. The 56 relays preserve the original instructions and flags, limit only
+the loaded value to 4 and leave `state+0x245A0` intact at 5..8. An aggregate
+counter and a 56-bit mask show which sites were actually used, without pointer,
+payload, identity or endpoint. The analyzer requires this proof with
 `--require-native-participant-scaling-clamp`.
 
-O clamp escolhe o ultimo perfil de dificuldade que existe no jogo; nao aumenta
-quantidade de inimigos. O multiplicador opcional permanece em outro modulo,
-sob `ExperimentalEnemySpawnMultiplier=false`, com intensidade inativa 1.
+The clamp chooses the last difficulty profile that exists in the game; it does
+not increase the number of enemies. The optional multiplier remains in another
+module, under `ExperimentalEnemySpawnMultiplier=false`, with inactive
+intensity 1.
 
-### Microexecucao dos 56 relays 0.6.42
+### Micro-execution of the 56 relays 0.6.42
 
-O autoteste deixou de conferir apenas o layout emitido. Uma pagina executavel
-isolada recebe os mesmos 56 stubs e um thunk Win64 carrega/captura `RAX`,
-`R8..R11`, `RBX`, `RDI` e `RFLAGS`. Cada site e chamado com contagem 3, 5 e 8.
-O teste exige 3 sem clamp/telemetria e 5/8 reduzidos a 4 com exatamente um hit
-e o bit correspondente na mascara de 56 sites.
+The self-test no longer checks only the emitted layout. An isolated executable
+page receives the same 56 stubs and a Win64 thunk loads/captures `RAX`,
+`R8..R11`, `RBX`, `RDI` and `RFLAGS`. Each site is called with count 3, 5 and 8.
+The test requires 3 with no clamp/telemetry and 5/8 reduced to 4 with exactly
+one hit and the corresponding bit in the 56-site mask.
 
-Tambem sao comparados todos os registradores nao-destino, os bits aritmeticos
-de flags e o dword original em `state+0x245A0`. Assim, as quatro variantes de
-destino e todas as variantes de base usadas pelo executavel passam pela CPU,
-nao apenas por uma inspecao dos bytes. O thunk e as paginas existem somente
-durante `EDF5MP_SelfTest`; nenhum microteste roda na inicializacao normal do
-EDF5 e nenhuma politica runtime foi alterada.
+All non-destination registers, the arithmetic flag bits and the original dword
+at `state+0x245A0` are also compared. Thus, the four destination variants and
+all the base variants used by the executable go through the CPU, not just
+through a byte inspection. The thunk and the pages exist only during
+`EDF5MP_SelfTest`; no micro-test runs at normal EDF5 startup and no runtime
+policy was changed.
 
-### Separacao entre armazenamento fixo e colecoes dinamicas do resultado
+### Separation between fixed storage and dynamic result collections
 
-O corpo completo de `net::MissionResult::Exec_Begin` foi revisado novamente
-depois do clamp. Em `0x42FD93..0x42FDCD`, ele zera exatamente quatro qwords em
-`state+0x2457C`, `+0x24584`, `+0x2458C` e `+0x24594`. Isso nao e uma nova
-rejeicao de P4: sao os quatro acumuladores nativos `Item`, cuja faixa termina
-antes do contador de perfis locais em `+0x2459C`. O fold comprovado de P4-P7
-depende de manter esse armazenamento com quatro entradas.
+The complete body of `net::MissionResult::Exec_Begin` was reviewed again
+after the clamp. At `0x42FD93..0x42FDCD`, it zeroes exactly four qwords at
+`state+0x2457C`, `+0x24584`, `+0x2458C` and `+0x24594`. This is not a new
+rejection of P4: they are the four native `Item` accumulators, whose range ends
+before the local profile counter at `+0x2459C`. The proven fold of P4-P7
+depends on keeping this storage at four entries.
 
-Depois, os blocos em `0x430259` e `0x430356` percorrem duas colecoes de handles
-com limite calculado como `begin + count * 0x10`. Ambos comparam o cursor com
-esse fim dinamico e nao com o imediato 4. Portanto, `Exec_Begin` combina um
-array agregado fixo e colecoes dinamicas sem que isso imponha quatro
-participantes online. `validate_spawn_result_layout.py` agora fixa as tres
-assinaturas e falha fechado se qualquer um desses layouts mudar.
+Afterwards, the blocks at `0x430259` and `0x430356` walk two collections of
+handles with a limit computed as `begin + count * 0x10`. Both compare the
+cursor with that dynamic end and not with the immediate 4. Therefore,
+`Exec_Begin` combines a fixed aggregate array and dynamic collections without
+this imposing four online participants. `validate_spawn_result_layout.py` now
+pins the three signatures and fails closed if any of these layouts changes.
 
-### Censo decodificado de limites no pipeline de resultado
+### Decoded census of limits in the result pipeline
 
-O novo `result_pipeline_scanner.exe` decodifica 2.882 instrucoes nos 12 corpos
-comprovados de `Exec_Begin`, begin/poll da named sync, wrappers e implementacoes
-de `ResolveResult`/`ApplyResult`, `MissionSync_Res`, `NetGameStatus` e os dois
-callers de sync. Em vez de buscar bytes soltos, ele inventaria toda instrucao
-com imediato 3, 4 ou 15 e exige os 15 RVAs e encodings exatos conhecidos.
+The new `result_pipeline_scanner.exe` decodes 2,882 instructions in the 12
+proven bodies of `Exec_Begin`, named sync begin/poll, wrappers and
+implementations of `ResolveResult`/`ApplyResult`, `MissionSync_Res`,
+`NetGameStatus` and the two sync callers. Instead of searching loose bytes, it
+inventories every instruction with immediate 3, 4 or 15 and requires the 15
+known RVAs and exact encodings.
 
-Os onze usos do valor 4 se dividem em seis strides dinamicos de 16 bytes, um
-bit de estado, uma reserva inicial de vetor que cresce, um limite fixo dos
-quatro acumuladores `Item` e os dois filtros online ja ligados a `MaxPlayers`.
-O valor 3 e um shift de divisao do agregado e os tres valores 15 sao constantes
-da named sync. Nao existe `and 3`, `and 15` ou outro limite nao classificado
-nesses corpos. A suite falha se surgir, desaparecer ou mudar qualquer candidato.
+The eleven uses of the value 4 split into six dynamic 16-byte strides, one
+state bit, an initial vector reserve that grows, a fixed limit of the
+four `Item` accumulators and the two online filters already bound to
+`MaxPlayers`. The value 3 is a division shift of the aggregate and the three 15
+values are constants of the named sync. There is no `and 3`, `and 15` or other
+unclassified limit in those bodies. The suite fails if any candidate appears,
+disappears or changes.
 
-O corpo adicional confirmado na 0.6.43 e `0x42AC40..0x42AC55`. A tabela de
-registro o nomeia `int ResultSync_Begin(int)`; ele preserva `ECX`, chama
-`Exec_Begin` em `0x42AC48` e retorna o argumento. O unico outro call direto e
-`0x1153EE`, no despacho que fornece `-20000`. O scanner e a validacao de startup
-agora exigem exatamente esses dois callers. A telemetria de `Exec_Begin`
-distingue `mission_script_dispatch`, `result_sync_begin_wrapper` e
-`mod_recovery` por RVA sanitizado, sem ponteiro ou payload.
+The additional body confirmed in 0.6.43 is `0x42AC40..0x42AC55`. The
+registration table names it `int ResultSync_Begin(int)`; it preserves `ECX`,
+calls `Exec_Begin` at `0x42AC48` and returns the argument. The only other
+direct call is `0x1153EE`, in the dispatch that supplies `-20000`. The scanner
+and the startup validation now require exactly these two callers. The
+`Exec_Begin` telemetry distinguishes `mission_script_dispatch`,
+`result_sync_begin_wrapper` and `mod_recovery` by sanitized RVA, without
+pointer or payload.
 
-### Contexto local do banner de chat 0.6.47
+### Local context of the chat banner 0.6.47
 
-A rota local de `Chat_Room` em `0x3F16C0` preserva suas duas identidades em
-`RSI` e `R12` e as encaminha ao publicador comum no call `0x3F1863`. Dentro de
-`0x3F0B70`, a primeira resolucao ocorre em `0x3F0C94..0x3F0CA3` e a segunda em
-`0x3F0CB3..0x3F0CC2`; elas fornecem contexto de sala e remetente. A hipotese antiga
-de que a segunda identidade zero selecionava a sala publica estava errada e
-explica por que o banner pendente so era aceito depois de uma mensagem nativa.
+The local `Chat_Room` route at `0x3F16C0` preserves its two identities in
+`RSI` and `R12` and forwards them to the common publisher at call `0x3F1863`.
+Inside `0x3F0B70`, the first resolution occurs at `0x3F0C94..0x3F0CA3` and the
+second at `0x3F0CB3..0x3F0CC2`; they supply room and sender context. The old
+hypothesis that the second identity being zero selected the public room was
+wrong and explains why the pending banner was only accepted after a native
+message.
 
-O report `Reports\msg_bug.zip` invalidou a hipotese da 0.6.47. Foram 29
-tentativas `room_update_local_self` rejeitadas; a tentativa 30 so foi aceita
-por `native_chat_fallback` depois que o usuario digitou. Nesse caller natural,
-a primeira identidade nao correspondia a nenhum `UserImpl` registrado. Isso
-reclassifica os argumentos: o primeiro e a identidade da sala e o segundo e o
-remetente.
+The report `Reports\msg_bug.zip` invalidated the 0.6.47 hypothesis. There were
+29 rejected `room_update_local_self` attempts; attempt 30 was only accepted by
+`native_chat_fallback` after the user typed. In that natural caller, the first
+identity did not match any registered `UserImpl`. This reclassifies the
+arguments: the first is the room identity and the second is the sender.
 
-### Par sala/remetente do banner de chat 0.6.48
+### Room/sender pair of the chat banner 0.6.48
 
-A 0.6.48 passa o lobby ativo na primeira identidade e o SteamID local na
-segunda. O `UserImpl` local continua sendo conferido antes da chamada. O
-SelfTest recusa o antigo par local/local e exige dois qwords validos e distintos,
-respectivamente iguais ao lobby e ao remetente esperados. O caminho segue
-direto ao publicador: nao passa por `0x3F16C0` nem `0x44D940` e nao cria trafego
-Steam.
+0.6.48 passes the active lobby as the first identity and the local SteamID as
+the second. The local `UserImpl` is still checked before the call. The
+SelfTest rejects the old local/local pair and requires two valid, distinct
+qwords, equal respectively to the expected lobby and sender. The path goes
+directly to the publisher: it does not go through `0x3F16C0` or `0x44D940` and
+creates no Steam traffic.
 
-O mesmo report mostrou que o quarto argumento de `0x3F0B70` e o texto da
-mensagem, nao o nickname. A auditoria runtime antiga foi desativada para nao
-fingerprintar o que o usuario digitou. O novo `chat_identity_context` compara
-as duas identidades apenas em memoria e persiste flags booleanas, ordinais e
-indice de participante; SteamID, lobby ID bruto, nickname e mensagem nunca sao
-gravados.
+The same report showed that the fourth argument of `0x3F0B70` is the text of
+the message, not the nickname. The old runtime audit was disabled so as not to
+fingerprint what the user typed. The new `chat_identity_context` compares
+the two identities in memory only and persists boolean flags, ordinals and
+participant index; SteamID, raw lobby ID, nickname and message are never
+written.
 
-### Publicador local de mensagem de sistema 0.6.49
+### Local system-message publisher 0.6.49
 
-`Reports\no_msg_2.zip` invalidou tambem o par sala/remetente da 0.6.48: a
-tentativa `room_update_lobby_local` foi rejeitada imediatamente, antes de
-qualquer texto ser digitado. Esse resultado confirma que `0x3F0B70` nao deve
-ser usado para fabricar uma mensagem automatica de jogador, mesmo com as duas
-identidades naturais.
+`Reports\no_msg_2.zip` also invalidated the room/sender pair of 0.6.48: the
+`room_update_lobby_local` attempt was rejected immediately, before any text was
+typed. This result confirms that `0x3F0B70` must not be used to fabricate an
+automatic player message, even with the two natural identities.
 
-O caller em `0x41029C` fornece `Chat_Room` e texto diretamente a `0x3F09D0`.
-Esse corpo cria internamente um registro de tipo 1 e o insere na lista local;
-nao converge em `0x3F16C0`, `0x3F0B70` ou `0x44D940`. A assinatura validada e
+The caller at `0x41029C` supplies `Chat_Room` and text directly to `0x3F09D0`.
+That body internally creates a type 1 record and inserts it into the local
+list; it does not converge on `0x3F16C0`, `0x3F0B70` or `0x44D940`. The
+validated signature is
 `48 89 54 24 10 55 53 56 57 41 56 48 8B EC 48 83 EC 70 48 C7 45 C0 FE FF FF FF`.
 
-A 0.6.49 usa essa rota somente depois de validar a instancia capturada pela
-vtable `0xEBEDA8`. O SelfTest exige exatamente uma chamada com a mesma
-instancia e o banner estatico ao entrar e ao criar, nenhuma chamada enquanto a
-instancia esta ausente e nenhuma duplicacao. A publicacao nao depende mais de
-SteamID, `UserImpl`, estado do editor ou mensagem anterior. O evento registra
-somente o RVA, tipo 1, contadores e flags; texto, identidades e ponteiros
-continuam fora dos logs.
+0.6.49 uses this route only after validating the instance captured by the
+vtable `0xEBEDA8`. The SelfTest requires exactly one call with the same
+instance and the static banner on join and on create, no call while the
+instance is absent and no duplication. Publication no longer depends on
+SteamID, `UserImpl`, editor state or a previous message. The event logs only
+the RVA, type 1, counters and flags; text, identities and pointers remain out
+of the logs.
 
-### Formato visual do banner 0.6.50
+### Visual format of the banner 0.6.50
 
-O banner estatico passou a usar `***` antes e depois do nome e versao. Esses
-caracteres sao ASCII comuns e continuam dentro da mesma `wstring` entregue a
-`0x3F09D0`; nenhum campo, tipo, identidade ou caminho de publicacao mudou.
+The static banner now uses `***` before and after the name and version. These
+characters are plain ASCII and remain within the same `wstring` delivered to
+`0x3F09D0`; no field, type, identity or publication path changed.
 
-### Ownership real do receive parser 0.6.51
+### Real ownership of the receive parser 0.6.51
 
-A hipotese de que `manager+0xD0` continha `SharedProperty<UserImpl>` foi
-refutada pela desmontagem do registro `0x433BD0`. Ele aloca `0xA8` bytes e
-chama `0x435DA0`; a propriedade desse novo objeto e que entra no slot
-`route_index*0x10`. O construtor copia o control block do handle original para
-`route+0x58` em `0x435E37`. Como o layout do control block conserva o objeto
-em `+0x08`, o usuario pode ser recuperado sem guardar identidade ou endereco.
+The hypothesis that `manager+0xD0` held `SharedProperty<UserImpl>` was refuted
+by the disassembly of the registrar `0x433BD0`. It allocates `0xA8` bytes and
+calls `0x435DA0`; the property of that new object is what goes into slot
+`route_index*0x10`. The constructor copies the control block of the original
+handle to `route+0x58` at `0x435E37`. Since the control block layout keeps the
+object at `+0x08`, the user can be recovered without storing identity or
+address.
 
-O parser usado pelo pump tambem e um objeto separado. `0x4351F0` recebe o
-objeto de rota em RDX e o grava em `parser+0x498` em `0x4352F0`; o pump carrega
-o parser de `route+0x88` antes da chamada `0x4339DC`. A cadeia comprovada e:
+The parser used by the pump is also a separate object. `0x4351F0` receives the
+route object in RDX and stores it at `parser+0x498` at `0x4352F0`; the pump
+loads the parser from `route+0x88` before the call `0x4339DC`. The proven chain
+is:
 
 `parser+0x498 -> route+0x58 -> control+0x08 -> UserImpl`.
 
-O antigo calculo `receive_state-0x88` foi removido. A matriz de recepcao,
-lifecycle e escopo incoming agora usam a cadeia real. O SelfTest monta objetos
-de rota e parser artificiais com os mesmos offsets e exige resolucao de P4,
-alem de detectar rota ausente e identidade duplicada. O scanner independente
-confirma os construtores, stores de ownership, call do parser e exatamente um
-caller direto para cada construtor.
+The old `receive_state-0x88` computation was removed. The receive matrix,
+lifecycle and incoming scope now use the real chain. The SelfTest builds
+artificial route and parser objects with the same offsets and requires
+resolution of P4, besides detecting a missing route and a duplicate identity.
+The independent scanner confirms the constructors, ownership stores, parser
+call and exactly one direct caller for each constructor.
 
-O loop em `0x45C8E3` examina elementos de oito bytes enquanto o vetor de
-recepcao usa slots de `0x10`. Isso ainda nao prova um bug: o owner passado ao
-construtor de `UserImpl` pode ser outra classe com offsets coincidentes. A
-0.6.51 guarda temporariamente esse owner por usuario e, no lifecycle, registra
-somente o booleano `allocator_owner_matches_receive_manager`. Nenhum stride foi
-alterado antes dessa comparacao real.
+The loop at `0x45C8E3` examines eight-byte elements while the receive vector
+uses `0x10` slots. This does not yet prove a bug: the owner passed to the
+`UserImpl` constructor may be another class with coinciding offsets. 0.6.51
+temporarily keeps that owner per user and, in the lifecycle, logs only the
+boolean `allocator_owner_matches_receive_manager`. No stride was changed before
+this real comparison.
 
-### Update e Finally do resultado 0.6.51
+### Result Update and Finally 0.6.51
 
-O censo de calls encontrou somente dois callers diretos de `0x430C20`:
-`0x42AC9F`, no wrapper de script, e `0x12AA8D`, no consumidor nativo. O retorno
-em AL e consumido de forma diferente nesses caminhos, portanto o hook preserva
-o `bool` e registra o resultado sem atribuir semantica global.
+The call census found only two direct callers of `0x430C20`:
+`0x42AC9F`, in the script wrapper, and `0x12AA8D`, in the native consumer. The
+return in AL is consumed differently in these paths, so the hook preserves
+the `bool` and logs the result without assigning global semantics.
 
-`0x42F090` e `void` e tambem possui somente dois callers: `0x42AC28` e
-`0x12AAA9`. O hook preserva a ABI e mede a origem. O
-`result_pipeline_scanner` agora falha se qualquer caller aparecer, sumir ou se
-os wrappers mudarem. Esses pontos permitem separar um bloqueio anterior ao
-`Update`, dentro dele, antes do `Finally`, no sync nomeado, nas recompensas ou
-no retorno da UI.
+`0x42F090` is `void` and also has only two callers: `0x42AC28` and
+`0x12AAA9`. The hook preserves the ABI and measures the origin. The
+`result_pipeline_scanner` now fails if any caller appears, disappears or if
+the wrappers change. These points make it possible to separate a block before
+`Update`, inside it, before `Finally`, in the named sync, in the rewards or
+in the UI return.
 
-### Update, motivos do gate e metodo de spawn do GeneratorPoll 0.6.46
+### Update, gate reasons and spawn method of the GeneratorPoll 0.6.46
 
-O vptr do objeto `GeneratorPoll` usa a vtable `0xEA0E38`. A entrada
-`0xEA0ED8`, exatamente `+0xA0`, aponta para `0x1F8B40`; esse update chama o
-corpo base `0x2DA720` em `0x1F8B5B` antes de qualquer trabalho especifico. O
-corpo base termina em `0x2DA9F4` com tail-jump para `0x2DC7C0`, depois de montar
-`RCX=owner+0x400` e `RDX=owner`. A entrada `0xEA0F40`, `+0x108`, aponta para
-`0x1F90A0`; a chamada indireta do gate em `0x2DC82C` entra nesse metodo e o
-`test al,al` seguinte consome seu retorno. O metodo preserva `RCX` como self,
-`RDX` como descritor, consulta `self+0x788` e chama o boundary comum em
-`0x1F9120` quando essa dependencia existe.
+The vptr of the `GeneratorPoll` object uses vtable `0xEA0E38`. Entry
+`0xEA0ED8`, exactly `+0xA0`, points to `0x1F8B40`; that update calls the base
+body `0x2DA720` at `0x1F8B5B` before any specific work. The base body ends at
+`0x2DA9F4` with a tail-jump to `0x2DC7C0`, after setting up
+`RCX=owner+0x400` and `RDX=owner`. Entry `0xEA0F40`, `+0x108`, points to
+`0x1F90A0`; the gate's indirect call at `0x2DC82C` enters that method and the
+following `test al,al` consumes its return. The method preserves `RCX` as self,
+`RDX` as descriptor, queries `self+0x788` and calls the common boundary at
+`0x1F9120` when that dependency exists.
 
-`GeneratorPollUpdateHook` encaminha os dois argumentos sem inspecionar o
-contexto de frame e correlaciona quantos updates chegaram ao metodo de spawn.
-`GeneratorPollGateHook` preserva a ABI `void(owner+0x400, owner)`, filtra a
-vtable concreta e classifica o desvio exato: cooldown ainda `>=0x1CC` depois
-do decremento, quota `+0x00<=0` dentro da janela, metodo retornando AL zero ou
-spawn aceito. O evento amostrado `generator_poll_gate_path` registra somente
-contadores, escalares pre/pos e bit-patterns dos floats `+0x08`, `+0x1F8` e
-`+0x1FC`; nenhum endereco e persistido.
+`GeneratorPollUpdateHook` forwards both arguments without inspecting the frame
+context and correlates how many updates reached the spawn method.
+`GeneratorPollGateHook` preserves the ABI `void(owner+0x400, owner)`, filters
+the concrete vtable and classifies the exact branch: cooldown still `>=0x1CC`
+after the decrement, quota `+0x00<=0` within the window, method returning zero
+AL or spawn accepted. The sampled event `generator_poll_gate_path` logs only
+counters, pre/post scalars and bit-patterns of the floats `+0x08`, `+0x1F8` and
+`+0x1FC`; no address is persisted.
 
-O evento `generator_poll_update_path`, o summary e os breadcrumbs anteriores
-aos originais distinguem update ausente, crash dentro do update e cada motivo
-do gate. `GeneratorPollSpawnHook` mantem o `RAX` nativo integral e apenas agrega:
-chamadas, legibilidade/presenca de `+0x788`, metodos que chegaram ao boundary,
-numero de calls comuns e retorno AL verdadeiro/falso. O evento amostrado
-`generator_poll_spawn_path` e o `enemy_spawn_summary` declaram explicitamente
-que nenhum ponteiro, descritor ou payload foi guardado. O validador offline
-fixa os dois slots da vtable, os tres prologos, call base, tail-jump, gate,
-boundary e retorno antes da instalacao dos hooks.
+The event `generator_poll_update_path`, the summary and the breadcrumbs before
+the originals distinguish a missing update, a crash inside the update and each
+gate reason. `GeneratorPollSpawnHook` keeps the native `RAX` whole and only
+aggregates: calls, readability/presence of `+0x788`, methods that reached the
+boundary, number of common calls and true/false AL return. The sampled event
+`generator_poll_spawn_path` and the `enemy_spawn_summary` explicitly declare
+that no pointer, descriptor or payload was stored. The offline validator pins
+the two vtable slots, the three prologues, base call, tail-jump, gate,
+boundary and return before the hooks are installed.
 
-### Origem da escala 0.6.38
+### Origin of the scale 0.6.38
 
-A desmontagem do configurador comum `0x3AC5F0` separou os dois mecanismos. Em
-`0x3AD3DE` o subobjeto de spawn recebe o default fail-closed `0/1`. Somente se
-o quarto registro aninhado de configuracao existir, o bloco
-`0x3AD3EF..0x3AD52F` copia os inteiros do registro para
-`owner+0x290/+0x294`. A fonte em `+0x2B0` e montada a partir da mesma
-configuracao, mas por um campo independente.
+The disassembly of the common configurator `0x3AC5F0` separated the two
+mechanisms. At `0x3AD3DE` the spawn subobject receives the fail-closed default
+`0/1`. Only if the fourth nested configuration record exists, the block
+`0x3AD3EF..0x3AD52F` copies the record's integers to
+`owner+0x290/+0x294`. The source at `+0x2B0` is built from the same
+configuration, but through an independent field.
 
-Logo, zero e um valor nativo possivel antes da configuracao e nao deve ser
-atribuido automaticamente ao indice do quinto jogador. O reparo atual continua
-experimental e estritamente temporario: ele so pode atuar no boundary comum,
-com caller confirmado, pedido positivo, fonte presente, denominador plausivel
-e 5..MaxPlayers; o valor original e registrado e restaurado depois da chamada.
-O proximo report real dira se o boundary sequer foi alcancado e, se foi, qual
-par de escala chegou nele. O multiplicador permanece apenas infraestrutura
-opcional. `ExperimentalEnemySpawnMultiplier=false` e um segundo gate alem do
-valor `EnemySpawnMultiplier=1`; assim, mudar apenas a intensidade nao altera o
-MultiSlot em desenvolvimento.
+Therefore, zero is a possible native value before configuration and must not be
+automatically attributed to the fifth player's index. The current repair
+remains experimental and strictly temporary: it can only act at the common
+boundary, with a confirmed caller, positive request, present source, plausible
+denominator and 5..MaxPlayers; the original value is logged and restored after
+the call. The next real report will say whether the boundary was even reached
+and, if so, which scale pair arrived at it. The multiplier remains only
+optional infrastructure. `ExperimentalEnemySpawnMultiplier=false` is a second
+gate besides the value `EnemySpawnMultiplier=1`; thus, changing only the
+intensity does not alter the MultiSlot under development.
 
-O validador offline agora fixa os tres blocos de configuracao, a tabela de
-timer separada e os 24 callers. `tools/find_member_accesses.py` tambem permite
-enumerar acessos decodificados a offsets de membros sem carregar o executavel.
+The offline validator now pins the three configuration blocks, the separate
+timer table and the 24 callers. `tools/find_member_accesses.py` also makes it
+possible to enumerate decoded accesses to member offsets without loading the
+executable.
 
-Os 24 callers formam tres familias de ABI, todas com `RCX=owner`,
-`RDX=descriptor` e `R8D=requested_count` no boundary comum:
+The 24 callers form three ABI families, all with `RCX=owner`,
+`RDX=descriptor` and `R8D=requested_count` at the common boundary:
 
-- onze caminhos de simulacao consultam o descritor com `0x3BCB00` e entregam
-  uma ou duas parcelas inteiras do pedido;
-- onze caminhos espelhados/serializados validam a leitura com `0x3BE480` e,
-  quando necessario, materializam o descritor com `0x405A40` antes do call;
-- os dois caminhos especiais `0x243CAD` e `0x245F8F` somam tres parcelas e
-  aplicam primeiro um limite local de 50; o limite comum de 400 continua sendo
-  aplicado depois.
+- eleven simulation paths query the descriptor with `0x3BCB00` and deliver
+  one or two integer parts of the request;
+- eleven mirrored/serialized paths validate the read with `0x3BE480` and,
+  when necessary, materialize the descriptor with `0x405A40` before the call;
+- the two special paths `0x243CAD` and `0x245F8F` sum three parts and
+  first apply a local limit of 50; the common limit of 400 is still
+  applied afterwards.
 
-Nos caminhos espelhados, falha do helper pula o spawn. Nos especiais, pedido
-zero tambem pula o call. Os demais chegam ao boundary, que ainda rejeita fonte
-nula e resultado escalado zero. Nao apareceu indexacao de participante na
-montagem de `R8D`; a unica indexacao `participant_count-1` comprovada no
-`GeneratorPoll` ocorre depois do call no fluxo de update e alimenta o timer.
+On the mirrored paths, a helper failure skips the spawn. On the special ones, a
+zero request also skips the call. The rest reach the boundary, which still
+rejects a null source and a zero scaled result. No participant indexing
+appeared in the assembly of `R8D`; the only proven `participant_count-1`
+indexing in `GeneratorPoll` occurs after the call in the update flow and feeds
+the timer.
 
-### Reset por geração 0.6.37
+### Reset by generation 0.6.37
 
-O replay dos reports reais 0.6.31 posiciona o bloqueio depois de
-`mission_result_apply(1)` e no primeiro `Sync_MissionResult(script, 0/0)`, com
-`Exec_Begin=0` em host e clientes. O hook atual arma a recuperação dentro desse
-begin, antes do poll repetido observado até 30 segundos.
+The replay of the real 0.6.31 reports places the block after
+`mission_result_apply(1)` and at the first `Sync_MissionResult(script, 0/0)`,
+with `Exec_Begin=0` on host and clients. The current hook arms the recovery
+inside that begin, before the repeated poll observed for up to 30 seconds.
 
-Uma nova fase na mesma sala agora chama
-`ResetMissionResultExecRecoveryState` sob o lock exclusivo. A operação descarta
-fila, tick e geração anteriores e zera call/attempt/cancel como um único estado
-de geração. O SelfTest injeta uma fila da geração 4, força o gap normal de fase
-e exige geração 5 com todos os campos zerados. O analisador aceita o novo evento
-sanitizado `mission_result_exec_recovery_generation_reset` somente quando
-`stale_pending_discarded` e `queue_cleared` são verdadeiros.
+A new phase in the same room now calls
+`ResetMissionResultExecRecoveryState` under the exclusive lock. The operation
+discards the previous queue, tick and generation and zeroes call/attempt/cancel
+as a single generation state. The SelfTest injects a queue from generation 4,
+forces the normal phase gap and requires generation 5 with all fields zeroed.
+The analyzer accepts the new sanitized event
+`mission_result_exec_recovery_generation_reset` only when
+`stale_pending_discarded` and `queue_cleared` are true.
 
-### Cancelamento nativo sequencial 0.6.36
+### Sequential native cancellation 0.6.36
 
-O estado lógico da fila de recuperação (`pending`, tick e geração) agora é
-limpo por uma única rotina chamada somente sob
-`g_mission_result_exec_recovery_lock`. O SelfTest runtime enfileira a
-recuperação, chama o wrapper nativo antes do grace period e exige cancelamento
-único, uma chamada original aceita, zero tentativas de fallback e os três
-campos zerados. Em seguida confirma que o mesmo sync não pode reenfileirar e
-que um poll posterior não duplica `Exec_Begin`.
+The logical state of the recovery queue (`pending`, tick and generation) is now
+cleared by a single routine called only under
+`g_mission_result_exec_recovery_lock`. The runtime SelfTest enqueues the
+recovery, calls the native wrapper before the grace period and requires a
+single cancellation, one accepted original call, zero fallback attempts and the
+three fields zeroed. It then confirms that the same sync cannot re-enqueue and
+that a later poll does not duplicate `Exec_Begin`.
 
-`analyze_player_controls.py` modela agora `Exec_Begin` e a recuperação com
-registros nomeados que preservam ordem e geração. O fixture positivo exige
-`queued -> cancelled -> Exec_Begin` com argumento preservado e sem fallback;
-o negativo contém cancelamento seguido por duas chamadas e `applied`, e só
-passa na suíte quando o analisador rejeita ambas as duplicações.
+`analyze_player_controls.py` now models `Exec_Begin` and the recovery with named
+records that preserve order and generation. The positive fixture requires
+`queued -> cancelled -> Exec_Begin` with the argument preserved and no fallback;
+the negative one contains a cancellation followed by two calls and `applied`,
+and only passes in the suite when the analyzer rejects both duplications.
 
-### SelfTest runtime 0.6.35
+### Runtime SelfTest 0.6.35
 
-O wrapper de ABI agora apenas resolve o return address e delega ao mesmo
-`DispatchEnemySpawn` usado pelo SelfTest. Com participante 5, caller confirmado,
-pedido 10, multiplicador 2, escala `0/4` e fonte valida, a funcao original falsa
-precisa receber 20 enquanto observa numerador 4. Ao retornar, o owner precisa
-conter zero novamente e os agregados precisam registrar um call, um reparo e
-nenhuma falha.
+The ABI wrapper now only resolves the return address and delegates to the same
+`DispatchEnemySpawn` used by the SelfTest. With participant 5, confirmed
+caller, request 10, multiplier 2, scale `0/4` and valid source, the fake
+original function must receive 20 while observing numerator 4. On return, the
+owner must contain zero again and the aggregates must record one call, one
+repair and no failure.
 
-`RestoreEnemySpawnScale` e testado separadamente com valor concorrente 7. O CAS
-espera 4, falha sem escrever e preserva 7, cobrindo a regra que impede o mod de
-apagar mudancas nativas ou de outro hook.
+`RestoreEnemySpawnScale` is tested separately with concurrent value 7. The CAS
+expects 4, fails without writing and preserves 7, covering the rule that
+prevents the mod from erasing native changes or those of another hook.
 
-## Auditoria real de cinco jogadores e telemetria 0.6.53
+## Real five-player audit and telemetry 0.6.53
 
-Os cinco reports da 0.6.52 completaram duas fases sem crash e fecharam a
-propriedade local P0-P4 exatamente uma vez entre server e quatro clientes. O
-fan-out de cada processo continha quatro rotas unicas e a mascara total de
-destinos era sempre `0x1f` menos o bit local. A 0.6.53 usa essa propriedade
-local como fallback somente quando ha um unico bit; owner ausente deixa de
-transformar um fan-out correto em warning sem aceitar casos ambiguos.
+The five reports from 0.6.52 completed two stages without a crash and closed
+the local ownership P0-P4 exactly once across the server and four clients. The
+fan-out of each process contained four unique routes and the total destination
+mask was always `0x1f` minus the local bit. 0.6.53 uses this local ownership as
+a fallback only when there is a single bit; a missing owner no longer turns a
+correct fan-out into a warning without accepting ambiguous cases.
 
-O vetor de recepcao real e remoto e prealocado: slots vazios e a ausencia do
-participante local sao normais. A auditoria passa a comparar com
-`participant_mask & ~local_mask`, separa empty de unresolved e nao exige
-`runtime_user_count == route_count`. A cadeia do parser permanece valida, mas
-seu lifetime nao alcancou o dispatcher; atribuicao incoming por participante
-continua um gate aberto.
+The real receive vector is remote and preallocated: empty slots and the absence
+of the local participant are normal. The audit now compares with
+`participant_mask & ~local_mask`, separates empty from unresolved and does not
+require `runtime_user_count == route_count`. The parser chain remains valid,
+but its lifetime did not reach the dispatcher; per-participant incoming
+attribution remains an open gate.
 
-`ApplyResult 0x3E3160` chama `0x199D50` antes de decidir seu retorno auxiliar.
-Nos dez eventos reais o retorno foi false, embora Items `0x1f`, sync, reward e
-retorno estivessem completos. O contador e o analisador agora medem
-`call_completed`; o valor nativo e preservado apenas como dado semantico. Os
-warnings do primeiro GeneratorPoll update e de checkpoints de resultado que
-depois concluiram tambem foram reclassificados.
+`ApplyResult 0x3E3160` calls `0x199D50` before deciding its auxiliary return.
+In the ten real events the return was false, although Items `0x1f`, sync,
+reward and return were complete. The counter and the analyzer now measure
+`call_completed`; the native value is preserved only as semantic data. The
+warnings of the first GeneratorPoll update and of result checkpoints that later
+concluded were also reclassified.
 
-Evidencia completa:
-[`docs/technical-research/09-TESTE-REAL-5-JOGADORES-2026-08-31.md`](docs/technical-research/09-TESTE-REAL-5-JOGADORES-2026-08-31.md).
+Full evidence:
+[`docs/technical-research/09-FIVE-PLAYER-LIVE-TEST-2026-08-31.md`](docs/technical-research/09-FIVE-PLAYER-LIVE-TEST-2026-08-31.md).
