@@ -10,6 +10,8 @@
 #include "mission_result_recovery.h"
 #include "mission_spawn.h"
 #include "mod_info.h"
+#include "stats_overlay.h"
+#include "ultrawide.h"
 #include "steam_interfaces.h"
 #include "win32_handle.h"
 
@@ -245,6 +247,16 @@ constexpr uintptr_t kUiLayoutDestructorRva = 0x4aab40;
 constexpr uintptr_t kPlayersGroupCastCallRva = 0x56580a;
 constexpr uintptr_t kPlayersGroupCastReturnRva = 0x565817;
 constexpr uintptr_t kHUiRoomUpdateRva = 0x5617f0;
+// HUiTitle vtable 0xED53A8 slot 1, the title screen's per-frame update (same
+// slot and (this, context) ABI as HUiRoom::Update). Only its call is observed,
+// to show the mod name/version watermark while the title screen is up.
+constexpr uintptr_t kHUiTitleUpdateRva = 0x547490;
+constexpr uint8_t kHUiTitleUpdateSignature[] = {
+    0x48, 0x89, 0x5c, 0x24, 0x18, 0x55, 0x48, 0x83, 0xec, 0x20,
+    0x48, 0x8b, 0xda, 0x48, 0x8b, 0xe9, 0xe8,
+};
+// The title counts as shown while its update ran this recently.
+constexpr uint64_t kTitleScreenActiveMs = 500;
 // MSVC's native __report_gsfailure routine. The /GS verifier tail-jumps here
 // only after a cookie mismatch, and this routine terminates with int 29h and
 // FAST_FAIL_STACK_COOKIE_CHECK_FAILURE (2). Hooking this failure-only path
@@ -2080,6 +2092,8 @@ UiLayoutCastFn g_ui_layout_cast = nullptr;
 UiLayoutClampFn g_ui_layout_clamp = nullptr;
 UiLayoutDestructorFn g_ui_layout_destructor = nullptr;
 HUiRoomUpdateFn g_hui_room_update = nullptr;
+HUiRoomUpdateFn g_hui_title_update = nullptr;
+std::atomic<uint64_t> g_title_update_tick{0};
 MissionStartUpdateFn g_mission_start_update = nullptr;
 MissionStartControllerFn g_mission_start_controller = nullptr;
 MissionStartControllerContextFn g_mission_start_controller_context = nullptr;
@@ -6322,6 +6336,7 @@ void ArmMissionResultRecovery(uintptr_t caller_rva, uint64_t now,
 }
 
 void DamageMeterOnResult(int32_t result);
+void DamageMeterOnMissionUpdate(uint64_t now);
 
 void __fastcall MissionResultApplyHook(void* ui, int32_t result) {
 #if defined(__clang__) || defined(__GNUC__)
@@ -7263,6 +7278,7 @@ int __fastcall MissionUpdateHook() {
     void* manager = CurrentMissionManager();
     void* ui = CurrentMissionUi(manager);
     ObserveMissionUpdate(now, ReadMissionUiState(ui));
+    DamageMeterOnMissionUpdate(now);
     const bool injected = ApplyPendingDebugStageWin(now);
     EDF5_DIAGNOSTIC_PHASE(diagnostics_scope, "call_original", now,
                             g_mission_generation.load(std::memory_order_acquire));
@@ -7315,8 +7331,20 @@ void QueueWheelDetents(int detents) {
     }
 }
 
+// Stats overlay key presses seen by the game window (first press only, Alt
+// up). The hotkey thread consumes them; window messages catch taps shorter
+// than its 40 ms poll.
+std::atomic<unsigned> g_stats_overlay_key_messages{0};
+
 LRESULT CALLBACK GameWindowProc(HWND window, UINT message, WPARAM wparam,
                                 LPARAM lparam) {
+    if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
+        !(lparam & (LPARAM{1} << 30)) &&
+        capture::GetConfig().stats_overlay_enabled &&
+        wparam == capture::GetConfig().stats_overlay_hotkey_vk &&
+        (GetKeyState(VK_MENU) & 0x8000) == 0) {
+        g_stats_overlay_key_messages.fetch_add(1, std::memory_order_acq_rel);
+    }
     // HUiRoom::Update keeps the roster "active" while room sub-menus such as
     // weapon selection are open, so the wheel must still reach the game:
     // swallowing it here (pre-0.6.72) froze every native list in the room.
@@ -10288,7 +10316,18 @@ uint32_t MissionPlayerControlAuditBit(int context,
 // WeaponBase, cached per projectile class. Damage is credited only to the
 // soldier objects created for P0-P7 by 0x11CE60; health loss is measured
 // around the native call, so overkill, invulnerability and multipliers are
-// already applied. The host prints the summary to its room chat locally.
+// already applied.
+//
+// Ownership (0.6.80): the NetworkObject message pre-filter (object+0xC0,
+// 0x402C00, reached through vtable slot 7 0x2DAC10) keeps a 0x80000000 damage
+// message local while its attacker weak_ptr is alive, so every machine applies
+// the hits of its own soldiers through ApplyDamage. Damage that arrives from
+// the network (0x4000001, unwrapped by the same filter) has no live attacker,
+// which is why the host alone credited remote players only a few hits in the
+// 0.6.77 live test. Each machine therefore owns the totals of its locally
+// controlled participants, publishes them in its Steam lobby member data at
+// mission end and merges the other members' totals before printing the
+// summary to its own room chat.
 // ---------------------------------------------------------------------------
 constexpr uintptr_t kObjectApplyDamageRva = 0x2db370;
 constexpr uint8_t kObjectApplyDamageSignature[] = {
@@ -10356,7 +10395,84 @@ constexpr char kWeaponBaseTypeName[] = ".?AVWeaponBase@@";
 constexpr char kSoldierBaseTypeName[] = ".?AVSoldierBase@@";
 constexpr size_t kRttiTypeDescriptorNameOffset = 0x10;
 constexpr size_t kDamageMeterWeaponSlots = 8;
+constexpr size_t kDamageMeterRecentSlots = 16;
+// Recent DPS window of the stats overlay, in whole seconds.
+constexpr uint64_t kDamageMeterRecentWindowSeconds = 10;
+constexpr uint64_t kDamageMeterUpdateGapMs = 1000;
+// The overlay treats the mission as running only while Mission() updates.
+constexpr uint64_t kDamageMeterInMissionTimeoutMs = 1500;
 constexpr size_t kDamageMeterLabelLength = 20;
+// Teams read by ApplyDamage's friendly-fire check: attacker team
+// GameDamageInfo+0x24 (movsxd rax,[rsi+0x24] at 0x2DB408) against the target
+// object's team +0x218 (movsxd rcx,[rdi+0x218] at 0x2DB411); -1 = none.
+constexpr uintptr_t kApplyDamageAttackerTeamReadRva = 0x2db408;
+constexpr uint8_t kApplyDamageAttackerTeamReadSignature[] = {
+    0x48, 0x63, 0x46, 0x24,
+};
+constexpr uintptr_t kApplyDamageTargetTeamReadRva = 0x2db411;
+constexpr uint8_t kApplyDamageTargetTeamReadSignature[] = {
+    0x48, 0x63, 0x8f, 0x18, 0x02, 0x00, 0x00,
+};
+constexpr size_t kGameDamageInfoTeamOffset = 0x24;
+constexpr size_t kGameObjectTeamOffset = 0x218;
+// ApplyDamage's friendly test (0x2DB41D..0x2DB431): with both teams valid,
+// relation = *(int*)(*(*(G + 0x38) + attacker * 0x38 + 0x18) + target * 4),
+// G = the global at the rip-relative load in 0x2DB421; 1 = friendly. Any
+// other value or a missing team (-1) is not friendly, as in the game.
+constexpr uintptr_t kTeamRelationLookupRva = 0x2db41d;
+constexpr uint8_t kTeamRelationLookupSignature[] = {
+    0x48, 0x6b, 0xd0, 0x38,                    // imul rdx,rax,0x38
+    0x48, 0x8b, 0x05,                          // mov rax,[rip+rel32]
+};
+constexpr uintptr_t kTeamRelationLookupTailRva = 0x2db428;
+constexpr uint8_t kTeamRelationLookupTailSignature[] = {
+    0x48, 0x8b, 0x40, 0x38,                    // mov rax,[rax+0x38]
+    0x48, 0x8b, 0x44, 0x02, 0x18,              // mov rax,[rdx+rax+0x18]
+    0x83, 0x3c, 0x88, 0x01,                    // cmp dword [rax+rcx*4],1
+};
+constexpr uintptr_t kTeamRelationGlobalLoadRva = 0x2db421;
+constexpr size_t kTeamRelationTableOffset = 0x38;
+constexpr size_t kTeamRelationRowStride = 0x38;
+constexpr size_t kTeamRelationRowValuesOffset = 0x18;
+constexpr int32_t kTeamRelationMaxTeams = 64;
+// World position: GameObjectBase keeps a world matrix at +0x70 whose
+// translation row is +0xA0 (x, y up, z, w). A census of the executable's
+// position subtractions (movaps [a+D] / subps [b+D]) ranks +0xA0 first among
+// object registers in the GameObject and soldier code (0.6.80).
+constexpr size_t kGameObjectPositionOffset = 0xa0;
+// Steps outside this range between two Mission() updates are not walking:
+// spawning, teleports and part changes, or sub-millimetre jitter.
+constexpr double kDistanceMaxStep = 30.0;
+constexpr double kDistanceMinStep = 0.001;
+// Hostile enumerator used by the radar (HUiHudRader slot 2, 0x4CDADE) and
+// nine other callers: (G, team, functor) locks G+8 (critical section), then
+// for every team whose relation to `team` is 2 (hostile) walks that team's
+// object set (std::set node value +0x20) and calls functor->vtable[1](object)
+// for each object with health > 0 and no flag 0x80 at +0x280: the red radar
+// dots. G is the team relation global (g_team_relation_global).
+constexpr uintptr_t kHostileEnumeratorRva = 0x32c7d0;
+constexpr uint8_t kHostileEnumeratorSignature[] = {
+    0x48, 0x8b, 0xc4, 0x48, 0x89, 0x48, 0x08, 0x55, 0x56, 0x57,
+    0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83,
+    0xec, 0x40,
+};
+constexpr uintptr_t kHostileEnumeratorRelationRva = 0x32c840;
+constexpr uint8_t kHostileEnumeratorRelationSignature[] = {
+    0x4a, 0x8b, 0x44, 0x2e, 0x18,              // mov rax,[rsi+r13+0x18]
+    0x41, 0x83, 0x3c, 0x07, 0x02,              // cmp dword [r15+rax],2
+};
+constexpr uintptr_t kHostileEnumeratorVisitRva = 0x32c870;
+constexpr uint8_t kHostileEnumeratorVisitSignature[] = {
+    0x48, 0x8b, 0x53, 0x20,                    // mov rdx,[rbx+0x20]
+    0x0f, 0x2f, 0xb2, 0xfc, 0x01, 0x00, 0x00,  // comiss xmm6,[rdx+0x1fc]
+    0x73, 0x12,
+    0xf6, 0x82, 0x80, 0x02, 0x00, 0x00, 0x80,  // test byte [rdx+0x280],0x80
+    0x75, 0x09,
+    0x49, 0x8b, 0x06, 0x49, 0x8b, 0xce,        // mov rax,[r14]; mov rcx,r14
+    0xff, 0x50, 0x08,                          // call [rax+8]
+};
+constexpr uint64_t kHostileCountIntervalMs = 250;
+constexpr uint64_t kHostileCountStaleMs = 2000;
 constexpr size_t kDamageMeterVtableCacheSize = 256;
 constexpr size_t kProjectileWeaponLinkCacheSize = 128;
 // Chat_Room vtable slot 1 (0x3F16C0) sends a player message over the room
@@ -10376,7 +10492,27 @@ ObjectApplyDamageFn g_object_apply_damage = nullptr;
 DamageListFlushFn g_damage_list_flush = nullptr;
 ChatRoomSendFn g_chat_room_send = nullptr;
 std::atomic<bool> g_damage_meter_installed{false};
+// Both team reads matched, so kills can tell hostile targets apart.
+std::atomic<bool> g_damage_meter_kills_supported{false};
+// The radar's hostile enumerator (null when it did not verify) and the last
+// count of living hostile objects for the local soldier's team.
+using HostileEnumeratorFn = void(__fastcall*)(void*, int32_t, void*);
+HostileEnumeratorFn g_hostile_enumerator = nullptr;
+std::atomic<int32_t> g_hostile_count{-1};
+std::atomic<uint64_t> g_hostile_count_tick{0};
+std::atomic<bool> g_position_first_logged{false};
+// Address of the team relation global (0 when the lookup did not verify).
+std::atomic<uintptr_t> g_team_relation_global{0};
+std::atomic<unsigned> g_kill_candidate_logs{0};
+// Offline self-test clock (milliseconds); 0 = GetTickCount64.
+std::atomic<uint64_t> g_damage_meter_test_now{0};
 thread_local const uint8_t* g_damage_meter_projectile = nullptr;
+
+uint64_t DamageMeterNow() {
+    const uint64_t test_now =
+        g_damage_meter_test_now.load(std::memory_order_acquire);
+    return test_now ? test_now : GetTickCount64();
+}
 
 struct RttiCompleteObjectLocator {
     uint32_t signature;
@@ -10430,6 +10566,9 @@ struct DamageMeterParticipant {
     uintptr_t soldier_alt = 0;
     // UserImpl identity (vtable slot 10), used for the Steam persona name.
     uint64_t steam_id = 0;
+    // Controlled on this machine. Only the controlling machine applies this
+    // participant's hits with a live attacker, so only its total is complete.
+    bool local = false;
     double damage = 0.0;
     uint32_t hits = 0;
     uint32_t projectile_hits = 0;  // flushed by this machine's projectiles
@@ -10443,6 +10582,21 @@ struct DamageMeterParticipant {
     double received_amount = 0.0;
     uint32_t zero_loss_hits = 0;
     double unattributed = 0.0;
+    // Hostile objects whose health this participant's hit brought to zero.
+    uint32_t kills = 0;
+    // Friendly fire on the other players: health removed and players whose
+    // health this participant's hit brought to zero (allied NPCs excluded).
+    double friendly_damage = 0.0;
+    uint32_t friendly_hits = 0;
+    uint32_t friendly_kills = 0;
+    // Distance moved since the stage began, in metres.
+    double distance = 0.0;
+    std::array<float, 3> last_position{};
+    bool position_known = false;
+    // Damage per wall-clock second (ring indexed by second % size), for the
+    // overlay's recent DPS.
+    std::array<double, kDamageMeterRecentSlots> recent_damage{};
+    std::array<uint64_t, kDamageMeterRecentSlots> recent_second{};
     std::array<DamageMeterWeapon, kDamageMeterWeaponSlots> weapons{};
     size_t weapon_count = 0;
     std::array<wchar_t, kPlayerInfoDisplayNameCopyLength> name{};
@@ -10468,6 +10622,10 @@ struct DamageMeterState {
         other_attackers{};
     uint64_t start_tick = 0;
     uint64_t end_tick = 0;
+    // Mission() script time since the measurement began; gaps longer than
+    // kDamageMeterUpdateGapMs (pause, loading) count only that much.
+    uint64_t active_ms = 0;
+    uint64_t last_update_tick = 0;
     bool active = false;
     bool ended = false;
     bool transition_pending = false;
@@ -10487,6 +10645,17 @@ std::array<ProjectileWeaponLink, kProjectileWeaponLinkCacheSize>
     g_projectile_weapon_links{};
 std::atomic<bool> g_damage_meter_publish_pending{false};
 std::atomic<unsigned> g_damage_meter_publish_count{0};
+// Lobby member data shared at mission end: "1;<index>:<steam id>:<damage>
+// :<hits>[;...]" for each participant controlled by the publishing machine.
+// Cleared when a new measurement starts so a previous mission is never read.
+constexpr char kDamageShareKey[] = "edf5mp_dmg";
+constexpr char kDamageShareFormat[] = "1";
+constexpr size_t kDamageSharePayloadLimit = 1024;
+// Room updates wait at most this long for the other members' totals.
+constexpr uint64_t kDamageShareWaitMs = 10000;
+constexpr uint64_t kDamageSharePollMs = 250;
+std::atomic<uint64_t> g_damage_share_room_tick{0};
+std::atomic<uint64_t> g_damage_share_poll_tick{0};
 std::atomic<unsigned> g_chat_room_send_logs{0};
 // Offline self-test: classify objects without image RTTI.
 using DamageMeterClassifierFn = DamageMeterClassKind (*)(uintptr_t object);
@@ -10806,11 +10975,217 @@ uint64_t DamageMeterUserSteamId(void* user) {
     return reinterpret_cast<UserIdGetterFn>(vtable[10])(user);
 }
 
+uint32_t DamageMeterRegisteredMask(const DamageMeterState& s) {
+    uint32_t mask = 0;
+    for (size_t index = 0; index < s.players.size(); ++index) {
+        if (s.players[index].soldier) mask |= uint32_t{1} << index;
+    }
+    return mask;
+}
+
+uint32_t DamageMeterLocalMask(const DamageMeterState& s) {
+    uint32_t mask = 0;
+    for (size_t index = 0; index < s.players.size(); ++index) {
+        if (s.players[index].soldier && s.players[index].local) {
+            mask |= uint32_t{1} << index;
+        }
+    }
+    return mask;
+}
+
+uint32_t CountBits(uint32_t value) {
+    uint32_t count = 0;
+    for (; value; value &= value - 1) ++count;
+    return count;
+}
+
+// Totals this machine can vouch for: its locally controlled participants.
+std::string BuildDamageSharePayload(const DamageMeterState& s) {
+    std::string payload = kDamageShareFormat;
+    for (size_t index = 0; index < s.players.size(); ++index) {
+        const auto& player = s.players[index];
+        if (!player.soldier || !player.local) continue;
+        const double damage = player.damage > 0.0 && std::isfinite(player.damage)
+            ? player.damage : 0.0;
+        payload += ";" + std::to_string(index) + ":" +
+            std::to_string(player.steam_id) + ":" +
+            std::to_string(static_cast<uint64_t>(std::llround(damage))) + ":" +
+            std::to_string(player.hits);
+    }
+    return payload;
+}
+
+// Damage totals known for the summary: local participants measured here plus
+// the participants other lobby members published for themselves.
+struct DamageShareView {
+    std::array<double, kMaximumMissionParticipants> damage{};
+    std::array<uint32_t, kMaximumMissionParticipants> hits{};
+    uint32_t known_mask = 0;
+    uint32_t remote_mask = 0;
+    uint32_t conflict_mask = 0;
+    // Remote participants whose member is no longer in the lobby.
+    uint32_t departed_mask = 0;
+    uint32_t members_read = 0;
+    uint32_t payloads_accepted = 0;
+    uint32_t payloads_rejected = 0;
+    uint32_t entries_rejected = 0;
+};
+
+bool ParseShareNumber(const char*& cursor, const char* end, uint64_t& value) {
+    if (cursor >= end || *cursor < '0' || *cursor > '9') return false;
+    uint64_t result = 0;
+    for (; cursor < end && *cursor >= '0' && *cursor <= '9'; ++cursor) {
+        const uint64_t digit = static_cast<uint64_t>(*cursor - '0');
+        if (result > (UINT64_MAX - digit) / 10) return false;
+        result = result * 10 + digit;
+    }
+    value = result;
+    return true;
+}
+
+// Merges one member's payload. A malformed payload is ignored as a whole. An
+// entry is accepted only for a participant registered here, not controlled
+// here, whose SteamID equals the declared one (the member's own SteamID when
+// this machine could not read the participant's), and only once.
+bool ApplyDamageSharePayload(const DamageMeterState& s, uint64_t member,
+                             const std::string& payload,
+                             DamageShareView& view) {
+    struct Entry {
+        uint64_t index;
+        uint64_t steam_id;
+        uint64_t damage;
+        uint64_t hits;
+    };
+    const size_t format_length = sizeof(kDamageShareFormat) - 1;
+    if (payload.size() > kDamageSharePayloadLimit ||
+        payload.compare(0, format_length, kDamageShareFormat) != 0 ||
+        (payload.size() > format_length && payload[format_length] != ';')) {
+        ++view.payloads_rejected;
+        return false;
+    }
+    std::array<Entry, kMaximumMissionParticipants> entries{};
+    size_t entry_count = 0;
+    const char* cursor = payload.data() + format_length;
+    const char* const end = payload.data() + payload.size();
+    while (cursor < end) {
+        ++cursor;  // ';'
+        Entry entry{};
+        const bool parsed = entry_count < entries.size() &&
+            ParseShareNumber(cursor, end, entry.index) &&
+            cursor < end && *cursor++ == ':' &&
+            ParseShareNumber(cursor, end, entry.steam_id) &&
+            cursor < end && *cursor++ == ':' &&
+            ParseShareNumber(cursor, end, entry.damage) &&
+            cursor < end && *cursor++ == ':' &&
+            ParseShareNumber(cursor, end, entry.hits) &&
+            (cursor == end || *cursor == ';');
+        if (!parsed) {
+            ++view.payloads_rejected;
+            return false;
+        }
+        entries[entry_count++] = entry;
+    }
+    for (size_t e = 0; e < entry_count; ++e) {
+        const Entry& entry = entries[e];
+        if (entry.index >= s.players.size()) {
+            ++view.entries_rejected;
+            continue;
+        }
+        const auto& player = s.players[static_cast<size_t>(entry.index)];
+        const uint64_t expected_id = player.steam_id ? player.steam_id : member;
+        // 1e12 is far above any mission total; anything larger is corrupt.
+        if (!player.soldier || player.local || !entry.steam_id ||
+            entry.steam_id != expected_id || entry.damage > 1000000000000ull) {
+            ++view.entries_rejected;
+            continue;
+        }
+        const uint32_t bit = uint32_t{1} << static_cast<unsigned>(entry.index);
+        if (view.known_mask & bit) {
+            view.conflict_mask |= bit;
+            continue;
+        }
+        view.damage[static_cast<size_t>(entry.index)] =
+            static_cast<double>(entry.damage);
+        view.hits[static_cast<size_t>(entry.index)] = static_cast<uint32_t>(
+            std::min<uint64_t>(entry.hits, UINT32_MAX));
+        view.known_mask |= bit;
+        view.remote_mask |= bit;
+    }
+    ++view.payloads_accepted;
+    return true;
+}
+
+DamageShareView LocalDamageShareView(const DamageMeterState& s) {
+    DamageShareView view;
+    for (size_t index = 0; index < s.players.size(); ++index) {
+        const auto& player = s.players[index];
+        if (!player.soldier || !player.local) continue;
+        view.damage[index] = player.damage > 0.0 ? player.damage : 0.0;
+        view.hits[index] = player.hits;
+        view.known_mask |= uint32_t{1} << index;
+    }
+    return view;
+}
+
+// Reads the real lobby members (never the synthetic fillers).
+DamageShareView CollectDamageShare(const DamageMeterState& s, uint64_t lobby,
+                                   uint64_t local_user) {
+    DamageShareView view = LocalDamageShareView(s);
+    if (!lobby) return view;
+    const int count = steam_capture::GetActualLobbyMemberCount(lobby);
+    if (count < 0) return view;
+    std::vector<uint64_t> members;
+    for (int index = 0; index < count && index < 64; ++index) {
+        const uint64_t member =
+            steam_capture::GetActualLobbyMemberByIndex(lobby, index);
+        if (!member) continue;
+        members.push_back(member);
+        if (member == local_user) continue;
+        std::string payload;
+        if (!steam_capture::CopyActualLobbyMemberData(
+                lobby, member, kDamageShareKey, payload)) {
+            continue;
+        }
+        ++view.members_read;
+        ApplyDamageSharePayload(s, member, payload, view);
+    }
+    for (size_t index = 0; index < s.players.size(); ++index) {
+        const auto& player = s.players[index];
+        const uint32_t bit = uint32_t{1} << index;
+        if (!player.soldier || player.local || !player.steam_id ||
+            (view.known_mask & bit)) {
+            continue;
+        }
+        if (std::find(members.begin(), members.end(), player.steam_id) ==
+            members.end()) {
+            view.departed_mask |= bit;
+        }
+    }
+    return view;
+}
+
+// Writes this machine's member data in the room lobby (owned or joined).
+void DamageShareWrite(const char* value, const char* phase, uint32_t entries) {
+    const uint64_t lobby = g_room_lobby.load(std::memory_order_acquire);
+    const bool written = lobby &&
+        steam_capture::SetActualLobbyMemberData(lobby, kDamageShareKey, value);
+    EDF5_CAPTURE_EVENT(
+        "more_players", "damage_meter_share_write",
+        capture::Fields()
+            .String("phase", phase)
+            .Bool("lobby_known", lobby != 0)
+            .Bool("written", written)
+            .UInt("entries", entries)
+            .UInt("payload_bytes", std::strlen(value))
+            .Bool("payload_logged", false));
+}
+
 // Called from the mission player factory for every participant. A first
 // registration after the previous mission ended starts a new measurement;
 // re-creation inside a two-part mission keeps the running totals.
 void DamageMeterRegisterSoldier(int32_t participant_index, void* first,
-                                void* second, void* user) {
+                                void* second, void* user,
+                                bool locally_controlled) {
     if (!DamageMeterEnabled() || participant_index < 0 ||
         participant_index >= static_cast<int32_t>(
                                  kMaximumMissionParticipants)) {
@@ -10841,6 +11216,7 @@ void DamageMeterRegisterSoldier(int32_t participant_index, void* first,
         soldier_alt = 0;
         chosen = "second";
     }
+    bool started = false;
     AcquireSRWLockExclusive(&g_damage_meter_lock);
     const bool recreated_without_transition =
         g_damage_meter.players[static_cast<size_t>(participant_index)]
@@ -10850,11 +11226,15 @@ void DamageMeterRegisterSoldier(int32_t participant_index, void* first,
         recreated_without_transition) {
         for (auto& player : g_damage_meter.players) player.soldier = 0;
         ResetDamageMeterLocked(GetTickCount64());
+        started = true;
     }
     auto& player =
         g_damage_meter.players[static_cast<size_t>(participant_index)];
     player.soldier = soldier;
     player.soldier_alt = soldier_alt;
+    player.local = locally_controlled;
+    // A (re)created soldier starts a new position trail.
+    player.position_known = false;
     if (steam_id) player.steam_id = steam_id;
     if (persona_known) {
         player.name = persona;
@@ -10862,10 +11242,21 @@ void DamageMeterRegisterSoldier(int32_t participant_index, void* first,
         player.name = info.display_name;
     }
     ReleaseSRWLockExclusive(&g_damage_meter_lock);
+    if (started) {
+        g_hostile_count_tick.store(0, std::memory_order_release);
+        // A summary still waiting for the previous mission is stale now, and
+        // the member data must not expose the previous totals to this one.
+        g_damage_meter_publish_pending.store(false, std::memory_order_release);
+        g_damage_share_room_tick.store(0, std::memory_order_release);
+        g_damage_share_poll_tick.store(0, std::memory_order_release);
+        DamageShareWrite("", "clear", 0);
+    }
     EDF5_CAPTURE_EVENT(
         "more_players", "damage_meter_soldier_registered",
         capture::Fields()
             .Int("participant_index", participant_index)
+            .Bool("locally_controlled", locally_controlled)
+            .Bool("measurement_started", started)
             .String("soldier_field", chosen)
             .String("soldier_class", first_soldier ? first_label.data()
                                      : second_soldier ? second_label.data()
@@ -10877,9 +11268,16 @@ void DamageMeterRegisterSoldier(int32_t participant_index, void* first,
             .Bool("name_logged", false));
 }
 
+// killed_hostile: this hit brought a hostile object's health from above zero
+// to zero or below. ally_target: the game treats the target as friendly
+// (allied NPC soldiers; neither enemy damage nor player friendly fire).
+// target_downed: the target's health went from above zero to zero or below.
 void DamageMeterRecord(uintptr_t target, uintptr_t attacker,
                        float health_loss, const uint8_t* projectile,
-                       float info_amount = 0.0f) {
+                       float info_amount = 0.0f,
+                       bool killed_hostile = false,
+                       bool ally_target = false,
+                       bool target_downed = false) {
     const bool has_loss = health_loss > 0.0f && std::isfinite(health_loss);
     const bool has_amount = info_amount > 0.0f && std::isfinite(info_amount);
     if (!has_loss && !has_amount) return;
@@ -10909,13 +11307,21 @@ void DamageMeterRecord(uintptr_t target, uintptr_t attacker,
         if (complete && complete != attacker) match(complete);
     }
     if (target_is_player) {
-        if (has_loss) {
+        // Friendly fire: a player hit by another player.
+        if (has_loss && participant >= 0) {
             AcquireSRWLockExclusive(&g_damage_meter_lock);
             ++g_damage_meter.friendly_hits;
+            auto& shooter =
+                g_damage_meter.players[static_cast<size_t>(participant)];
+            shooter.friendly_damage += amount;
+            ++shooter.friendly_hits;
+            if (target_downed) ++shooter.friendly_kills;
             ReleaseSRWLockExclusive(&g_damage_meter_lock);
         }
         return;
     }
+    // Allied NPCs are neither enemies nor players.
+    if (ally_target && participant >= 0) return;
     if (!has_loss) {
         AcquireSRWLockExclusive(&g_damage_meter_lock);
         if (participant >= 0) {
@@ -10945,6 +11351,7 @@ void DamageMeterRecord(uintptr_t target, uintptr_t attacker,
         weapon = ProjectileWeapon(projectile, nullptr);
         if (weapon) ClassifyDamageMeterObject(weapon, &weapon_label);
     }
+    const uint64_t now = DamageMeterNow();
     AcquireSRWLockExclusive(&g_damage_meter_lock);
     if (participant < 0) {
         g_damage_meter.other_damage += amount;
@@ -10973,6 +11380,14 @@ void DamageMeterRecord(uintptr_t target, uintptr_t attacker,
     player.damage += amount;
     if (has_amount) player.received_amount += static_cast<double>(info_amount);
     ++player.hits;
+    const uint64_t second = now / 1000;
+    const size_t recent = static_cast<size_t>(second % kDamageMeterRecentSlots);
+    if (player.recent_second[recent] != second) {
+        player.recent_second[recent] = second;
+        player.recent_damage[recent] = 0.0;
+    }
+    player.recent_damage[recent] += amount;
+    if (killed_hostile) ++player.kills;
     if (projectile) {
         ++g_damage_meter.projectile_hits;
         ++player.projectile_hits;
@@ -11001,6 +11416,69 @@ void DamageMeterRecord(uintptr_t target, uintptr_t attacker,
     ReleaseSRWLockExclusive(&g_damage_meter_lock);
 }
 
+// A soldier registered for P0-P7 (or its complete object).
+bool DamageMeterIsPlayerSoldier(uintptr_t object) {
+    auto registered = [](uintptr_t key) {
+        bool found = false;
+        AcquireSRWLockShared(&g_damage_meter_lock);
+        for (const auto& player : g_damage_meter.players) {
+            if (key && (key == player.soldier || key == player.soldier_alt)) {
+                found = true;
+                break;
+            }
+        }
+        ReleaseSRWLockShared(&g_damage_meter_lock);
+        return found;
+    };
+    if (registered(object)) return true;
+    if (g_damage_meter_test_classifier) return false;
+    const uintptr_t complete = DamageMeterCompleteObject(object);
+    return complete && complete != object && registered(complete);
+}
+
+// The game's team relation value, -1 when a team is missing (no lookup, as
+// in ApplyDamage) and -2 when the table could not be read safely.
+int32_t TeamRelation(int32_t attacker_team, int32_t target_team) {
+    if (attacker_team == -1 || target_team == -1) return -1;
+    const uintptr_t global =
+        g_team_relation_global.load(std::memory_order_acquire);
+    if (!global || attacker_team < 0 || target_team < 0 ||
+        attacker_team >= kTeamRelationMaxTeams ||
+        target_team >= kTeamRelationMaxTeams) {
+        return -2;
+    }
+    auto read_pointer = [](uintptr_t address, uintptr_t& value) {
+        if (!address || !IsReadableMemoryRange(
+                reinterpret_cast<const void*>(address), sizeof(value))) {
+            return false;
+        }
+        std::memcpy(&value, reinterpret_cast<const void*>(address),
+                    sizeof(value));
+        return value != 0;
+    };
+    uintptr_t owner = 0;
+    uintptr_t rows = 0;
+    uintptr_t values = 0;
+    if (!read_pointer(global, owner) ||
+        !read_pointer(owner + kTeamRelationTableOffset, rows) ||
+        !read_pointer(rows + static_cast<uintptr_t>(attacker_team) *
+                                 kTeamRelationRowStride +
+                          kTeamRelationRowValuesOffset,
+                      values)) {
+        return -2;
+    }
+    const uintptr_t cell =
+        values + static_cast<uintptr_t>(target_team) * sizeof(int32_t);
+    if (!IsReadableMemoryRange(reinterpret_cast<const void*>(cell),
+                               sizeof(int32_t))) {
+        return -2;
+    }
+    int32_t relation = 0;
+    std::memcpy(&relation, reinterpret_cast<const void*>(cell),
+                sizeof(relation));
+    return relation;
+}
+
 void __fastcall ObjectApplyDamageHook(uint8_t* object, const uint8_t* info) {
     if (!g_damage_meter_installed.load(std::memory_order_acquire) ||
         !object || !info) {
@@ -11009,6 +11487,11 @@ void __fastcall ObjectApplyDamageHook(uint8_t* object, const uint8_t* info) {
     }
     float before = 0.0f;
     std::memcpy(&before, object + kGameObjectHealthOffset, sizeof(before));
+    // Read before the call: a killing blow unregisters the object from its
+    // team (its team field reads -1 afterwards, live 0.6.80).
+    int32_t target_team = -1;
+    std::memcpy(&target_team, object + kGameObjectTeamOffset,
+                sizeof(target_team));
     g_object_apply_damage(object, info);
     float after = 0.0f;
     std::memcpy(&after, object + kGameObjectHealthOffset, sizeof(after));
@@ -11021,11 +11504,249 @@ void __fastcall ObjectApplyDamageHook(uint8_t* object, const uint8_t* info) {
     float info_amount = 0.0f;
     std::memcpy(&info_amount, info + kGameDamageInfoAmountOffset,
                 sizeof(info_amount));
+    // Same death test as ApplyDamage/0x2DAC60 (0 >= health afterwards).
+    const bool target_downed = before > 0.0f && !(after > 0.0f);
+    const uintptr_t credited = control ? attacker : 0;
+    // The team relation (as the game and its radar see it) is only needed
+    // for the players' own hits: hostile kills, allied NPC hits.
+    bool killed_hostile = false;
+    bool ally_target = false;
+    if (before > after && credited &&
+        g_damage_meter_kills_supported.load(std::memory_order_acquire) &&
+        DamageMeterIsPlayerSoldier(credited)) {
+        int32_t attacker_team = -1;
+        std::memcpy(&attacker_team, info + kGameDamageInfoTeamOffset,
+                    sizeof(attacker_team));
+        const int32_t relation = TeamRelation(attacker_team, target_team);
+        ally_target = relation == 1;
+        // Hostile exactly as the radar sees it (relation 2). When the table
+        // cannot be read (-2), a different valid team counts.
+        killed_hostile = target_downed &&
+            (relation == 2 ||
+             (relation == -2 && target_team != -1 &&
+              target_team != attacker_team));
+        if (target_downed &&
+            g_kill_candidate_logs.fetch_add(1, std::memory_order_acq_rel) < 6) {
+            EDF5_CAPTURE_EVENT(
+                "more_players", "damage_meter_kill_candidate",
+                capture::Fields()
+                    .Int("attacker_team", attacker_team)
+                    .Int("target_team", target_team)
+                    .Int("relation", relation)
+                    .Bool("attacker_present", control != 0)
+                    .Bool("counted_as_hostile", killed_hostile));
+        }
+    }
     // Only the attacker address is compared; it is never dereferenced here.
-    DamageMeterRecord(reinterpret_cast<uintptr_t>(object),
-                      control ? attacker : 0, before - after,
-                      g_damage_meter_projectile, info_amount);
+    DamageMeterRecord(reinterpret_cast<uintptr_t>(object), credited,
+                      before - after, g_damage_meter_projectile, info_amount,
+                      killed_hostile, ally_target, target_downed);
 }
+
+bool ReadObjectPosition(uintptr_t object, std::array<float, 3>& position) {
+    if (!object) return false;
+    const auto* source =
+        reinterpret_cast<const uint8_t*>(object + kGameObjectPositionOffset);
+    if (!IsReadableMemoryRange(source, sizeof(float) * 3)) return false;
+    std::memcpy(position.data(), source, sizeof(float) * 3);
+    for (const float value : position) {
+        if (!std::isfinite(value) || std::fabs(value) > 1.0e6f) return false;
+    }
+    return true;
+}
+
+// Functor handed to the radar's enumerator: the game calls slot 1 with each
+// living hostile object; slot 0 is never used by the enumerator.
+struct HostileCounter {
+    void* const* vtable;
+    uint32_t count;
+};
+
+void __fastcall HostileCounterUnused(HostileCounter*) {}
+
+void __fastcall HostileCounterVisit(HostileCounter* self, void*) {
+    ++self->count;
+}
+
+void* const kHostileCounterVtable[2] = {
+    reinterpret_cast<void*>(&HostileCounterUnused),
+    reinterpret_cast<void*>(&HostileCounterVisit),
+};
+
+// Living hostile objects for `team`, counted by the game's own radar
+// enumerator; -1 when unavailable. Called without g_damage_meter_lock held
+// (the enumerator takes the game's lock).
+int32_t CountHostiles(int32_t team) {
+    const uintptr_t global =
+        g_team_relation_global.load(std::memory_order_acquire);
+    if (!g_hostile_enumerator || !global || team < 0 ||
+        team >= kTeamRelationMaxTeams ||
+        !IsReadableMemoryRange(reinterpret_cast<const void*>(global),
+                               sizeof(uintptr_t))) {
+        return -1;
+    }
+    void* owner = nullptr;
+    std::memcpy(&owner, reinterpret_cast<const void*>(global), sizeof(owner));
+    if (!owner) return -1;
+    HostileCounter counter{kHostileCounterVtable, 0};
+    g_hostile_enumerator(owner, team, &counter);
+    return static_cast<int32_t>(counter.count);
+}
+
+// Mission() update: accumulates the script time and the distance moved by
+// the local participants of the running measurement.
+void DamageMeterOnMissionUpdate(uint64_t now) {
+    if (!g_damage_meter_installed.load(std::memory_order_acquire)) return;
+    bool first_position = false;
+    std::array<float, 3> logged_position{};
+    AcquireSRWLockExclusive(&g_damage_meter_lock);
+    if (g_damage_meter.active && !g_damage_meter.ended) {
+        const uint64_t last = g_damage_meter.last_update_tick;
+        if (last && now > last) {
+            g_damage_meter.active_ms +=
+                std::min<uint64_t>(now - last, kDamageMeterUpdateGapMs);
+        }
+        g_damage_meter.last_update_tick = now;
+        // Between the parts of a two-part mission the old soldiers are gone.
+        for (auto& player : g_damage_meter.players) {
+            if (g_damage_meter.transition_pending || !player.soldier ||
+                !player.local) {
+                continue;
+            }
+            std::array<float, 3> position{};
+            if (!ReadObjectPosition(player.soldier, position)) continue;
+            if (player.position_known) {
+                const double step = std::sqrt(
+                    std::pow(static_cast<double>(position[0] -
+                                                 player.last_position[0]), 2) +
+                    std::pow(static_cast<double>(position[1] -
+                                                 player.last_position[1]), 2) +
+                    std::pow(static_cast<double>(position[2] -
+                                                 player.last_position[2]), 2));
+                if (step >= kDistanceMinStep && step <= kDistanceMaxStep) {
+                    player.distance += step;
+                }
+            } else if (!g_position_first_logged.exchange(
+                           true, std::memory_order_acq_rel)) {
+                first_position = true;
+                logged_position = position;
+            }
+            player.last_position = position;
+            player.position_known = true;
+        }
+    }
+    uintptr_t team_soldier = 0;
+    if (g_damage_meter.active && !g_damage_meter.ended &&
+        !g_damage_meter.transition_pending) {
+        for (const auto& player : g_damage_meter.players) {
+            if (player.soldier && player.local) {
+                team_soldier = player.soldier;
+                break;
+            }
+        }
+    }
+    ReleaseSRWLockExclusive(&g_damage_meter_lock);
+    const uint64_t last_count =
+        g_hostile_count_tick.load(std::memory_order_acquire);
+    if (team_soldier && (!last_count || now - last_count >=
+                                            kHostileCountIntervalMs)) {
+        const auto* team_field = reinterpret_cast<const uint8_t*>(
+            team_soldier + kGameObjectTeamOffset);
+        int32_t team = -1;
+        if (IsReadableMemoryRange(team_field, sizeof(team))) {
+            std::memcpy(&team, team_field, sizeof(team));
+        }
+        const int32_t hostiles = CountHostiles(team);
+        g_hostile_count.store(hostiles, std::memory_order_release);
+        g_hostile_count_tick.store(now, std::memory_order_release);
+    }
+    if (first_position) {
+        EDF5_CAPTURE_EVENT(
+            "more_players", "damage_meter_position_first",
+            capture::Fields()
+                .UInt("position_offset", kGameObjectPositionOffset)
+                .Int("x", static_cast<int64_t>(logged_position[0]))
+                .Int("y", static_cast<int64_t>(logged_position[1]))
+                .Int("z", static_cast<int64_t>(logged_position[2])));
+    }
+}
+
+// Damage of the last kDamageMeterRecentWindowSeconds (the current second
+// included, in proportion) per second; shorter at the start of a stage.
+double DamageMeterRecentDps(const DamageMeterParticipant& player,
+                            uint64_t now, uint64_t active_ms) {
+    const uint64_t second = now / 1000;
+    double sum = 0.0;
+    for (size_t slot = 0; slot < kDamageMeterRecentSlots; ++slot) {
+        const uint64_t stamp = player.recent_second[slot];
+        if (stamp && stamp <= second &&
+            second - stamp < kDamageMeterRecentWindowSeconds) {
+            sum += player.recent_damage[slot];
+        }
+    }
+    double window = static_cast<double>(kDamageMeterRecentWindowSeconds - 1) +
+        static_cast<double>(now % 1000) / 1000.0;
+    const double active = static_cast<double>(active_ms) / 1000.0;
+    if (active > 0.0 && active < window) window = active;
+    return window >= 1.0 ? sum / window : sum;
+}
+
+}  // namespace
+
+bool GetCombatStats(CombatStats& stats) {
+    stats = {};
+    if (!DamageMeterEnabled()) return false;
+    const uint64_t now = DamageMeterNow();
+    AcquireSRWLockShared(&g_damage_meter_lock);
+    const DamageMeterState& s = g_damage_meter;
+    stats.in_mission = s.active && !s.ended && s.last_update_tick &&
+        now >= s.last_update_tick &&
+        now - s.last_update_tick < kDamageMeterInMissionTimeoutMs;
+    stats.measurement_active = s.active;
+    stats.measurement_ended = s.ended;
+    stats.last_update_age_ms = !s.last_update_tick ? UINT64_MAX
+        : now >= s.last_update_tick ? now - s.last_update_tick : 0;
+    stats.active_ms = s.active_ms;
+    for (size_t index = 0;
+         index < s.players.size() && stats.count < std::size(stats.players);
+         ++index) {
+        const auto& player = s.players[index];
+        if (!player.soldier || !player.local) continue;
+        auto& out = stats.players[stats.count++];
+        out.participant_index = static_cast<int32_t>(index);
+        out.damage = player.damage;
+        out.kills = player.kills;
+        out.recent_dps = DamageMeterRecentDps(player, now, s.active_ms);
+        out.distance = player.distance;
+        out.friendly_damage = player.friendly_damage;
+        out.friendly_kills = player.friendly_kills;
+    }
+    ReleaseSRWLockShared(&g_damage_meter_lock);
+    stats.kills_supported =
+        g_damage_meter_kills_supported.load(std::memory_order_acquire);
+    // Red radar dots: living hostile objects counted by the game's radar
+    // enumerator on the mission thread (stale counts are not shown).
+    const uint64_t counted_at =
+        g_hostile_count_tick.load(std::memory_order_acquire);
+    if (counted_at && now >= counted_at &&
+        now - counted_at < kHostileCountStaleMs) {
+        stats.enemies_alive = g_hostile_count.load(std::memory_order_acquire);
+    }
+    return true;
+}
+
+void* GameWindow() {
+    return reinterpret_cast<void*>(
+        g_game_window.load(std::memory_order_acquire));
+}
+
+bool TitleScreenActive() {
+    const uint64_t tick = g_title_update_tick.load(std::memory_order_acquire);
+    const uint64_t now = GetTickCount64();
+    return tick && now >= tick && now - tick < kTitleScreenActiveMs;
+}
+
+namespace {
 
 // Damage list (0x2D9720): data at +0x08, count at +0x18, 0xA0-byte entries
 // {weak_ptr target +0x00, GameDamageInfo +0x10}; attacker object at entry
@@ -11129,37 +11850,54 @@ void DamageMeterOnResult(int32_t result) {
         return;
     }
     const bool fresh = g_damage_meter.active && !g_damage_meter.ended;
+    std::string payload;
+    uint32_t entries = 0;
     if (fresh) {
         g_damage_meter.ended = true;
         g_damage_meter.end_tick = GetTickCount64();
         g_damage_meter.result = result;
+        payload = BuildDamageSharePayload(g_damage_meter);
+        entries = CountBits(DamageMeterLocalMask(g_damage_meter));
     }
     ReleaseSRWLockExclusive(&g_damage_meter_lock);
     if (fresh) {
+        // Published as soon as the mission ends, so the other machines have
+        // it by the time everyone is back in the room.
+        DamageShareWrite(payload.c_str(), "publish", entries);
+        g_damage_share_room_tick.store(0, std::memory_order_release);
+        g_damage_share_poll_tick.store(0, std::memory_order_release);
         g_damage_meter_publish_pending.store(true, std::memory_order_release);
     }
-}
-
-std::wstring WideAscii(const char* text) {
-    std::wstring out;
-    for (; text && *text; ++text) {
-        out += static_cast<wchar_t>(static_cast<unsigned char>(*text));
-    }
-    return out;
 }
 
 std::wstring WideRounded(double value) {
     return std::to_wstring(static_cast<int64_t>(std::llround(value)));
 }
 
-std::wstring FormatDamageAmount(double value) {
-    if (value >= 1000000.0) {
-        const int64_t tenths = std::llround(value / 100000.0);
-        return std::to_wstring(tenths / 10) + L"." +
-            std::to_wstring(tenths % 10) + L"M";
+// Full total with thousands separators: 1234567 -> "1,234,567".
+std::wstring FormatDamageTotal(double value) {
+    const int64_t rounded = value > 0.0 && std::isfinite(value)
+        ? static_cast<int64_t>(std::llround(value)) : 0;
+    const std::wstring digits = std::to_wstring(rounded);
+    std::wstring out;
+    for (size_t index = 0; index < digits.size(); ++index) {
+        if (index && (digits.size() - index) % 3 == 0) out += L',';
+        out += digits[index];
     }
-    if (value >= 10000.0) return WideRounded(value / 1000.0) + L"k";
-    return WideRounded(value);
+    return out;
+}
+
+// Mission length as m:ss (h:mm:ss from one hour).
+std::wstring FormatMissionClock(uint64_t seconds) {
+    const uint64_t hours = seconds / 3600;
+    const uint64_t minutes = (seconds / 60) % 60;
+    const uint64_t rest = seconds % 60;
+    auto two = [](uint64_t value) {
+        return (value < 10 ? L"0" : L"") + std::to_wstring(value);
+    };
+    return hours ? std::to_wstring(hours) + L":" + two(minutes) + L":" +
+                       two(rest)
+                 : std::to_wstring(minutes) + L":" + two(rest);
 }
 
 std::wstring DamageMeterPlayerName(const DamageMeterParticipant& player,
@@ -11173,74 +11911,57 @@ std::wstring DamageMeterPlayerName(const DamageMeterParticipant& player,
     return name;
 }
 
-// Builds the chat lines (each short enough for one chat entry).
+// Builds the chat lines: total damage each participant dealt since the stage
+// began (both parts of a two-part mission), highest first, with the share of
+// the team total. Participants without a known total are listed last.
 std::vector<std::wstring> BuildDamageMeterSummary(const DamageMeterState& s,
+                                                  const DamageShareView& view,
                                                   uint64_t now) {
     std::vector<std::wstring> lines;
     const uint64_t end = s.end_tick ? s.end_tick : now;
-    const double seconds = s.start_tick && end > s.start_tick
-        ? static_cast<double>(end - s.start_tick) / 1000.0 : 0.0;
-    const double divisor = seconds >= 1.0 ? seconds : 1.0;
+    const uint64_t seconds = s.start_tick && end > s.start_tick
+        ? (end - s.start_tick) / 1000 : 0;
+    const auto known = [&](size_t index) {
+        return (view.known_mask >> index) & 1u;
+    };
     std::array<size_t, kMaximumMissionParticipants> order{};
     for (size_t index = 0; index < order.size(); ++index) order[index] = index;
     std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-        return s.players[a].damage > s.players[b].damage;
+        if (known(a) != known(b)) return known(a) > known(b);
+        return view.damage[a] > view.damage[b];
     });
     double team_damage = 0.0;
-    for (const auto& player : s.players) {
-        if (player.damage > 0.0) team_damage += player.damage;
+    for (size_t index = 0; index < s.players.size(); ++index) {
+        if (s.players[index].soldier && known(index) &&
+            view.damage[index] > 0.0) {
+            team_damage += view.damage[index];
+        }
     }
-    lines.push_back(L"[DPS] Mission: " + WideRounded(seconds) +
-                    L"s - damage dealt per player");
+    lines.push_back(L"[Damage] Total per player (" +
+                    FormatMissionClock(seconds) + L")");
     for (const size_t index : order) {
         const auto& player = s.players[index];
-        if (!(player.damage > 0.0)) continue;
-        lines.push_back(DamageMeterPlayerName(player, index) + L": " +
-                        WideRounded(player.damage / divisor) + L"/s (" +
-                        FormatDamageAmount(player.damage) + L", " +
+        if (!player.soldier) continue;
+        const std::wstring name = DamageMeterPlayerName(player, index);
+        if (!known(index)) {
+            lines.push_back(name + L": ? (no data)");
+            continue;
+        }
+        const double damage = view.damage[index];
+        lines.push_back(name + L": " + FormatDamageTotal(damage) + L" (" +
                         WideRounded(team_damage > 0.0
-                                        ? player.damage * 100.0 / team_damage
+                                        ? damage * 100.0 / team_damage
                                         : 0.0) +
                         L"%)");
-        std::array<size_t, kDamageMeterWeaponSlots> weapons{};
-        for (size_t w = 0; w < weapons.size(); ++w) weapons[w] = w;
-        std::stable_sort(weapons.begin(),
-                         weapons.begin() + static_cast<std::ptrdiff_t>(
-                                               player.weapon_count),
-                         [&](size_t a, size_t b) {
-                             return player.weapons[a].damage >
-                                    player.weapons[b].damage;
-                         });
-        std::wstring detail;
-        auto append = [&](const std::wstring& part) {
-            if (!detail.empty() && detail.size() + part.size() > 46) {
-                lines.push_back(L"  " + detail);
-                detail.clear();
-            }
-            if (!detail.empty()) detail += L", ";
-            detail += part;
-        };
-        for (size_t w = 0; w < player.weapon_count; ++w) {
-            const auto& weapon = player.weapons[weapons[w]];
-            const std::wstring label = weapon.label[0]
-                ? WideAscii(weapon.label.data())
-                : L"Weapon " + std::to_wstring(weapons[w] + 1);
-            append(label + L" " + WideRounded(weapon.damage / divisor) +
-                   L"/s");
-        }
-        if (player.weapon_count &&
-            player.unattributed >= player.damage * 0.01) {
-            append(L"other " + WideRounded(player.unattributed / divisor) +
-                   L"/s");
-        }
-        if (!detail.empty()) lines.push_back(L"  " + detail);
     }
-    if (lines.size() == 1) lines.emplace_back(L"  (no damage recorded)");
+    if (lines.size() == 1) lines.emplace_back(L"  (no players recorded)");
     return lines;
 }
 
-// Room update: the host prints the finished mission once. Every machine
-// logs the totals it measured (no names).
+// Room update: every machine prints the finished mission once to its own room
+// chat (never sent to the other players) after merging the totals the other
+// members published, waiting at most kDamageShareWaitMs for them. Every
+// machine logs the totals it measured and merged (no names).
 void DamageMeterOnRoom() {
     if (!g_damage_meter_publish_pending.load(std::memory_order_acquire)) {
         return;
@@ -11251,32 +11972,90 @@ void DamageMeterOnRoom() {
         IsReadableMemoryRange(room, sizeof(void*)) &&
         *reinterpret_cast<void***>(room) == g_runtime_chat_room_vtable;
     const bool host = g_owned_lobby.load(std::memory_order_acquire) != 0;
-    if (host && capture::GetConfig().damage_meter_chat &&
-        (!room_valid || !g_chat_system_message_publish)) {
+    const bool chat_enabled = capture::GetConfig().damage_meter_chat;
+    const uint64_t now = GetTickCount64();
+    if (chat_enabled && (!room_valid || !g_chat_system_message_publish)) {
         AcquireSRWLockShared(&g_damage_meter_lock);
         const uint64_t ended_at = g_damage_meter.end_tick;
         ReleaseSRWLockShared(&g_damage_meter_lock);
-        const uint64_t now = GetTickCount64();
         // Wait (bounded) for the room chat after the result screen.
         if (ended_at && now >= ended_at && now - ended_at < 30000) return;
     }
+    uint64_t first_room_tick =
+        g_damage_share_room_tick.load(std::memory_order_acquire);
+    if (!first_room_tick) {
+        uint64_t unset = 0;
+        first_room_tick =
+            g_damage_share_room_tick.compare_exchange_strong(
+                unset, now, std::memory_order_acq_rel,
+                std::memory_order_acquire)
+                ? now : unset;
+    }
+    const uint64_t waited_ms = now >= first_room_tick ? now - first_room_tick
+                                                      : 0;
+    const bool wait_expired = waited_ms >= kDamageShareWaitMs;
+    if (!wait_expired) {
+        const uint64_t last_poll =
+            g_damage_share_poll_tick.load(std::memory_order_acquire);
+        if (last_poll && now >= last_poll &&
+            now - last_poll < kDamageSharePollMs) {
+            return;
+        }
+        g_damage_share_poll_tick.store(now, std::memory_order_release);
+    }
+    DamageMeterState snapshot;
+    AcquireSRWLockShared(&g_damage_meter_lock);
+    snapshot = g_damage_meter;
+    ReleaseSRWLockShared(&g_damage_meter_lock);
+    const DamageShareView view = CollectDamageShare(
+        snapshot, g_room_lobby.load(std::memory_order_acquire),
+        steam_capture::LocalUserSteamId());
+    const uint32_t registered_mask = DamageMeterRegisteredMask(snapshot);
+    const uint32_t awaited_mask =
+        registered_mask & ~view.known_mask & ~view.departed_mask;
+    if (awaited_mask && !wait_expired) return;
     bool expected = true;
     if (!g_damage_meter_publish_pending.compare_exchange_strong(
             expected, false, std::memory_order_acq_rel,
             std::memory_order_acquire)) {
         return;
     }
-    DamageMeterState snapshot;
-    AcquireSRWLockShared(&g_damage_meter_lock);
-    snapshot = g_damage_meter;
-    ReleaseSRWLockShared(&g_damage_meter_lock);
+    g_damage_share_room_tick.store(0, std::memory_order_release);
+    g_damage_share_poll_tick.store(0, std::memory_order_release);
     uint32_t names_known = 0;
     for (auto& player : snapshot.players) {
-        if (!player.name[0] && player.damage > 0.0) {
+        if (!player.soldier) continue;
+        if (!player.name[0]) {
             DamageMeterPersonaName(player.steam_id, player.name);
         }
-        if (player.name[0] && player.damage > 0.0) ++names_known;
+        if (player.name[0]) ++names_known;
     }
+    std::string shared = "[";
+    for (size_t index = 0; index < snapshot.players.size(); ++index) {
+        shared += index ? "," : "";
+        shared += (view.known_mask >> index) & 1u
+            ? std::to_string(static_cast<int64_t>(
+                  std::llround(view.damage[index])))
+            : std::string("null");
+    }
+    shared += "]";
+    std::string friendly = "[";
+    for (size_t index = 0; index < snapshot.players.size(); ++index) {
+        const auto& player = snapshot.players[index];
+        friendly += std::string(index ? "," : "") + "[" +
+            std::to_string(static_cast<int64_t>(
+                std::llround(player.friendly_damage))) +
+            "," + std::to_string(player.friendly_hits) + "," +
+            std::to_string(player.friendly_kills) + "]";
+    }
+    friendly += "]";
+    std::string distances = "[";
+    for (size_t index = 0; index < snapshot.players.size(); ++index) {
+        distances += (index ? "," : "") +
+            std::to_string(static_cast<int64_t>(
+                std::llround(snapshot.players[index].distance)));
+    }
+    distances += "]";
     std::string totals = "[";
     std::string hits = "[";
     std::string outgoing = "[";
@@ -11305,7 +12084,7 @@ void DamageMeterOnRoom() {
     hits += "]";
     outgoing += "]";
     received += "]";
-    const auto lines = BuildDamageMeterSummary(snapshot, GetTickCount64());
+    const auto lines = BuildDamageMeterSummary(snapshot, view, now);
     std::string others = "[";
     for (const auto& entry : snapshot.other_attackers) {
         if (!entry.label[0]) continue;
@@ -11316,10 +12095,8 @@ void DamageMeterOnRoom() {
             std::to_string(entry.distinct) + "]";
     }
     others += "]";
-    // Measurement only unless DamageMeterChat=true: the host applies just the
-    // damage on objects it owns, so its totals are incomplete (0.6.79).
-    const bool chat_enabled = capture::GetConfig().damage_meter_chat;
-    const bool published = chat_enabled && host && room_valid &&
+    // Local system messages only: each machine prints its own copy.
+    const bool published = chat_enabled && room_valid &&
                            g_chat_system_message_publish;
     if (published) {
         for (const auto& text : lines) {
@@ -11339,7 +12116,26 @@ void DamageMeterOnRoom() {
                   snapshot.end_tick > snapshot.start_tick
                       ? snapshot.end_tick - snapshot.start_tick : 0)
             .Raw("participant_damage", totals)
+            // Totals shown: local participants measured here, the others as
+            // published by their own machine (null = no data).
+            .Raw("participant_total_shown", shared)
+            .UInt("participant_registered_mask", registered_mask)
+            .UInt("participant_local_mask", DamageMeterLocalMask(snapshot))
+            .UInt("shared_known_mask", view.known_mask)
+            .UInt("shared_remote_mask", view.remote_mask)
+            .UInt("shared_conflict_mask", view.conflict_mask)
+            .UInt("shared_departed_mask", view.departed_mask)
+            .UInt("shared_members_read", view.members_read)
+            .UInt("shared_payloads_accepted", view.payloads_accepted)
+            .UInt("shared_payloads_rejected", view.payloads_rejected)
+            .UInt("shared_entries_rejected", view.entries_rejected)
+            .UInt("share_wait_ms", waited_ms)
+            .Bool("share_wait_expired", wait_expired)
             .Raw("participant_hits", hits)
+            // Metres moved by the participants controlled here.
+            .Raw("participant_distance_m", distances)
+            // Friendly fire on players: [damage, hits, kills].
+            .Raw("participant_friendly_fire", friendly)
             // Source side for this machine's soldiers (raw amount, hits).
             .Raw("participant_outgoing", outgoing)
             // Applied on this machine: raw info amount, hits without loss.
@@ -11367,6 +12163,8 @@ void ResetDamageMeter() {
     g_damage_meter = {};
     ReleaseSRWLockExclusive(&g_damage_meter_lock);
     g_damage_meter_publish_pending.store(false, std::memory_order_release);
+    g_damage_share_room_tick.store(0, std::memory_order_release);
+    g_damage_share_poll_tick.store(0, std::memory_order_release);
 }
 
 // Diagnostics: records how the native client calls Chat_Room::Send so the
@@ -11541,16 +12339,62 @@ void InstallDamageMeterHooks(uint8_t* base, size_t image_size) {
                            "Chat_Room send identity telemetry", false);
         }
     }
+    // Optional on its own: a mismatch only hides the kill count.
+    const bool kills_supported = apply_hooked &&
+        SignatureMatches(base, image_size, kApplyDamageAttackerTeamReadRva,
+                         kApplyDamageAttackerTeamReadSignature,
+                         sizeof(kApplyDamageAttackerTeamReadSignature)) &&
+        SignatureMatches(base, image_size, kApplyDamageTargetTeamReadRva,
+                         kApplyDamageTargetTeamReadSignature,
+                         sizeof(kApplyDamageTargetTeamReadSignature));
+    g_damage_meter_kills_supported.store(kills_supported,
+                                         std::memory_order_release);
+    uintptr_t relation_global = 0;
+    if (kills_supported &&
+        SignatureMatches(base, image_size, kTeamRelationLookupRva,
+                         kTeamRelationLookupSignature,
+                         sizeof(kTeamRelationLookupSignature)) &&
+        SignatureMatches(base, image_size, kTeamRelationLookupTailRva,
+                         kTeamRelationLookupTailSignature,
+                         sizeof(kTeamRelationLookupTailSignature))) {
+        int32_t relative = 0;
+        std::memcpy(&relative, base + kTeamRelationGlobalLoadRva + 3,
+                    sizeof(relative));
+        const int64_t target =
+            static_cast<int64_t>(kTeamRelationLookupTailRva) + relative;
+        if (target > 0 && static_cast<uint64_t>(target) + sizeof(uintptr_t) <=
+                              image_size) {
+            relation_global =
+                reinterpret_cast<uintptr_t>(base) + static_cast<uintptr_t>(target);
+        }
+    }
+    g_team_relation_global.store(relation_global, std::memory_order_release);
+    const bool hostile_enumerator = relation_global &&
+        SignatureMatches(base, image_size, kHostileEnumeratorRva,
+                         kHostileEnumeratorSignature,
+                         sizeof(kHostileEnumeratorSignature)) &&
+        SignatureMatches(base, image_size, kHostileEnumeratorRelationRva,
+                         kHostileEnumeratorRelationSignature,
+                         sizeof(kHostileEnumeratorRelationSignature)) &&
+        SignatureMatches(base, image_size, kHostileEnumeratorVisitRva,
+                         kHostileEnumeratorVisitSignature,
+                         sizeof(kHostileEnumeratorVisitSignature));
+    g_hostile_enumerator = hostile_enumerator
+        ? reinterpret_cast<HostileEnumeratorFn>(base + kHostileEnumeratorRva)
+        : nullptr;
     g_damage_meter_installed.store(apply_hooked, std::memory_order_release);
     EDF5_CAPTURE_EVENT(
         "more_players", "damage_meter_ready",
         capture::Fields()
             .Bool("apply_damage_hooked", apply_hooked)
+            .Bool("kills_supported", kills_supported)
+            .Bool("team_relation_table", relation_global != 0)
+            .Bool("hostile_enumerator", hostile_enumerator)
             .Bool("projectile_flush_hooked", flush_hooked)
             .UInt("apply_damage_rva", kObjectApplyDamageRva)
             .UInt("damage_flush_rva", kDamageListFlushRva)
             .UInt("health_offset", kGameObjectHealthOffset)
-            .String("summary", "host_local_chat"));
+            .String("summary", "lobby_member_data_merge_local_chat"));
 }
 
 SharedProperty* __fastcall MissionPlayerCreateHook(
@@ -11753,7 +12597,8 @@ SharedProperty* __fastcall MissionPlayerCreateHook(
     const bool output_player_present = output && output->object;
     if (output_player_present) {
         DamageMeterRegisterSoldier(participant_index, output->control,
-                                   output->object, participant_user);
+                                   output->object, participant_user,
+                                   locally_controlled);
     }
     EDF5_DIAGNOSTIC_PHASE(diagnostics_scope, "original_returned", output_player_present ? 1 : 0,
                             result == output ? 1 : 0);
@@ -12210,6 +13055,17 @@ void* __fastcall ChatRoomConstructorHook(void* self) {
         ? g_chat_room_constructor(self) : nullptr;
     CaptureChatRoomInstance(result, false);
     return result;
+}
+
+void* __fastcall HUiTitleUpdateHook(void* self, void* frame) {
+    const uint64_t previous = g_title_update_tick.exchange(
+        GetTickCount64(), std::memory_order_acq_rel);
+    if (!previous) {
+        EDF5_CAPTURE_EVENT("more_players", "title_screen_update_observed",
+                           capture::Fields().UInt("title_update_rva",
+                                                  kHUiTitleUpdateRva));
+    }
+    return g_hui_title_update(self, frame);
 }
 
 void* __fastcall HUiRoomUpdateHook(void* self, void* frame) {
@@ -14458,7 +15314,54 @@ bool ReadHotkeyState(std::atomic<int>& override_state, unsigned virtual_key) {
                       : (GetAsyncKeyState(static_cast<int>(virtual_key)) & 0x8000) != 0;
 }
 
+// The overlay key (Tab by default) only counts while a window of this process
+// (EDF5) has focus and Alt is up, so Alt+Tab and typing in other programs
+// never toggle it. Returns the physical key state; accepted tells whether it
+// counts and reason why not.
+bool StatsOverlayHotkeyDown(bool& accepted, const char*& reason) {
+    const auto& config = capture::GetConfig();
+    accepted = false;
+    reason = "disabled";
+    if (!config.stats_overlay_enabled) return false;
+    const SHORT state =
+        GetAsyncKeyState(static_cast<int>(config.stats_overlay_hotkey_vk));
+    // The low bit reports a press since the previous query, so a tap that
+    // ended between two polls still counts once.
+    const bool down = (state & 0x8001) != 0;
+    if (!down) return false;
+    DWORD process_id = 0;
+    const HWND foreground = GetForegroundWindow();
+    if (!foreground || !GetWindowThreadProcessId(foreground, &process_id) ||
+        process_id != GetCurrentProcessId()) {
+        reason = "game_not_focused";
+    } else if ((GetAsyncKeyState(VK_MENU) & 0x8000) != 0) {
+        reason = "alt_held";
+    } else {
+        accepted = true;
+        reason = "accepted";
+    }
+    return true;
+}
+
+// A hotkey that only counts while EDF5 has focus and Alt is up.
+bool FocusedHotkeyDown(unsigned virtual_key) {
+    if ((GetAsyncKeyState(static_cast<int>(virtual_key)) & 0x8001) == 0) {
+        return false;
+    }
+    DWORD process_id = 0;
+    const HWND foreground = GetForegroundWindow();
+    return foreground && GetWindowThreadProcessId(foreground, &process_id) &&
+           process_id == GetCurrentProcessId() &&
+           (GetAsyncKeyState(VK_MENU) & 0x8000) == 0;
+}
+
 DWORD WINAPI HotkeyMain(void*) {
+    bool was_ultrawide_down = false;
+    uint64_t ultrawide_last_toggle = 0;
+    bool was_stats_overlay_down = false;
+    unsigned stats_overlay_rejections_logged = 0;
+    unsigned stats_overlay_messages_seen = 0;
+    uint64_t stats_overlay_last_toggle = 0;
     bool was_add_down = false;
     bool was_remove_down = false;
     bool was_ready_down = false;
@@ -14494,10 +15397,65 @@ DWORD WINAPI HotkeyMain(void*) {
         const bool scroll_test_down = scroll_override > 0;
         const bool feedback = !g_suppress_hotkey_feedback.load(std::memory_order_acquire);
         const uint64_t lobby = g_owned_lobby.load(std::memory_order_acquire);
+        if (capture::GetConfig().mod_watermark_enabled &&
+            TitleScreenActive()) {
+            stats_overlay::EnsureInstalled();
+        }
+        CombatStats mission_stats;
+        const bool in_mission =
+            GetCombatStats(mission_stats) && mission_stats.in_mission;
+        ultrawide::SetMissionActive(in_mission);
+        if (capture::GetConfig().stats_overlay_enabled &&
+            capture::GetConfig().stats_overlay_start_visible && in_mission) {
+            stats_overlay::EnsureInstalled();
+        }
+        bool stats_overlay_accepted = false;
+        const char* stats_overlay_reason = "";
+        const bool stats_overlay_down = StatsOverlayHotkeyDown(
+            stats_overlay_accepted, stats_overlay_reason);
+        const unsigned stats_overlay_messages =
+            g_stats_overlay_key_messages.load(std::memory_order_acquire);
+        const bool stats_overlay_message =
+            stats_overlay_messages != stats_overlay_messages_seen;
+        stats_overlay_messages_seen = stats_overlay_messages;
+        const bool stats_overlay_edge =
+            stats_overlay_down && !was_stats_overlay_down;
+        const uint64_t stats_overlay_now = GetTickCount64();
+        // One physical press can reach both the poll and the window message;
+        // presses closer than 250 ms toggle only once.
+        if ((stats_overlay_message ||
+             (stats_overlay_edge && stats_overlay_accepted)) &&
+            stats_overlay_now - stats_overlay_last_toggle >= 250) {
+            stats_overlay_last_toggle = stats_overlay_now;
+            stats_overlay::Toggle();
+            EDF5_CAPTURE_EVENT("more_players", "stats_overlay_hotkey",
+                               capture::Fields()
+                                   .Bool("window_message",
+                                         stats_overlay_message)
+                                   .Bool("polled", stats_overlay_edge));
+        } else if (stats_overlay_edge && !stats_overlay_accepted) {
+            if (stats_overlay_rejections_logged < 8) {
+                ++stats_overlay_rejections_logged;
+                EDF5_CAPTURE_EVENT("more_players",
+                                   "stats_overlay_hotkey_ignored",
+                                   capture::Fields().String(
+                                       "reason", stats_overlay_reason));
+            }
+        }
+        was_stats_overlay_down = stats_overlay_down;
+        const bool ultrawide_down = capture::GetConfig().ultrawide &&
+            FocusedHotkeyDown(capture::GetConfig().ultrawide_hotkey_vk);
+        if (ultrawide_down && !was_ultrawide_down &&
+            stats_overlay_now - ultrawide_last_toggle >= 250) {
+            ultrawide_last_toggle = stats_overlay_now;
+            ultrawide::Toggle();
+        }
+        was_ultrawide_down = ultrawide_down;
         if (add_down && !was_add_down) TryAddBot(lobby, feedback);
         if (remove_down && !was_remove_down) TryRemoveBot(lobby, feedback);
         if (ready_down && !was_ready_down) RequestReadyBots(lobby, feedback);
-        if (invite_down && !was_invite_down) {
+        if (invite_down && !was_invite_down &&
+            (GetAsyncKeyState(VK_MENU) & 0x8000) == 0) {
             TryOpenInviteDialog(lobby, feedback);
         }
         if (local_mission_harness_down &&
@@ -15392,6 +16350,19 @@ bool InstallGameHooks() {
                        .Int("mission_clear_result", kMissionResultClear)
                        .UInt("identity_getter_rva", kUserIdGetterRva));
     InstallDamageMeterHooks(base, image_size);
+    // Optional: a mismatch only loses the title-screen watermark.
+    const bool title_hooked =
+        SignatureMatches(base, image_size, kHUiTitleUpdateRva,
+                         kHUiTitleUpdateSignature,
+                         sizeof(kHUiTitleUpdateSignature)) &&
+        hooks::Address(base + kHUiTitleUpdateRva,
+                       reinterpret_cast<void*>(&HUiTitleUpdateHook),
+                       reinterpret_cast<void**>(&g_hui_title_update),
+                       "HUiTitle::Update mod watermark", false);
+    EDF5_CAPTURE_EVENT("more_players", "title_watermark_hook",
+                       capture::Fields()
+                           .Bool("hooked", title_hooked)
+                           .UInt("title_update_rva", kHUiTitleUpdateRva));
     return true;
 }
 
@@ -15470,6 +16441,7 @@ void Stop() {
         win32_handle::CloseNullable(g_hotkey_thread);
         g_hotkey_thread_id = 0;
     }
+    stats_overlay::Shutdown();
     RestoreGameWindowProc();
     g_started.store(false, std::memory_order_release);
     g_create_pending.store(false, std::memory_order_release);
@@ -17621,8 +18593,8 @@ bool SelfTest(std::string& report) {
         auto* soldier0 = reinterpret_cast<void*>(uintptr_t{0x20000000});
         auto* soldier1 = reinterpret_cast<void*>(uintptr_t{0x20000100});
         const uintptr_t enemy = 0x30000000;
-        DamageMeterRegisterSoldier(0, soldier0, nullptr, nullptr);
-        DamageMeterRegisterSoldier(1, soldier1, nullptr, nullptr);
+        DamageMeterRegisterSoldier(0, soldier0, nullptr, nullptr, true);
+        DamageMeterRegisterSoldier(1, soldier1, nullptr, nullptr, false);
         for (int shot = 0; shot < 3; ++shot) {
             DamageMeterRecord(enemy, 0x20000000, 100.0f, projectile_a.data());
         }
@@ -17664,8 +18636,8 @@ bool SelfTest(std::string& report) {
             DamageMeterRecordOutgoing(list.data());
         }
         DamageMeterOnResult(3);  // two-part mission transition
-        DamageMeterRegisterSoldier(0, soldier0, nullptr, nullptr);
-        DamageMeterRegisterSoldier(1, soldier1, nullptr, nullptr);
+        DamageMeterRegisterSoldier(0, soldier0, nullptr, nullptr, true);
+        DamageMeterRegisterSoldier(1, soldier1, nullptr, nullptr, false);
         DamageMeterRecord(enemy, 0x20000000, 100.0f, projectile_a.data());
         DamageMeterOnResult(kMissionResultClear);
         DamageMeterRecord(enemy, 0x20000000, 999.0f, nullptr);  // after end
@@ -17675,7 +18647,45 @@ bool SelfTest(std::string& report) {
         g_damage_meter.end_tick = 11000;
         snapshot = g_damage_meter;
         ReleaseSRWLockExclusive(&g_damage_meter_lock);
-        const auto lines = BuildDamageMeterSummary(snapshot, 11000);
+        // P1 is controlled here, P2 by another machine: P2's total comes from
+        // the member data that machine published for itself.
+        DamageShareView merged = LocalDamageShareView(snapshot);
+        const bool share_local_ok = merged.known_mask == 1 &&
+            DamageMeterRegisteredMask(snapshot) == 3 &&
+            DamageMeterLocalMask(snapshot) == 1 &&
+            BuildDamageSharePayload(snapshot) == "1;0:0:420:5";
+        const bool share_accept_ok =
+            ApplyDamageSharePayload(snapshot, 777, "1;1:777:50:1", merged) &&
+            merged.known_mask == 3 && merged.remote_mask == 2 &&
+            std::fabs(merged.damage[1] - 50.0) < 0.001 &&
+            merged.hits[1] == 1 &&
+            // A second claim for the same participant is a conflict.
+            ApplyDamageSharePayload(snapshot, 888, "1;1:888:60:2", merged) &&
+            merged.conflict_mask == 2 &&
+            std::fabs(merged.damage[1] - 50.0) < 0.001;
+        DamageShareView unresolved = LocalDamageShareView(snapshot);
+        const bool share_reject_ok =
+            // Participant controlled here, foreign SteamID, unknown index.
+            ApplyDamageSharePayload(snapshot, 777, "1;0:777:999:1",
+                                    unresolved) &&
+            ApplyDamageSharePayload(snapshot, 777, "1;1:778:50:1",
+                                    unresolved) &&
+            ApplyDamageSharePayload(snapshot, 777, "1;9:777:5:1",
+                                    unresolved) &&
+            unresolved.entries_rejected == 3 &&
+            // Wrong format and malformed payloads are ignored as a whole.
+            !ApplyDamageSharePayload(snapshot, 777, "2;1:777:50:1",
+                                     unresolved) &&
+            !ApplyDamageSharePayload(snapshot, 777, "1;1:777:5x:1",
+                                     unresolved) &&
+            !ApplyDamageSharePayload(snapshot, 777, "1;1:777:50",
+                                     unresolved) &&
+            unresolved.payloads_rejected == 3 &&
+            ApplyDamageSharePayload(snapshot, 777, "1", unresolved) &&
+            unresolved.known_mask == 1 && unresolved.remote_mask == 0;
+        const auto lines = BuildDamageMeterSummary(snapshot, merged, 11000);
+        const auto partial_lines =
+            BuildDamageMeterSummary(snapshot, unresolved, 11000);
         const bool totals_ok =
             std::fabs(snapshot.players[0].damage - 420.0) < 0.001 &&
             snapshot.players[0].weapon_count == 1 &&
@@ -17694,24 +18704,31 @@ bool SelfTest(std::string& report) {
             snapshot.players[1].outgoing_hits == 1 &&
             std::fabs(snapshot.players[0].received_amount - 40.0) < 0.001 &&
             snapshot.players[0].zero_loss_hits == 1;
-        const bool summary_ok = lines.size() == 5 &&
-            lines[0] == L"[DPS] Mission: 10s - damage dealt per player" &&
-            lines[1] == L"P1: 42/s (420, 89%)" &&
-            lines[2] == L"  Weapon 1 40/s, other 2/s" &&
-            lines[3] == L"P2: 5/s (50, 11%)" &&
-            lines[4] == L"  Weapon 1 5/s";
+        const bool summary_ok = lines.size() == 3 &&
+            lines[0] == L"[Damage] Total per player (0:10)" &&
+            lines[1] == L"P1: 420 (89%)" &&
+            lines[2] == L"P2: 50 (11%)" &&
+            partial_lines.size() == 3 &&
+            partial_lines[1] == L"P1: 420 (100%)" &&
+            partial_lines[2] == L"P2: ? (no data)";
         // A re-created participant without a pending transition starts a
         // new measurement (previous mission abandoned).
-        DamageMeterRegisterSoldier(0, soldier0, nullptr, nullptr);
+        DamageMeterRegisterSoldier(0, soldier0, nullptr, nullptr, true);
         DamageMeterRecord(enemy, 0x20000000, 10.0f, nullptr);
         AcquireSRWLockShared(&g_damage_meter_lock);
         const bool restart_ok =
             std::fabs(g_damage_meter.players[0].damage - 10.0) < 0.001 &&
             !g_damage_meter.ended;
         ReleaseSRWLockShared(&g_damage_meter_lock);
-        const bool amounts_ok = FormatDamageAmount(9999.4) == L"9999" &&
-            FormatDamageAmount(152340.0) == L"152k" &&
-            FormatDamageAmount(2450000.0) == L"2.5M";
+        const bool amounts_ok = FormatDamageTotal(0.0) == L"0" &&
+            FormatDamageTotal(999.0) == L"999" &&
+            FormatDamageTotal(1000.0) == L"1,000" &&
+            FormatDamageTotal(9999.4) == L"9,999" &&
+            FormatDamageTotal(152340.0) == L"152,340" &&
+            FormatDamageTotal(2450000.0) == L"2,450,000" &&
+            FormatMissionClock(5) == L"0:05" &&
+            FormatMissionClock(754) == L"12:34" &&
+            FormatMissionClock(3725) == L"1:02:05";
         std::array<char, kDamageMeterLabelLength> label{};
         DamageMeterLabelFromTypeName(".?AVWeapon_Gatling@@", label);
         const bool label_ok = std::strcmp(label.data(), "Gatling") == 0;
@@ -17721,6 +18738,181 @@ bool SelfTest(std::string& report) {
         if (!totals_ok || !summary_ok || !restart_ok || !amounts_ok ||
             !label_ok) {
             return fail("damage meter attribution or summary failed");
+        }
+        if (!share_local_ok || !share_accept_ok || !share_reject_ok) {
+            return fail("damage meter lobby total sharing failed");
+        }
+    }
+
+    {
+        // Stats overlay numbers: hostile kills, Mission() time across a
+        // pause, the recent DPS window and local participants only.
+        g_damage_meter_test_classifier = [](uintptr_t) {
+            return DamageMeterClassKind::unknown;
+        };
+        ResetDamageMeter();
+        const bool saved_installed =
+            g_damage_meter_installed.exchange(true, std::memory_order_acq_rel);
+        const bool saved_kills = g_damage_meter_kills_supported.exchange(
+            true, std::memory_order_acq_rel);
+        auto* soldier0 = reinterpret_cast<void*>(uintptr_t{0x20000000});
+        auto* soldier1 = reinterpret_cast<void*>(uintptr_t{0x20000100});
+        g_damage_meter_test_now.store(100000, std::memory_order_release);
+        DamageMeterRegisterSoldier(0, soldier0, nullptr, nullptr, true);
+        DamageMeterRegisterSoldier(1, soldier1, nullptr, nullptr, false);
+        DamageMeterOnMissionUpdate(100000);
+        DamageMeterOnMissionUpdate(100500);  // +500
+        DamageMeterOnMissionUpdate(130500);  // 30 s pause counts 1000
+        DamageMeterOnMissionUpdate(131000);  // +500 -> 2000 ms
+        g_damage_meter_test_now.store(131000, std::memory_order_release);
+        DamageMeterRecord(0x30000000, 0x20000000, 300.0f, nullptr, 0.0f,
+                          true);
+        DamageMeterRecord(0x30000010, 0x20000000, 200.0f, nullptr, 0.0f,
+                          false);
+        // Another machine's participant: not part of the local overlay.
+        DamageMeterRecord(0x30000020, 0x20000100, 500.0f, nullptr, 0.0f,
+                          true);
+        // Friendly fire: P1 hits P2 twice, the second hit downs P2; a hit on
+        // an allied NPC counts nowhere.
+        DamageMeterRecord(0x20000100, 0x20000000, 60.0f, nullptr);
+        DamageMeterRecord(0x20000100, 0x20000000, 40.0f, nullptr, 0.0f, false,
+                          false, true);
+        DamageMeterRecord(0x30000030, 0x20000000, 70.0f, nullptr, 0.0f, false,
+                          true, true);
+        CombatStats live;
+        const bool live_ok = GetCombatStats(live) && live.in_mission &&
+            live.kills_supported && live.active_ms == 2000 &&
+            live.count == 1 && live.players[0].participant_index == 0 &&
+            std::fabs(live.players[0].damage - 500.0) < 0.001 &&
+            live.players[0].kills == 1 &&
+            std::fabs(live.players[0].friendly_damage - 100.0) < 0.001 &&
+            live.players[0].friendly_kills == 1 &&
+            std::fabs(live.players[0].recent_dps - 250.0) < 0.001;
+        // Fourteen seconds later the hits left the recent window, and the
+        // mission script has not updated for too long to count as running.
+        g_damage_meter_test_now.store(145000, std::memory_order_release);
+        CombatStats idle;
+        const bool idle_ok = GetCombatStats(idle) && !idle.in_mission &&
+            idle.count == 1 && idle.players[0].recent_dps == 0.0 &&
+            std::fabs(idle.players[0].damage - 500.0) < 0.001;
+        g_damage_meter_test_now.store(145000, std::memory_order_release);
+        DamageMeterOnMissionUpdate(145000);
+        DamageMeterOnResult(kMissionResultClear);
+        CombatStats ended;
+        const bool ended_ok = GetCombatStats(ended) && !ended.in_mission;
+        g_damage_meter_test_now.store(0, std::memory_order_release);
+        g_damage_meter_installed.store(saved_installed,
+                                       std::memory_order_release);
+        g_damage_meter_kills_supported.store(saved_kills,
+                                             std::memory_order_release);
+        g_damage_meter_test_classifier = nullptr;
+        ResetDamageMeter();
+        if (!live_ok || !idle_ok || !ended_ok) {
+            return fail("stats overlay combat statistics failed");
+        }
+        // Team relation table walk used for kills: G -> owner, owner+0x38
+        // -> rows (0x38 stride), row+0x18 -> int32 relation per target team.
+        alignas(16) std::array<int32_t, 2> row0_values{1, 0};  // 0 vs 0/1
+        alignas(16) std::array<int32_t, 2> row1_values{0, 1};
+        alignas(16) std::array<uint8_t, 2 * kTeamRelationRowStride> rows{};
+        const int32_t* row0 = row0_values.data();
+        const int32_t* row1 = row1_values.data();
+        std::memcpy(rows.data() + kTeamRelationRowValuesOffset, &row0,
+                    sizeof(row0));
+        std::memcpy(rows.data() + kTeamRelationRowStride +
+                        kTeamRelationRowValuesOffset,
+                    &row1, sizeof(row1));
+        alignas(16) std::array<uint8_t, 0x40> owner{};
+        const uint8_t* rows_pointer = rows.data();
+        std::memcpy(owner.data() + kTeamRelationTableOffset, &rows_pointer,
+                    sizeof(rows_pointer));
+        const uint8_t* owner_pointer = owner.data();
+        const uintptr_t saved_relation_global =
+            g_team_relation_global.exchange(
+                reinterpret_cast<uintptr_t>(&owner_pointer),
+                std::memory_order_acq_rel);
+        const bool relation_ok = TeamRelation(0, 0) == 1 &&
+            TeamRelation(0, 1) == 0 && TeamRelation(1, 1) == 1 &&
+            TeamRelation(-1, 1) == -1 && TeamRelation(1, -1) == -1 &&
+            TeamRelation(kTeamRelationMaxTeams, 0) == -2;
+        g_team_relation_global.store(0, std::memory_order_release);
+        const bool relation_unverified_ok = TeamRelation(0, 1) == -2;
+        g_team_relation_global.store(saved_relation_global,
+                                     std::memory_order_release);
+        if (!relation_ok || !relation_unverified_ok) {
+            return fail("damage meter team relation lookup failed");
+        }
+        // Radar count: a stand-in enumerator visits three hostiles through
+        // functor->vtable[1](functor, object), like 0x32C7D0 at 0x32C886.
+        {
+            static int32_t seen_team = -1;
+            seen_team = -1;
+            const auto fake_enumerator = [](void* owner, int32_t team,
+                                            void* functor) {
+                if (!owner) return;
+                seen_team = team;
+                auto* const* vtable = *static_cast<void* const* const*>(functor);
+                using VisitFn = void(__fastcall*)(void*, void*);
+                const auto visit = reinterpret_cast<VisitFn>(vtable[1]);
+                for (int index = 0; index < 3; ++index) visit(functor, owner);
+            };
+            const HostileEnumeratorFn saved_enumerator = g_hostile_enumerator;
+            const uintptr_t saved_global = g_team_relation_global.exchange(
+                reinterpret_cast<uintptr_t>(&owner_pointer),
+                std::memory_order_acq_rel);
+            g_hostile_enumerator = fake_enumerator;
+            const bool counted_ok = CountHostiles(1) == 3 && seen_team == 1 &&
+                CountHostiles(-1) == -1 &&
+                CountHostiles(kTeamRelationMaxTeams) == -1;
+            g_hostile_enumerator = saved_enumerator;
+            g_team_relation_global.store(saved_global,
+                                         std::memory_order_release);
+            if (!counted_ok) {
+                return fail("stats overlay radar enemy count failed");
+            }
+        }
+        // Distance: a soldier object whose world position (+0xA0) moves
+        // 3-4-5 (5 m), teleports 100 m (ignored), then walks 1 m.
+        {
+            g_damage_meter_test_classifier = [](uintptr_t) {
+                return DamageMeterClassKind::unknown;
+            };
+            ResetDamageMeter();
+            const bool saved_installed_distance = g_damage_meter_installed
+                .exchange(true, std::memory_order_acq_rel);
+            alignas(16) std::array<uint8_t, 0x200> soldier_object{};
+            auto place = [&](float x, float y, float z) {
+                const float position[3] = {x, y, z};
+                std::memcpy(soldier_object.data() + kGameObjectPositionOffset,
+                            position, sizeof(position));
+            };
+            place(10.0f, 0.0f, 10.0f);
+            DamageMeterRegisterSoldier(0, soldier_object.data(), nullptr,
+                                       nullptr, true);
+            DamageMeterOnMissionUpdate(200000);
+            place(13.0f, 0.0f, 14.0f);
+            DamageMeterOnMissionUpdate(200100);
+            place(113.0f, 0.0f, 14.0f);
+            DamageMeterOnMissionUpdate(200200);
+            place(113.0f, 1.0f, 14.0f);
+            DamageMeterOnMissionUpdate(200300);
+            g_damage_meter_test_now.store(200300, std::memory_order_release);
+            CombatStats moved;
+            const bool distance_ok = GetCombatStats(moved) &&
+                moved.count == 1 &&
+                std::fabs(moved.players[0].distance - 6.0) < 0.001;
+            g_damage_meter_test_now.store(0, std::memory_order_release);
+            g_damage_meter_installed.store(saved_installed_distance,
+                                           std::memory_order_release);
+            g_damage_meter_test_classifier = nullptr;
+            ResetDamageMeter();
+            if (!distance_ok) {
+                return fail("stats overlay distance accounting failed");
+            }
+        }
+        std::string overlay_report;
+        if (!stats_overlay::SelfTest(overlay_report)) {
+            return fail(overlay_report.c_str());
         }
     }
 

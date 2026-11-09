@@ -529,4 +529,35 @@ bool CopyActualLobbyMemberData(uint64_t lobby, uint64_t user,
     return true;
 }
 
+uint64_t GetActualLobbyMemberByIndex(uint64_t lobby, int index) {
+    MemberByIndexFn member_by_index = nullptr;
+    void* interface_pointer = nullptr;
+    AcquireSRWLockShared(&g_match_lock);
+    member_by_index = o_member_by_index;
+    interface_pointer = g_match_interface;
+    ReleaseSRWLockShared(&g_match_lock);
+    if (!member_by_index || !interface_pointer || !lobby || index < 0) {
+        return 0;
+    }
+    SteamId result = 0;
+    member_by_index(interface_pointer, &result, lobby, index);
+    return result;
+}
+
+bool SetActualLobbyMemberData(uint64_t lobby, const char* key,
+                              const char* value) {
+    SetMemberDataFn set_member_data = nullptr;
+    void* interface_pointer = nullptr;
+    AcquireSRWLockShared(&g_match_lock);
+    set_member_data = o_set_member_data;
+    interface_pointer = g_match_interface;
+    ReleaseSRWLockShared(&g_match_lock);
+    if (!set_member_data || !interface_pointer || !lobby || !key || !*key ||
+        !value) {
+        return false;
+    }
+    set_member_data(interface_pointer, lobby, key, value);
+    return true;
+}
+
 }  // namespace steam_capture

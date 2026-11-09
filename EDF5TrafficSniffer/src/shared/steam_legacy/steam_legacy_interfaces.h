@@ -28,6 +28,12 @@ uint64_t LocalUserSteamId();
 int GetActualLobbyMemberCount(uint64_t lobby);
 bool CopyActualLobbyMemberData(uint64_t lobby, uint64_t user,
                                const char* key, std::string& value);
+// Real lobby member at index (no synthetic fillers); 0 when unavailable.
+uint64_t GetActualLobbyMemberByIndex(uint64_t lobby, int index);
+// Writes this user's own member data through the original, unhooked
+// SetLobbyMemberData (the game's member-data observation is not involved).
+bool SetActualLobbyMemberData(uint64_t lobby, const char* key,
+                              const char* value);
 bool SelfTestPrivateIdentityAudit(std::string& report);
 
 }  // namespace steam_capture

@@ -1,4 +1,4 @@
-EDF5_MultiSlotMod v0.6.79 - PACOTE DE TESTE (6+ JOGADORES)
+EDF5_MultiSlotMod v0.6.80 - PACOTE DE TESTE (6+ JOGADORES)
 
 Pre-requisito:
 - EDFModLoader 1.0.10 instalado em cada computador.
@@ -13,7 +13,7 @@ Instalacao:
    EDF5.exe) e confirme a mesclagem da pasta Mods.
 4. Confira que existem Mods\Plugins\EDF5_MultiSlotMod.dll e .ini.
 5. Ao criar/entrar numa sala, o chat deve mostrar
-   `*** EDF5_MultiSlotMod v0.6.79 ***`.
+   `*** EDF5_MultiSlotMod v0.6.80 ***`.
    Se a linha nao aparecer, o mod se desativou por seguranca: envie o arquivo
    Mods\TrafficSniffer\startup-failures.log.
 6. NAO use a v0.6.66: ela se desativava sozinha ao abrir o jogo.
@@ -29,6 +29,58 @@ IMPORTANTE - SE O JOGO FECHAR AO ENTRAR EM SALA COM 5+ JOGADORES:
 - Se ainda bloquear, e o "Controle Inteligente de Aplicativos" (Smart App
   Control) do Windows 11, em Seguranca do Windows > Controle de aplicativos
   e do navegador.
+
+Novidade da 0.6.80:
+- O medidor agora mostra o DANO TOTAL de cada jogador desde o inicio da
+  fase (somando as duas partes das missoes em duas etapas), nao mais o dano
+  por segundo. Ao voltar para a sala, TODOS os jogadores (nao so o host)
+  veem no proprio chat, por exemplo:
+    [Damage] Total per player (12:34)
+    Nome1: 1,234,567 (54%)
+    Nome2: 845,210 (37%)
+    Nome3: ? (no data)
+- Numeros corrigidos para quem nao e o host: cada computador mede o dano
+  do proprio jogador (o unico que enxerga todos os acertos dele) e manda o
+  total para os outros pelos dados do lobby da Steam no fim da fase.
+  "? (no data)" aparece para quem esta sem o mod / com versao antiga ou se o
+  total nao chegar em 10 segundos.
+- A mensagem e local: nada e enviado no chat da sala.
+- Ligado por padrao (DamageMeterChat=true). Para desligar a mensagem:
+  DamageMeterChat=false no EDF5_MultiSlotMod.ini.
+- Ainda nao conta dano de veiculos, torres/armas instaladas e ataques
+  aereos do Air Raider (o atacante nesses casos nao e o soldado). Mande o
+  relatorio (CreateDebugReport) de host e clientes depois de uma fase para
+  conferirmos.
+- NOVO: durante a fase, aperte TAB para mostrar/esconder um painel com os
+  numeros do SEU personagem: dano total, DPS (media da fase e ultimos 10 s),
+  kills, distancia percorrida, fogo amigo em outros players (dano e
+  players derrubados, em laranja quando houver), inimigos vivos (a mesma
+  contagem dos pontos
+  vermelhos do radar, incluindo os fora do alcance) e tempo de fase. O
+  painel ja aparece no inicio da missao (StatsOverlayStartVisible=true).
+  So funciona com a janela do jogo em foco (Alt+Tab
+  nao liga o painel). Configuravel no EDF5_MultiSlotMod.ini:
+  StatsOverlayEnabled, StatsOverlayHotkeyVK (9 = Tab), StatsOverlayX/Y
+  (posicao em % da tela; padrao 2/96 = canto inferior esquerdo, onde o jogo
+  nao tem HUD) e StatsOverlayScale (tamanho em %).
+  Kill = o seu tiro zerou a vida de um inimigo hostil (partes de
+  chefes/naves com vida propria contam separadas). Dano em soldados NPC
+  aliados nao entra em nada (nem no dano, nem no fogo amigo).
+- Alt+F4 nao abre mais o convite da Steam (F4) ao fechar o jogo.
+- NOVO: monitor ultrawide (mais largo que 16:9, ex. 2560x1080 ou 3440x1440):
+  durante a missao, o cenario 3D ocupa a tela inteira sem esticar (mesma
+  visao vertical, mais mundo visivel nas laterais), sem as barras pretas. O
+  HUD vai para os cantos da tela: armadura na esquerda, radar e armas na
+  direita. A pausa continua no centro, sem esticar. Tela inicial, menus,
+  sala e resultado ficam como no jogo original. Aperte HOME durante a
+  missao para alternar com a imagem original (16:9 com barras). Monitores
+  16:9 e 16:10 nao mudam nada. No EDF5_MultiSlotMod.ini: Ultrawide=false
+  desliga, UltrawideStartEnabled=false comeca na imagem original,
+  UltrawideHudCorners=false deixa o HUD no centro, UltrawideHotkeyVK (36 =
+  Home) troca a tecla.
+- NOVO: na tela inicial do jogo aparece "EDF5_MultiSlotMod v0.6.80" no canto
+  superior direito (com "Diagnostics" no pacote de teste). Se nao aparecer,
+  o mod nao carregou. Para esconder: ModWatermarkEnabled=false no .ini.
 
 Novidade da 0.6.79:
 - O DPS no chat foi desligado por enquanto: os numeros estavam errados para

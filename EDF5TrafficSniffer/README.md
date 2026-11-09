@@ -148,7 +148,7 @@ The explicit opt-in is required even if the numeric multiplier changes.
 The local room chat displays this once after create/join:
 
 ```text
-*** EDF5_MultiSlotMod v0.6.66 ***
+*** EDF5_MultiSlotMod v0.6.80 ***
 If you have 4 players in the room,
 press F4 to invite more.
 ```
@@ -159,13 +159,17 @@ does not send the banner through Steam chat or require a player identity.
 | Control | Action |
 | --- | --- |
 | F4 | Open Steam's invite dialog for the locally created room |
+| (automatic) | Title screen: `EDF5_MultiSlotMod v<version>` in the top-right corner, drawn by the stats overlay renderer while `HUiTitle::Update` runs (`ModWatermarkEnabled`) |
+| Tab | During a mission, show/hide your own character's total damage, DPS (stage average and last 10 s), kills, distance moved and friendly fire on other players (damage and kills), the living enemies (the radar's own count) and stage time; shown when a mission starts (`StatsOverlayStartVisible`, `StatsOverlayEnabled`, `StatsOverlayHotkeyVK`, `StatsOverlayX/Y/Scale`, bottom-left corner by default); only while EDF5 has focus and Alt is up |
+| (automatic) | Screens wider than 16:9 (21:9, 32:9), during missions only: the 3D scene fills the whole screen without stretching (same vertical view, more of the world at the sides) and the HUD gauges sit in the screen corners: armor left, radar and weapons right (`Ultrawide`, `UltrawideHudCorners`, `UltrawideStartEnabled`); title, menus, room and result screens keep the original picture; 16:9 and 16:10 screens are unchanged |
+| Home | Switch between the ultrawide picture and the game's original centred 16:9 picture (`UltrawideHotkeyVK`); only while EDF5 has focus and Alt is up |
 | Mouse wheel | Scroll the room list anywhere in the room window; the game still receives the wheel for its own menus |
 | F8 | Add one synthetic filler up to the effective room limit |
 | F7 | Remove the newest filler |
 | F6 | Reapply EDF5 filler Ready properties |
 | F3 | Cycle host-only mission harness: host+3, host+4 ... host+7, Off |
 | F5 | Request mission-clear result during an active stage, when debug mode is enabled |
-| (automatic) | Measures damage per player per mission in the diagnostic log (`DamageMeterEnabled`); room chat summary only with `DamageMeterChat=true` (under validation) |
+| (automatic) | Measures each player's total damage since the stage began (`DamageMeterEnabled`). Each machine measures its own players and shares the totals in Steam lobby member data; back in the room every player sees the merged summary in their own chat (`DamageMeterChat`, local message only) |
 | (automatic) | With 5-8 players enemy HP keeps scaling past the four-player table (`ExtendedEnemyHealthScaling`, `EnemyHealth5Players`..`EnemyHealth8Players`) |
 | F9 | Diagnostics live snapshot/minidump |
 | F10 | Toggle bounded deep capture in Diagnostics |

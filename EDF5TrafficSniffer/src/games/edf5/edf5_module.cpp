@@ -6,6 +6,7 @@
 #include "logger.h"
 #include "more_players.h"
 #include "steam_interfaces.h"
+#include "ultrawide.h"
 #include "winsock_hooks.h"
 
 #include <iterator>
@@ -132,6 +133,8 @@ bool Load(HMODULE plugin_module) {
     if (config.coop8 && !more_players::InstallGameHooks()) {
         return Quarantine("EDF5 Coop8 game hooks failed");
     }
+    // Optional: a signature mismatch only keeps the original 16:9 picture.
+    ultrawide::Install();
 
     bool steam_ok = true;
     bool winsock_ok = true;

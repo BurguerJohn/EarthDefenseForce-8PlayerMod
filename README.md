@@ -7,6 +7,9 @@ patches, offline regression tests and optional diagnostics.
 
 F4 opens Steam's invite dialog for a locally created room, including after the
 game's usual four-player UI limit. The mouse wheel scrolls the participant list.
+During a mission, Tab shows or hides your own character's total damage, DPS,
+kills and stage time; back in the room every player sees each player's total
+damage in their own chat.
 Synthetic fillers and a host-only mission harness are available for development;
 fillers have no combat AI and are not real Steam lobby members.
 
@@ -42,15 +45,18 @@ following dependencies relative to this README:
 EDFModLoader/EDFModLoader/PluginAPI.h
 SteamworksSDK-Headers/public/steam/steam_api.h
 EDF5TrafficSniffer/third_party/minhook/include/MinHook.h
+EDF5TrafficSniffer/third_party/imgui/imgui.h
 EDF5TrafficSniffer/tools/zig/zig.exe
 ```
 
-Obtain the pinned EDFModLoader 1.0.10 and MinHook 1.3.4 sources with:
+Obtain the pinned EDFModLoader 1.0.10, MinHook 1.3.4 and Dear ImGui 1.91.8
+sources with:
 
 ```powershell
 git clone https://github.com/BlueAmulet/EDFModLoader.git EDFModLoader
 git -C EDFModLoader checkout c686e8fb48121e0a6b3f6b7f42d6df0d5249678b
 git clone --branch v1.3.4 --depth 1 https://github.com/TsudaKageyu/minhook.git EDF5TrafficSniffer/third_party/minhook
+git clone --branch v1.91.8 --depth 1 https://github.com/ocornut/imgui.git EDF5TrafficSniffer/third_party/imgui
 ```
 
 Extract Zig 0.14.1 at the path above. Obtain compatible Steamworks SDK headers

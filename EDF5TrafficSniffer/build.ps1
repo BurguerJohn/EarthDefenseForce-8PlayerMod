@@ -26,9 +26,13 @@ $output = if ($Flavor -eq 'Users') {
 }
 $loaderApi = Join-Path $project '..\EDFModLoader\EDFModLoader'
 $minhook = Join-Path $project 'third_party\minhook'
+$imgui = Join-Path $project 'third_party\imgui'
 
 if (-not (Test-Path -LiteralPath (Join-Path $loaderApi 'PluginAPI.h'))) {
     throw "EDFModLoader PluginAPI.h not found at '$loaderApi'."
+}
+if (-not (Test-Path -LiteralPath (Join-Path $imgui 'imgui.h'))) {
+    throw "Dear ImGui not found at '$imgui'. See README.md for the pinned v1.91.8 setup."
 }
 
 New-Item -ItemType Directory -Force -Path $output | Out-Null
@@ -49,6 +53,8 @@ $cppSources = @(
     (Join-Path $project 'src\games\edf5\coop8\mission_result_recovery.cpp'),
     (Join-Path $project 'src\games\edf5\coop8\more_players.cpp'),
     (Join-Path $project 'src\games\edf5\coop8\game_patches.cpp'),
+    (Join-Path $project 'src\games\edf5\coop8\stats_overlay.cpp'),
+    (Join-Path $project 'src\games\edf5\coop8\ultrawide.cpp'),
     (Join-Path $project 'src\games\edf5\sniffer\steam_hooks.cpp'),
     (Join-Path $project 'src\shared\steam_legacy\steam_user_auth.cpp'),
     (Join-Path $project 'src\shared\steam_legacy\steam_friends.cpp'),
@@ -70,6 +76,14 @@ if ($Flavor -eq 'Diagnostics') {
         (Join-Path $project 'src\games\edf41\sniffer\version_guard.cpp')
     )
 }
+# Dear ImGui draws the stats overlay; compiled like the other third-party code.
+$thirdPartyCppSources = @(
+    (Join-Path $imgui 'imgui.cpp'),
+    (Join-Path $imgui 'imgui_draw.cpp'),
+    (Join-Path $imgui 'imgui_tables.cpp'),
+    (Join-Path $imgui 'imgui_widgets.cpp'),
+    (Join-Path $imgui 'backends\imgui_impl_dx11.cpp')
+)
 $cSources = @(
     (Join-Path $minhook 'src\buffer.c'),
     (Join-Path $minhook 'src\hook.c'),
@@ -105,7 +119,13 @@ $commonArguments = @(
     '-I', $loaderApi,
     '-I', (Join-Path $minhook 'include'),
     '-I', (Join-Path $minhook 'src'),
-    '-I', (Join-Path $minhook 'src\hde')
+    '-I', (Join-Path $minhook 'src\hde'),
+    '-I', $imgui,
+    '-I', (Join-Path $imgui 'backends'),
+    '-DIMGUI_DISABLE_WIN32_FUNCTIONS',
+    '-DIMGUI_DISABLE_DEMO_WINDOWS',
+    '-DIMGUI_DISABLE_DEBUG_TOOLS',
+    '-DIMGUI_DISABLE_OBSOLETE_FUNCTIONS'
 )
 foreach ($includeDirectory in $sourceIncludeDirectories) {
     $commonArguments += @('-I', $includeDirectory)
@@ -172,6 +192,12 @@ function Get-ObjectPath {
 foreach ($source in $cppSources) {
     $object = Get-ObjectPath $source
     Invoke-Zig (@('c++') + $commonArguments + $firstPartyCppWarnings + @('-std=c++17', '-c', $source, '-o', $object))
+    $objects += $object
+}
+
+foreach ($source in $thirdPartyCppSources) {
+    $object = Get-ObjectPath $source
+    Invoke-Zig (@('c++') + $commonArguments + @('-std=c++17', '-w', '-c', $source, '-o', $object))
     $objects += $object
 }
 

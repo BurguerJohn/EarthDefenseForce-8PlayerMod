@@ -84,8 +84,29 @@ struct Config {
     unsigned local_mission_harness_hotkey_vk = VK_F3;
     bool debug_stage_win_enabled = true;
     bool damage_meter_enabled = true;
-    // Post the summary in the host's room chat (off: log only).
-    bool damage_meter_chat = false;
+    // Print the total damage summary in this machine's room chat (off: log only).
+    bool damage_meter_chat = true;
+    // On-screen stats of the local character, toggled by a hotkey (Tab).
+    bool stats_overlay_enabled = true;
+    unsigned stats_overlay_hotkey_vk = 0x09;
+    // The box's matching corner sits at this percentage of the screen
+    // (bottom-left by default: no game HUD there).
+    unsigned stats_overlay_x_percent = 2;
+    unsigned stats_overlay_y_percent = 96;
+    unsigned stats_overlay_scale_percent = 100;
+    // Panel already shown when a mission starts (Tab still toggles it).
+    bool stats_overlay_start_visible = true;
+    // Mod name and version in a corner of the title screen.
+    bool mod_watermark_enabled = true;
+    // Screens wider than 16:9: the scene fills the screen (no side bars) and,
+    // with hud_corners, the HUD gauges sit in the screen corners. The hotkey
+    // (Home) switches to the original picture and back.
+    bool ultrawide = true;
+    // false: the game starts with the original picture (the hotkey still
+    // switches).
+    bool ultrawide_start_enabled = true;
+    bool ultrawide_hud_corners = true;
+    unsigned ultrawide_hotkey_vk = VK_HOME;
     bool extended_enemy_health_scaling = true;
     // EnemyHealth5Players..EnemyHealth8Players; 0 = automatic step.
     float enemy_health_multipliers[4] = {0.0f, 0.0f, 0.0f, 0.0f};

@@ -195,6 +195,101 @@ stride, target `+0`, attacker `+0x20`, amount `+0x60`) whose attacker is a
 registered soldier and whose target is not. Each machine's log therefore holds
 what its own player sent, for comparison with the host's received totals.
 
+0.6.80: total damage instead of DPS, correct for every player. The objects'
+message pre-filter (vtable slot 7 `0x2DAC10` -> NetworkObject component at
+`object+0xC0`, `0x402C00`) leaves a `0x80000000` damage message local while
+the attacker weak_ptr (`GameDamageInfo +0x18`) is alive; with no live attacker
+a non-authoritative machine rewrites it to `0x4000004`. Network-delivered
+damage arrives as `0x4000001` and the same filter unwraps it into
+`0x80000000` without a live attacker. So every machine applies its own
+soldiers' hits through ApplyDamage, and only that machine sees all of them.
+Each participant now records whether it is locally controlled (the
+MissionPlayerCreate controller resolution). At a measurement start every
+machine clears its lobby member data key `edf5mp_dmg`; at mission end it
+writes `1;<index>:<steam id>:<damage>:<hits>` for its local participants
+through the original SetLobbyMemberData. Back in the room each machine reads
+the real lobby members (fillers excluded) every 250 ms for up to 10 s and
+accepts an entry only for a registered participant that is not local and
+whose SteamID equals the declared one (the member's own ID when unknown);
+a second claim is a conflict and members that left are not awaited. The
+summary is printed with the native local system-message publisher on every
+machine (`DamageMeterChat`, default true); missing totals show `? (no data)`.
+Damage whose attacker is not the soldier (vehicles, deployed weapons, air
+raids) is still not credited.
+
+0.6.80 stats overlay (Tab): local participants only. A kill is a credited hit
+that takes the target's health from above zero to zero or below (the same
+`0 >= health` test as `0x2DAC60`, which then sets `object+0x280 |= 0x10`) on a
+target the game does not treat as friendly. That is ApplyDamage's own test:
+attacker team `GameDamageInfo +0x24` and target team `object+0x218`
+(`0x2DB408`/`0x2DB411`); only when both are valid, the relation
+`*(int*)(*(*(G+0x38) + attacker*0x38 + 0x18) + target*4)` with `G` the
+global loaded at `0x2DB421` (RVA `0x125AB80`) equal to 1 means friendly and
+2 hostile. A killing blow unregisters the target from its team inside
+ApplyDamage, so its team reads -1 afterwards (live 0.6.80, players are teams 0
+and 2): the target team is read before the native call and a kill counts only
+for relation 2, the radar's definition. The reads are signature-checked
+separately; a mismatch only hides kills, and an unreadable table falls back
+to "different valid team".
+
+Distance: the soldier's world position is the translation row `+0xA0`
+(x, y up, z) of the GameObjectBase world matrix at `+0x70`; a census of
+position subtractions (`movaps [a+D]`/`subps [b+D]`) ranks `+0xA0` first among
+object registers. Each `Mission()` update adds the step of every local
+soldier; steps above 30 m (spawn, teleport, part change) or below 1 mm are
+ignored, and nothing is read while a two-part transition is pending. Live
+0.6.80: plausible against walked distance.
+
+Living enemies: `0x32C7D0(G, team, functor)` is the radar's enumerator
+(HUiHudRader slot 2 at `0x4CDADE`, nine other callers). Under G's critical
+section (G+8) it walks every team whose relation to `team` is 2, visits each
+object of that team's `std::set` (node value `+0x20`) with health > 0 and no
+`+0x280` flag `0x80`, and calls `functor->vtable[1](object)`. Every 250 ms the
+mission update calls it, outside the plugin's locks, with the local soldier's
+team and a counting functor; the overlay shows counts at most 2 s old. Live
+0.6.80: matches the mission's enemies. The spawn boundary's global counter
+(`[0x124DD8C]`, compared with the 400 cap) did not match and is not used.
+A Wing Diver flight flag was not identified; that metric was dropped.
+
+Ultrawide (screens wider than 16:9, keep-aspect option on): EDF5 lays out a
+centred 16:9 area (`0x60C120`) and every consumer of the keep-aspect byte
+uses it. The swap chain, depth buffer and several effect targets are already
+screen-sized; the scene renders deferred into view render targets sized by
+the view rect (from the screen object's 16:9 size), and the camera takes its
+aspect from that rect (vertical FOV), so a full-screen rect gives Hor+.
+`0x6153A0` widens a rect equal to the area; `0x5EF930` moves back viewports
+the wider rect would push past the right edge (camera and layer paths add
+the area offset); the composite (`0x3D8920`) takes the screen path and the
+screen size for its 2D projection. HUD corners: the UI viewport
+(`0x3D7D30`) and the layer/HUD viewport (`0x623FF7`) take the screen path,
+every UI projection built from `0x4B2FB0`, `0x4B2390` and slot 10
+`0x4B2590` is compressed on x by area/screen, and the power gauge, radar and
+weapon panels (RTTI-checked vtables) move by the area offset to their side.
+The picture is switched in the scene update `0x611BB0` (game thread, where
+EDF5 refreshes views itself); the render thread only reads the state.
+It is only used during missions, from one second after the damage meter
+sees the mission until it ends: UI built while the full-screen UI viewport
+is active scales itself to it (the title came out zoomed 1.33x when the
+picture was on from the first frame), so the title, menus, room and
+result screens keep the original picture.
+A plain C++ detour on `0x5BE700` crashed (caller at `0x4B4309` used r8/r9
+after the call): every ultrawide hook enters through a stub that preserves
+all general and XMM registers.
+
+Friendly fire (players only): a credited hit whose target is another
+registered player soldier adds the health it removed to the shooter's
+friendly fire and counts a friendly kill when it takes that player from above
+zero to zero or below; it never counts as enemy damage. For the players' own
+hits the hook also reads the relation of the target's team (read before the
+native call): relation 1 (allied NPC soldiers) is excluded from both enemy
+damage and friendly fire. Hits by non-players skip the relation lookup. Overlay hooks: Present and
+Present1 (slot 22) with a re-entry guard; EDF5's back buffer is
+R8G8B8A8_UNORM with 8x MSAA, so the view must be TEXTURE2DMS (an
+intermediate copy is used for back buffers without render-target binding). Stage time
+accumulates on each `Mission()` update (`0x3E1890`), counting at most 1 s per
+gap so pauses and loading are excluded. Recent DPS sums per-second buckets of
+the last 10 s. Multi-part targets with their own health count once per part.
+
 ## Hook installation criteria
 
 Require an exact supported signature, a known callsite ABI (volatile registers,

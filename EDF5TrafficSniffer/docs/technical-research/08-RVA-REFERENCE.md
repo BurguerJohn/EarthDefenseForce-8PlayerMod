@@ -110,6 +110,22 @@ identity arguments are neither the lobby nor the SteamID (live 0.6.71 log);
 | `0x1437FE/0x1441E6` | projectile-system flush calls (`lea rcx,[projectile+0x80]`) |
 | `0x146D80` | projectile system update (called from `0x3D84F1`) |
 | `0x4FCE0` | GameObject SendMessage (vtable +0x38/+0x30/+0x40) |
+| `0x2DAC10` | GameObjectBase message pre-filter (vtable slot 7), forwards to the NetworkObject component at `+0xC0` |
+| `0x402C00` | NetworkObject pre-filter: keeps damage local with a live attacker, unwraps network damage `0x4000001`, rewrites attacker-less damage to `0x4000004` off-authority |
+| `0xCF500` / `0x4030F0` | message post-filter (vtable slot 8) and its NetworkObject handler |
+| `0x547490` | `HUiTitle::Update` (vtable `0xED53A8` slot 1, same slot/ABI as `HUiRoom::Update` `0x5617F0`); observed for the title watermark |
+| `0x60C120` | screen layout: 16:9 area (aspect `0xEE64E0`) into globals `0x125A9D0` screen w/h, `+8` off_y, `+0xC` off_x, `+0x10` area w/h; keep-aspect byte `0x115408C` (1 = consumers use the area) |
+| `0x611BB0` | scene update `(scene manager [0x125AB68], ...)`, called once per frame by `0x3D7D30` at `0x3D7E77`; ultrawide switches the picture here |
+| `0x6153A0` | scene view render-target (re)creation `(view)`: view rect `+0x34` x/y/w/h vs created `+0x44`; views at manager `+0x230 + i*0x188` (4); setters `0x5DDE0`, `0x61D60`, command `0x6299F0` |
+| `0x5EF930` | game viewport setter `(context, {int x,y,w,h; float min_z,max_z})`, caches at context `+0x2710` |
+| `0x5BE700` / `0x5BE600` | ortho `(out, cx, cy, w, h, n, f)` / perspective `(out, fov, aspect, n, f)` builders, row-vector matrices (column 0 = x, column 3 = w); some callers rely on volatile registers surviving the call |
+| `0x4B2FB0` | UI object draw (object in rdi): view from slot 9 `0x4B2630`, projection ortho 1920x1080 centred (960,-540) or perspective fov `+0x430` aspect 16:9 |
+| `0x3D89A6` / `0x3D8A99` | composite of the scene views (`0x3D8920`): keep-aspect test and its 2D projection from the screen object `[[0x1256CB8]+0x18]+0x20/+0x24` |
+| `0x3D7EDA` / `0x624075` | keep-aspect tests of the UI viewport (`0x3D7D30`) and of the layer/HUD viewport (`0x623FF7`, restored at `0x624231`) |
+| `0xECAF90` / `0xECB230` / `0xECB3C0` | vtables HUiHudPowerGuage / HUiHudRader / HUiHudWeapon |
+| `0x32C7D0` | hostile enumerator `(G, team, functor)`: radar enemy dots; relation 2 teams, health > 0, no `+0x280` flag `0x80`, `functor->vtable[1](object)` |
+| `+0xA0` (object) | world position (translation row of the matrix at `+0x70`), x, y up, z |
+| `0x2DB408` / `0x2DB411` | ApplyDamage reads attacker team `GameDamageInfo +0x24` and target team `object+0x218` (relation table row stride `0x38`, value 1 = friendly) |
 | `0x11B1AB0` / `0x11A4970` | RTTI TypeDescriptor WeaponBase / SoldierBase |
 
 Object health is `+0x1FC` (min `+0x1F4`, max `+0x1F8`, damage multiplier

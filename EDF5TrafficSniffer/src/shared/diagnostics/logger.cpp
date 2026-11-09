@@ -1151,6 +1151,24 @@ bool Initialize(HMODULE plugin_module) {
              << "  \"damage_meter_chat\": "
              << (g_config.damage_meter_chat ? "true" : "false")
              << ",\r\n"
+             << "  \"stats_overlay_enabled\": "
+             << (g_config.stats_overlay_enabled ? "true" : "false")
+             << ",\r\n"
+             << "  \"stats_overlay_hotkey_vk\": "
+             << g_config.stats_overlay_hotkey_vk << ",\r\n"
+             << "  \"mod_watermark_enabled\": "
+             << (g_config.mod_watermark_enabled ? "true" : "false")
+             << ",\r\n"
+             << "  \"ultrawide\": "
+             << (g_config.ultrawide ? "true" : "false") << ",\r\n"
+             << "  \"ultrawide_start_enabled\": "
+             << (g_config.ultrawide_start_enabled ? "true" : "false")
+             << ",\r\n"
+             << "  \"ultrawide_hud_corners\": "
+             << (g_config.ultrawide_hud_corners ? "true" : "false")
+             << ",\r\n"
+             << "  \"ultrawide_hotkey_vk\": "
+             << g_config.ultrawide_hotkey_vk << ",\r\n"
              << "  \"extended_enemy_health_scaling\": "
              << (g_config.extended_enemy_health_scaling ? "true" : "false")
              << ",\r\n"

@@ -59,6 +59,43 @@ void QueueSyntheticAuthValidation(uint64_t user);
 bool ConsumeSyntheticAuthValidation(uint64_t& user);
 void SyntheticAuthValidationDelivered(uint64_t user);
 
+// Combat statistics of the participants controlled on this machine, for the
+// on-screen stats overlay. Only this machine applies their hits with a live
+// attacker, so these numbers are complete.
+struct CombatStatsPlayer {
+    int32_t participant_index = -1;
+    double damage = 0.0;
+    // Damage of the last few seconds divided by that window.
+    double recent_dps = 0.0;
+    uint32_t kills = 0;
+    double distance = 0.0;  // metres moved since the stage began
+    // Friendly fire on the other players (allied NPCs excluded).
+    double friendly_damage = 0.0;
+    uint32_t friendly_kills = 0;
+};
+
+struct CombatStats {
+    // A measurement is running and the mission script updated recently.
+    bool in_mission = false;
+    bool kills_supported = false;
+    // Enemies alive right now (the game's own count), -1 when unknown.
+    int32_t enemies_alive = -1;
+    // Why in_mission is false (for the overlay's diagnostics).
+    bool measurement_active = false;
+    bool measurement_ended = false;
+    uint64_t last_update_age_ms = 0;  // UINT64_MAX: no Mission() update yet
+    // Time the mission script ran since the stage began (pauses excluded).
+    uint64_t active_ms = 0;
+    uint32_t count = 0;  // local participants (two in split screen)
+    CombatStatsPlayer players[2];
+};
+
+bool GetCombatStats(CombatStats& stats);
+// The EDF5 main window once found by the hotkey thread, or nullptr.
+void* GameWindow();
+// The title screen's update ran within the last half second.
+bool TitleScreenActive();
+
 // Pure protocol checks used by the standalone smoke harness. This does not
 // initialize Steam or launch EDF5.
 bool SelfTest(std::string& report);

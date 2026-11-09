@@ -52,6 +52,18 @@ current process.
   `MissionResult::Exec_Begin`.
 - `src/games/edf5/coop8/more_players.cpp`: participant state, native hooks,
   identity, replication, results and experimental tools.
+- `src/games/edf5/coop8/stats_overlay.cpp`: hotkey-toggled on-screen stats of
+  the local character. Dear ImGui draws from an `IDXGISwapChain::Present`
+  hook installed on first show (a throwaway swap chain exposes the dxgi.dll
+  methods); the game's output-merger bindings are saved and restored, and
+  `D3DCompile` is resolved from d3dcompiler_47.dll at first use instead of
+  being imported. Any failure leaves only the overlay off.
+- `src/games/edf5/coop8/ultrawide.cpp`: screens wider than 16:9. The 3D scene
+  fills the screen (Hor+) and the HUD gauges move to the corners. Every game
+  hook enters through a register-preserving assembly stub (EDF5 callers rely
+  on volatile registers surviving direct calls); code patches are switched
+  per frame from the scene update, where EDF5 itself refreshes scene views.
+  A signature mismatch only keeps the original picture.
 
 ### Shared Steam and sniffer code
 

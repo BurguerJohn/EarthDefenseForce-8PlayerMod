@@ -31,6 +31,11 @@ PATCHED = (
     ("kMissionScriptRecordReadBRva", 0, 19),
     ("kCalibanSeatRva", 0, 14),
     ("kCarSeatRva", 0, 14),
+    # ultrawide: written per frame while the screen is wider than 16:9.
+    ("kUltrawideCompositeViewportRva", 0, 1),
+    ("kUltrawideCompositeProjectionRva", 0, 33),
+    ("kUltrawideUiViewportRva", 0, 1),
+    ("kUltrawideLayerViewportRva", 0, 1),
 )
 MESSAGE_RESERVE_RVAS = (0x43309E, 0x432D65)  # imm32 bytes 1..4 patched
 

@@ -11,6 +11,7 @@
 #include "module_registry.h"
 #include "more_players.h"
 #include "steam_interfaces.h"
+#include "ultrawide.h"
 
 #if EDF5_COMPILE_DIAGNOSTICS
 #include "native_roster_patch.h"
@@ -63,6 +64,9 @@ EDF5MP_SelfTest(char* report, uint32_t capacity) {
     std::string patch_message;
     const bool patch_result = game_patches::SelfTest(patch_message);
     if (!patch_message.empty()) message += "; " + patch_message;
+    std::string ultrawide_message;
+    const bool ultrawide_result = ultrawide::SelfTest(ultrawide_message);
+    if (!ultrawide_message.empty()) message += "; " + ultrawide_message;
     std::string steam_policy_message;
     const bool steam_policy_result =
         steam_capture::SelfTestInstallPolicy(steam_policy_message);
@@ -84,8 +88,8 @@ EDF5MP_SelfTest(char* report, uint32_t capacity) {
     const bool edf41_patch_result = true;
 #endif
     const bool result = protocol_result && identity_result && patch_result &&
-                        steam_policy_result && startup_policy_result &&
-                        edf41_patch_result;
+                        ultrawide_result && steam_policy_result &&
+                        startup_policy_result && edf41_patch_result;
     if (report && capacity) {
         const size_t copied = std::min<size_t>(message.size(), capacity - 1);
         std::memcpy(report, message.data(), copied);

@@ -351,7 +351,29 @@ capture::Config Load(HMODULE plugin_module) {
     config.damage_meter_enabled = IniBoolWithLegacy(
         kCoop8, kLegacyCoop8, L"DamageMeterEnabled", true);
     config.damage_meter_chat = IniBoolWithLegacy(
-        kCoop8, kLegacyCoop8, L"DamageMeterChat", false);
+        kCoop8, kLegacyCoop8, L"DamageMeterChat", true);
+    config.stats_overlay_enabled = IniBoolWithLegacy(
+        kCoop8, kLegacyCoop8, L"StatsOverlayEnabled", true);
+    config.stats_overlay_hotkey_vk = IniUIntWithLegacy(
+        kCoop8, kLegacyCoop8, L"StatsOverlayHotkeyVK", VK_TAB, 1, 255);
+    config.stats_overlay_x_percent = IniUIntWithLegacy(
+        kCoop8, kLegacyCoop8, L"StatsOverlayX", 2, 0, 100);
+    config.stats_overlay_y_percent = IniUIntWithLegacy(
+        kCoop8, kLegacyCoop8, L"StatsOverlayY", 96, 0, 100);
+    config.stats_overlay_scale_percent = IniUIntWithLegacy(
+        kCoop8, kLegacyCoop8, L"StatsOverlayScale", 100, 50, 300);
+    config.stats_overlay_start_visible = IniBoolWithLegacy(
+        kCoop8, kLegacyCoop8, L"StatsOverlayStartVisible", true);
+    config.mod_watermark_enabled = IniBoolWithLegacy(
+        kCoop8, kLegacyCoop8, L"ModWatermarkEnabled", true);
+    config.ultrawide = IniBoolWithLegacy(
+        kCoop8, kLegacyCoop8, L"Ultrawide", true);
+    config.ultrawide_start_enabled = IniBoolWithLegacy(
+        kCoop8, kLegacyCoop8, L"UltrawideStartEnabled", true);
+    config.ultrawide_hud_corners = IniBoolWithLegacy(
+        kCoop8, kLegacyCoop8, L"UltrawideHudCorners", true);
+    config.ultrawide_hotkey_vk = IniUIntWithLegacy(
+        kCoop8, kLegacyCoop8, L"UltrawideHotkeyVK", VK_HOME, 1, 255);
     config.extended_enemy_health_scaling = IniBoolWithLegacy(
         kCoop8, kLegacyCoop8, L"ExtendedEnemyHealthScaling", true);
     constexpr const wchar_t* kEnemyHealthKeys[] = {
